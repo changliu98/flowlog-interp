@@ -198,21 +198,38 @@ impl ProgramQueryPlan {
     }
 
     /// Determines if fat mode should be used based on the maximum arity required.
-    /// Fat mode is REQUIRED for arities > fallback_arity
-    /// as the fixed-size array implementations only support up to this arity.
+    /// Fat mode is REQUIRED for a planned collection the fixed-size
+    /// implementations do not cover, since those are generated per arity.
+    ///
+    /// The two limits are not interchangeable, and reading them as if they were
+    /// is how a legal program reached a missing arm. A key-less collection is
+    /// one row, so it is bounded by the row limit. A `(key, value)` collection
+    /// is *two* rows of the generated key/value tables, and both halves are
+    /// bounded by the key/value limit - a `(1, 5)` split has no arm even though
+    /// 5 is a perfectly ordinary row width, which is what produced
+    /// `codegen_row_kv unimplemented for 6, 1, 5` and
+    /// `codegen_jn unimplemented for 1, 5, 1, 6` on programs whose relations
+    /// all fit in a row.
+    ///
+    /// The pairs are the planned collection signatures rather than the declared
+    /// relation arities, so an intermediate join signature is covered too; the
+    /// maximality filter is sound here because a pair that dominates another
+    /// is at least as wide in both components.
     pub fn should_use_fat_mode(
         &self,
         user_requested_fat_mode: bool,
-        fallback_key: usize,
-        fallback_value: usize,
+        key_value_limit: usize,
+        row_limit: usize,
     ) -> bool {
-        // If any key or value arity exceeds fallback_arity, fat mode must be used
-        // Otherwise, it depends on the user's command-line argument
         let maximal_pairs = self.maximal_arity_pairs();
-        let any_exceeds_fallback = maximal_pairs
-            .iter()
-            .any(|(k, v)| *k > fallback_key || *v > fallback_value);
-        any_exceeds_fallback || user_requested_fat_mode
+        let exceeds_fixed_size_rows = maximal_pairs.iter().any(|&(key, value)| {
+            if key == 0 {
+                value > row_limit
+            } else {
+                key > key_value_limit || value > key_value_limit
+            }
+        });
+        exceeds_fixed_size_rows || user_requested_fat_mode
     }
 
     /// Returns detailed arity information for debugging purposes.

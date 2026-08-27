@@ -345,6 +345,63 @@ R(a, b, c, d, e, {operator}(v)) :- E(a, b, c, d, e, v).
     }
 }
 
+/// A join whose value side is wider than the key/value tables is ordinary as
+/// long as its relations fit in a row. It has no fixed-size arm, so the program
+/// must be planned onto fat rows instead of reaching one.
+#[test]
+fn a_join_with_a_value_side_wider_than_the_key_value_tables_still_runs() {
+    let temp = TempTree::new("wide-kv-join");
+    let program = temp.program(
+        ".in
+.decl A(k: number, a1: number, a2: number, a3: number, a4: number, a5: number)
+.input A.facts
+.decl B(k: number, b1: number)
+.input B.facts
+.printsize
+.decl Out(k: number, a1: number, a2: number, a3: number, a4: number, a5: number, b1: number)
+.rule
+Out(k, a1, a2, a3, a4, a5, b1) :- A(k, a1, a2, a3, a4, a5), B(k, b1).
+",
+    );
+    temp.facts("A", "1,2,3,4,5,6\n2,0,0,0,0,0\n");
+    temp.facts("B", "1,9\n3,9\n");
+
+    let execution = run(&temp, &program, &[]);
+    assert_success(&execution);
+    assert!(
+        String::from_utf8_lossy(&execution.stdout).contains("Fat mode automatically enabled"),
+        "a (1, 5) key/value split has no fixed-size arm and must be planned onto fat rows",
+    );
+    assert_eq!(
+        rows(&temp.output("Out")),
+        vec![vec![1, 2, 3, 4, 5, 6, 9]],
+    );
+}
+
+/// An antijoin keeps its left row, and that row is bounded by the row limit
+/// rather than by the key/value tables the antijoin is built from.
+#[test]
+fn an_antijoin_keeping_more_columns_than_the_key_value_tables_still_runs() {
+    let temp = TempTree::new("wide-antijoin");
+    let program = temp.program(
+        ".in
+.decl A(k: number, a1: number, a2: number, a3: number, a4: number)
+.input A.facts
+.decl B(k: number)
+.input B.facts
+.printsize
+.decl Out(k: number, a1: number, a2: number, a3: number, a4: number)
+.rule
+Out(k, a1, a2, a3, a4) :- A(k, a1, a2, a3, a4), !B(k).
+",
+    );
+    temp.facts("A", "1,2,3,4,5\n9,8,7,6,5\n");
+    temp.facts("B", "9\n");
+
+    assert_success(&run(&temp, &program, &[]));
+    assert_eq!(rows(&temp.output("Out")), vec![vec![1, 2, 3, 4, 5]]);
+}
+
 /// The head checks are unit-tested in `parsing::validate`; this asserts that
 /// the binary reaches them, before it reads a fact or assembles a dataflow.
 #[test]

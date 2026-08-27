@@ -181,7 +181,7 @@ target/release/executing -p examples/reach.dl -f reach -w 8
 </tr>
 <tr>
   <td align="center"><code>-d, --delimiter &lt;CHAR&gt;</code></td>
-  <td>Delimiter for input files (default: <code>,</code>)</td>
+  <td>Delimiter for input and output files (default: <code>,</code>)</td>
 </tr>
 <tr>
   <td align="center"><code>-w, --workers &lt;NUM&gt;</code></td>
@@ -216,6 +216,20 @@ target/release/executing -p examples/batik.dl -f batik -d $'\t' -w 32 -O 3
 # Debug print RUST_LOG=debug
 RUST_LOG=debug target/release/executing -p examples/batik.dl -f batik -c results -O 2
 ```
+
+### Input and Output Files
+
+An input file holds one tuple per line, with columns separated by
+`--delimiter`. Every cell is a `number`. A cell that is not one - a mistyped
+value, a wrong delimiter, a value outside the domain - refuses the run, naming
+the file, the cell and its line; it is not skipped, because a silently smaller
+relation is a silently wrong answer.
+
+With `-c <DIR>`, each output relation is written to
+`<DIR>/csvs/<Relation>.csv` in the same format: one tuple per line, columns
+separated by the same `--delimiter`, no padding. A written relation is
+therefore a valid input file, so one run's output can be another run's EDB.
+Relation sizes are written alongside them to `<DIR>/csvs/size.txt`.
 
 ### Datasets
 

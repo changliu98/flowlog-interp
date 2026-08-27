@@ -27,4 +27,12 @@ pub use parsing::Val;
 //     ↓ compiles with isize type
 
 pub type Time = ();
+
+/// The iteration counter of a recursive stratum's inner timestamp.
+///
+/// Known limit: 65,535 iterations. A fixed point that needs more overflows the
+/// counter rather than reporting anything, so a program whose recursion depth
+/// can exceed that - long chains under a rule that advances one step per round
+/// - is outside what this width supports. Widening it costs memory and
+/// comparison work in every timestamp of every recursive dataflow.
 pub type Iter = u16;

@@ -309,8 +309,11 @@ pub fn codegen_k_k_jn(_: TokenStream) -> TokenStream {
 
 #[proc_macro]
 pub fn codegen_kv_flatten(_: TokenStream) -> TokenStream {
+    // The output of a flatten is a row, so it is bounded by `ROW_MAX` and not
+    // by the key/value table's own `KV_MAX`: an antijoin whose surviving
+    // columns number more than `KV_MAX` is ordinary.
     let space =
-        iproduct!(1..=KV_MAX, 1..=KV_MAX, 1..=KV_MAX).filter(|&(ik, iv, target)| ik + iv >= target);
+        iproduct!(1..=KV_MAX, 1..=KV_MAX, 1..=ROW_MAX).filter(|&(ik, iv, target)| ik + iv >= target);
 
     let mut arms = vec![];
     for (ik0_, iv0_, target_) in space {
@@ -381,7 +384,11 @@ pub fn codegen_k_flatten(_: TokenStream) -> TokenStream {
 /* ------------------------------------------------------------------------ */
 #[proc_macro]
 pub fn codegen_aggregation(_: TokenStream) -> TokenStream {
-    let space = 0..=KV_MAX;
+    // Group-by columns, so the relation's arity is one more. The bound is
+    // `ROW_MAX` because the aggregate's key is an ordinary fixed-size row
+    // arranged by `reduce_core`, not one half of a generated join table: an
+    // aggregate over a relation the rows can hold has an arm.
+    let space = 0..ROW_MAX;
     let mut arms = vec![];
 
     for key_arity in space {
@@ -430,7 +437,7 @@ pub fn codegen_aggregation(_: TokenStream) -> TokenStream {
 
 #[proc_macro]
 pub fn codegen_min_optimize(_: TokenStream) -> TokenStream {
-    let space = 1..=KV_MAX + 1; // Support up to KV_MAX + 1 arity for MIN aggregation
+    let space = 1..=ROW_MAX; // every arity the fixed-size rows hold
     let mut arms = vec![];
 
     for arity in space {

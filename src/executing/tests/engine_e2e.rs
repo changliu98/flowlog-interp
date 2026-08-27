@@ -317,6 +317,34 @@ Out(r, x, y, z) :- Round(r), Tri(x, y, z).
     assert_eq!(rows(&fat.output("Out")), expected);
 }
 
+/// An aggregate's group-by key is an ordinary fixed-size row arranged by
+/// `reduce_core`, not one half of a generated join table, so every relation the
+/// rows can hold should have an arm. The table stopped at `KV_MAX + 1 = 5`.
+#[test]
+fn an_aggregate_wider_than_the_key_value_tables_still_runs() {
+    for (operator, expected) in [("sum", 13), ("min", 6), ("max", 7), ("count", 2)] {
+        let temp = TempTree::new(&format!("wide-aggregate-{operator}"));
+        let program = temp.program(&format!(
+            ".in
+.decl E(a: number, b: number, c: number, d: number, e: number, v: number)
+.input E.facts
+.printsize
+.decl R(a: number, b: number, c: number, d: number, e: number, s: number)
+.rule
+R(a, b, c, d, e, {operator}(v)) :- E(a, b, c, d, e, v).
+"
+        ));
+        temp.facts("E", "1,2,3,4,5,6\n1,2,3,4,5,7\n");
+
+        assert_success(&run(&temp, &program, &[]));
+        assert_eq!(
+            rows(&temp.output("R")),
+            vec![vec![1, 2, 3, 4, 5, expected]],
+            "aggregate {operator}",
+        );
+    }
+}
+
 /// The head checks are unit-tested in `parsing::validate`; this asserts that
 /// the binary reaches them, before it reads a fact or assembles a dataflow.
 #[test]

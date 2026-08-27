@@ -245,6 +245,12 @@ count_paths(x, z, count(y)) :- edge(x, y), edge(y, z).
 max_salary(dept, max(salary)) :- employee(emp_id, salary), works_in(emp_id, dept).
 ```
 
+### Value domain
+
+A `number` is a 64-bit signed integer, from `-9223372036854775808` to
+`9223372036854775807`. Program constants, input cells, row columns, aggregate
+results and `@call` arguments and results all live in that one domain.
+
 ### Imperative functions in rule bodies
 
 A program can keep row-local imperative logic in the same `.dl` file with one
@@ -256,15 +262,15 @@ implementation details:
 .code rust
 use std::cmp::min;
 
-fn absolute(value: i32) -> i32 {
+fn absolute(value: i64) -> i64 {
     value.saturating_abs()
 }
 
-pub fn normalize(value: i32, limit: i32) -> i32 {
+pub fn normalize(value: i64, limit: i64) -> i64 {
     min(absolute(value), limit)
 }
 
-pub fn acceptable(value: i32) -> bool {
+pub fn acceptable(value: i64) -> bool {
     value % 2 == 0
 }
 .endcode
@@ -279,16 +285,16 @@ pub fn acceptable(value: i32) -> bool {
 Output(X, Y) :- Input(X), Y = @call(normalize, X, 255), @call(acceptable, Y).
 ```
 
-An `i32`-returning call binds a number with
+An `i64`-returning call binds a number with
 `Y = @call(function, arguments...)`. A `bool`-returning call is written bare
-and filters out the row when it returns `false`. Calls can consume `i32`
+and filters out the row when it returns `false`. Calls can consume `i64`
 constants, variables from positive relational atoms, and results of earlier
 calls. Earlier/later refers to call order in the rule; relational predicates
 retain Datalog's unordered meaning.
 
 The current physical ABI deliberately matches FlowLog's row representation:
 exports must be safe, synchronous, non-generic free functions whose arguments
-are all `i32` and whose result is `i32` or `bool`. Arithmetic/aggregate heads,
+are all `i64` and whose result is `i64` or `bool`. Arithmetic/aggregate heads,
 using a call result in another relational predicate or ordinary comparison,
 text arguments, and call rules with no retained relational column to drive
 evaluation are not supported yet. Rules with calls skip SIP rewriting, while

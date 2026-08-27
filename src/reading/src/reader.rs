@@ -24,6 +24,7 @@ use crate::Time;
 use crate::Iter;
 use crate::Semiring;
 use crate::semiring_one;
+use crate::Val;
 
 
 fn byte_range_reader(rel_path: &str, id: usize, peers: usize) -> (BufReader<File>, u64) {
@@ -132,7 +133,7 @@ macro_rules! generate_read_row_functions {
                         let Some(first_value) = tuple
                             .next()
                             .and_then(|value| std::str::from_utf8(value).ok())
-                            .and_then(|value| value.parse::<i32>().ok())
+                            .and_then(|value| value.parse::<Val>().ok())
                         else {
                             return;
                         };
@@ -143,7 +144,7 @@ macro_rules! generate_read_row_functions {
                         for value in tuple {
                             let Some(parsed_value) = std::str::from_utf8(value)
                                 .ok()
-                                .and_then(|value| value.parse::<i32>().ok())
+                                .and_then(|value| value.parse::<Val>().ok())
                             else {
                                 return;
                             };
@@ -187,7 +188,7 @@ pub fn read_row_fat(
         let Some(first_value) = tuple
             .next()
             .and_then(|value| std::str::from_utf8(value).ok())
-            .and_then(|value| value.parse::<i32>().ok())
+            .and_then(|value| value.parse::<Val>().ok())
         else {
             return;
         };
@@ -198,7 +199,7 @@ pub fn read_row_fat(
         for value in tuple {
             let Some(parsed_value) = std::str::from_utf8(value)
                 .ok()
-                .and_then(|value| value.parse::<i32>().ok())
+                .and_then(|value| value.parse::<Val>().ok())
             else {
                 return;
             };

@@ -2,6 +2,7 @@ use libloading::Library;
 use parsing::embedded::{EmbeddedRust, RustReturnType};
 use planning::calls::{CallHeadRef, CallProjection, CallValueRef};
 use reading::row::Array;
+use reading::Val;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
@@ -12,9 +13,14 @@ use std::process::Command;
 use std::sync::Arc;
 use tracing::info;
 
-const CALL_ABI_VERSION: &str = "flowlog-call-abi-v1-i32-bool";
+const CALL_ABI_VERSION: &str = "flowlog-call-abi-v2-i64-bool";
 
-type NativeCall = unsafe extern "C" fn(*const i32, usize, *mut i32) -> i32;
+/// The physical `@call` ABI: a pointer to the argument values, their count,
+/// and an out-parameter for the single result. Arguments and results are
+/// `Val`, the engine's row scalar; the returned `i32` is the ABI status
+/// (0 success, 1 the callee panicked, 2 the boundary was called incorrectly)
+/// and is deliberately not a value.
+type NativeCall = unsafe extern "C" fn(*const Val, usize, *mut Val) -> i32;
 
 /// A loaded content-addressed module. Keeping the `Library` here guarantees
 /// that every resolved function pointer remains valid for the dataflow's life.
@@ -158,7 +164,7 @@ pub struct ResolvedCallProjection {
 }
 
 impl ResolvedCallProjection {
-    pub fn evaluate<A: Array>(&self, input: &A) -> Option<Vec<i32>> {
+    pub fn evaluate<A: Array>(&self, input: &A) -> Option<Vec<Val>> {
         let mut results = Vec::new();
         for step in &self.steps {
             let arguments = step
@@ -170,7 +176,7 @@ impl ResolvedCallProjection {
                     CallValueRef::Constant(value) => *value,
                 })
                 .collect::<Vec<_>>();
-            let mut output = 0i32;
+            let mut output = Val::default();
             let status =
                 unsafe { (step.function)(arguments.as_ptr(), arguments.len(), &mut output) };
             match status {
@@ -295,12 +301,12 @@ fn render_module(embedded: &EmbeddedRust, digest: &str) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             let result = match function.return_type() {
-                RustReturnType::I32 => format!(
-                    "let value: i32 = super::{}({arguments}); output.write(value);",
+                RustReturnType::I64 => format!(
+                    "let value: i64 = super::{}({arguments}); output.write(value);",
                     function.name()
                 ),
                 RustReturnType::Bool => format!(
-                    "let value: bool = super::{}({arguments}); output.write(i32::from(value));",
+                    "let value: bool = super::{}({arguments}); output.write(i64::from(value));",
                     function.name()
                 ),
             };
@@ -308,9 +314,9 @@ fn render_module(embedded: &EmbeddedRust, digest: &str) -> String {
                 r#"
     #[export_name = "__flowlog_call_{index}"]
     pub unsafe extern "C" fn call_{index}(
-        arguments: *const i32,
+        arguments: *const i64,
         argument_count: usize,
-        output: *mut i32,
+        output: *mut i64,
     ) -> i32 {{
         if argument_count != {arity}
             || (argument_count != 0 && arguments.is_null())

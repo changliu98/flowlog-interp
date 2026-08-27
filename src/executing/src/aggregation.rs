@@ -1,6 +1,6 @@
 use parsing::aggregation::{Aggregation, AggregationOperator};
 use reading::row::{Array, FatRow, Row};
-use reading::{semiring_one, Semiring};
+use reading::{semiring_one, Semiring, Val};
 
 /// Aggregates a collection of integer values using the specified aggregation operator.
 ///
@@ -11,9 +11,9 @@ use reading::{semiring_one, Semiring};
 /// # Returns
 /// * `Some(result)` - The aggregation result, or the count for Count operations
 /// * `None` - If the input is empty and the operation cannot produce a meaningful result
-fn aggregate_ints(input: &[i32], op: &AggregationOperator) -> Option<i32> {
+fn aggregate_ints(input: &[Val], op: &AggregationOperator) -> Option<Val> {
     match op {
-        AggregationOperator::Count => Some(input.len() as i32),
+        AggregationOperator::Count => Some(input.len() as Val),
         AggregationOperator::Sum => Some(input.iter().sum()),
         AggregationOperator::Min => input.iter().min().copied(),
         AggregationOperator::Max => input.iter().max().copied(),
@@ -48,7 +48,7 @@ pub fn aggregation_reduce_logic<const N_GB: usize>(
         let mut out = Row::<1>::new();
 
         // Extract values from input rows for aggregation
-        let values: Vec<i32> = input.iter().map(|(row, _)| row.column(0)).collect();
+        let values: Vec<Val> = input.iter().map(|(row, _)| row.column(0)).collect();
 
         if let Some(result) = aggregate_ints(&values, &operator) {
             out.push(result);
@@ -114,7 +114,7 @@ pub fn aggregation_reduce_logic_fat(
     move |_key, input, output, _fuel| {
         let mut out = Row::<1>::new();
 
-        let values: Vec<i32> = input.iter().map(|(row, _)| row.column(0)).collect();
+        let values: Vec<Val> = input.iter().map(|(row, _)| row.column(0)).collect();
 
         if let Some(result) = aggregate_ints(&values, &operator) {
             out.push(result);

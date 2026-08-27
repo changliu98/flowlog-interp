@@ -1,4 +1,4 @@
-use crate::{head::Head, parser::Lexeme, Rule};
+use crate::{head::Head, parser::Lexeme, Rule, Val};
 use pest::iterators::Pair;
 use crate::compare::ComparisonExpr;
 use std::fmt;
@@ -8,7 +8,7 @@ use tracing::error;
 /*
     Atom: NAME(AtomArg, AtomArg, ...)
     AtomArg: Var(String) | Const(Const) | Placeholder
-    Const: Integer(i32) | Text(String)
+    Const: Integer(Val) | Text(String)
 */
 
 // atom_arg = var | const | placeholder
@@ -63,12 +63,12 @@ impl Lexeme for AtomArg {
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Const {
-    Integer(i32),
+    Integer(Val),
     Text(String),
 }
 
 impl Const {
-    pub fn integer(&self) -> i32 {
+    pub fn integer(&self) -> Val {
         match self {
             Self::Integer(int) => *int,
             _ => panic!("expects ints: {:?}", self),
@@ -85,11 +85,27 @@ impl fmt::Display for Const {
     }
 }
 
+/// Reads one integer literal of a program into the engine's value domain.
+///
+/// The grammar already guarantees the text is a signed run of digits, so the
+/// only way this fails is a literal outside `Val`, which is reported rather
+/// than wrapped.
+fn parse_integer(text: &str) -> Val {
+    text.parse::<Val>().unwrap_or_else(|error| {
+        panic!(
+            "integer constant {text} is outside this engine's value domain \
+             ({} .. {}): {error}",
+            Val::MIN,
+            Val::MAX
+        )
+    })
+}
+
 impl Lexeme for Const {
     fn from_parsed_rule(parsed_rule: Pair<Rule>) -> Self {
         let inner = parsed_rule.into_inner().next().unwrap();
         match inner.as_rule() {
-            Rule::integer => Self::Integer(inner.as_str().parse::<i32>().unwrap()),
+            Rule::integer => Self::Integer(parse_integer(inner.as_str())),
             Rule::string => Self::Text(inner.as_str().to_string()),
             _ => { error!("constant parsing panic {:?}", inner); unreachable!() }
         }

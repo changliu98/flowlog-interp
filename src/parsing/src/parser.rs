@@ -152,8 +152,8 @@ mod tests {
     #[test]
     fn parses_call_bindings_and_filters_from_a_complete_program() {
         let source = r#".code rust
-pub fn normalize(x: i32) -> i32 { x.saturating_abs() }
-pub fn keep(x: i32) -> bool { x < 256 }
+pub fn normalize(x: i64) -> i64 { x.saturating_abs() }
+pub fn keep(x: i64) -> bool { x < 256 }
 .endcode
 .in
 .decl Input(x: number)

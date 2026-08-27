@@ -1,4 +1,5 @@
 use arrayvec::ArrayVec;
+use parsing::Val;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::fmt;
@@ -13,17 +14,17 @@ use std::hash::Hash;
 /// a trait to abstract ops over array implementations
 pub trait Array: Debug + Send + Sync {
     /// insert a value
-    fn push(&mut self, v: i32);
+    fn push(&mut self, v: Val);
     /// return the number of columns
     fn arity(&self) -> usize;
     /// return the value of a column
-    fn column(&self, id: usize) -> i32;
+    fn column(&self, id: usize) -> Val;
 }
 
 /// stack-allocated row for small arities using const generics
 #[derive(Debug, Clone, Hash, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row<const N: usize> {
-    values: ArrayVec<i32, N>,
+    values: ArrayVec<Val, N>,
 }
 
 impl<const N: usize> Row<N> {
@@ -33,13 +34,13 @@ impl<const N: usize> Row<N> {
         }
     }
 
-    // pub fn extend(&mut self, slice: &[i32]) {
+    // pub fn extend(&mut self, slice: &[Val]) {
     //     self.values.extend(slice.iter().cloned());
     // }
 }
 
 impl<const N: usize> Array for Row<N> {
-    fn push(&mut self, v: i32) {
+    fn push(&mut self, v: Val) {
         self.values.push(v);
     }
 
@@ -47,7 +48,7 @@ impl<const N: usize> Array for Row<N> {
         self.values.len()
     }
 
-    fn column(&self, id: usize) -> i32 {
+    fn column(&self, id: usize) -> Val {
         unsafe { *self.values.get_unchecked(id) }
     }
 }
@@ -69,7 +70,7 @@ impl<const N: usize> fmt::Display for Row<N> {
 /// heap-allocated row for large arities using SmallVec as fallback
 #[derive(Debug, Clone, Hash, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FatRow {
-    values: SmallVec<[i32; crate::FALLBACK_ARITY]>,
+    values: SmallVec<[Val; crate::FALLBACK_ARITY]>,
 }
 
 impl FatRow {
@@ -81,7 +82,7 @@ impl FatRow {
 }
 
 impl Array for FatRow {
-    fn push(&mut self, v: i32) {
+    fn push(&mut self, v: Val) {
         self.values.push(v);
     }
 
@@ -89,7 +90,7 @@ impl Array for FatRow {
         self.values.len()
     }
 
-    fn column(&self, id: usize) -> i32 {
+    fn column(&self, id: usize) -> Val {
         unsafe { *self.values.get_unchecked(id) }
     }
 }

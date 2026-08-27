@@ -40,25 +40,25 @@ pub const SEMIRING_TYPE: &str = "isize";
 /// MIN Semiring
 #[derive(Copy, Debug, Clone, Hash, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Min {
-    pub value: u32,
+    pub value: u64,
 }
 
 impl Min {
     /// Creates a new `Min` with a value.
-    pub fn new(value: u32) -> Self {
+    pub fn new(value: u64) -> Self {
         Min { value }
     }
 
-    /// Creates a new `Min` representing infinity (u32::MAX).
+    /// Creates a new `Min` representing infinity (u64::MAX).
     /// This serves as the additive identity in the MIN semiring:
     /// min(a, ∞) = a for any value a.
     pub fn infinity() -> Self {
-        Min { value: u32::MAX }
+        Min { value: u64::MAX }
     }
 
     /// Returns true if this Min represents infinity.
     pub fn is_infinity(&self) -> bool {
-        self.value == u32::MAX
+        self.value == u64::MAX
     }
 }
 
@@ -90,8 +90,8 @@ impl Multiply<i64> for Min {
 }
 
 // Convenience implementations for easier use
-impl From<u32> for Min {
-    fn from(value: u32) -> Self {
+impl From<u64> for Min {
+    fn from(value: u64) -> Self {
         Min::new(value)
     }
 }
@@ -117,6 +117,6 @@ mod tests {
         let zero = Min::zero();
         assert!(!zero.is_zero());
         assert!(zero.is_infinity());
-        assert_eq!(zero.value, u32::MAX);
+        assert_eq!(zero.value, u64::MAX);
     }
 }

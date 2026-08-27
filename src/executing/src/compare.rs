@@ -1,12 +1,13 @@
 use parsing::{arithmetic::ArithmeticOperator, compare::ComparisonOperator};
 use reading::row::Array;
+use reading::Val;
 use planning::compare::ComparisonExprArgument;
 use planning::arithmetic::ArithmeticArgument;
 use planning::arithmetic::FactorArgument;
 use planning::arguments::TransformationArgument;
 
 
-pub fn compare_ints(x: i32, op: &ComparisonOperator, y: i32) -> bool {
+pub fn compare_ints(x: Val, op: &ComparisonOperator, y: Val) -> bool {
     match op {
         ComparisonOperator::Equals => x == y,
         ComparisonOperator::NotEquals => x != y,
@@ -17,7 +18,7 @@ pub fn compare_ints(x: i32, op: &ComparisonOperator, y: i32) -> bool {
     }
 }
 
-pub fn arithmetic_ints(init: i32, rest: &[(&ArithmeticOperator, i32)]) -> i32 {
+pub fn arithmetic_ints(init: Val, rest: &[(&ArithmeticOperator, Val)]) -> Val {
     let mut result = init;
     for (op, value) in rest {
         match op {
@@ -35,7 +36,7 @@ pub fn arithmetic_ints(init: i32, rest: &[(&ArithmeticOperator, i32)]) -> i32 {
 /* ------------------------------ */
 /* compare for rows */
 /* ------------------------------ */
-pub fn factor_row(v: &dyn Array, factor: &FactorArgument) -> i32 {
+pub fn factor_row(v: &dyn Array, factor: &FactorArgument) -> Val {
     match factor {
         FactorArgument::Var(transformation_arg) => {
             match transformation_arg {
@@ -47,7 +48,7 @@ pub fn factor_row(v: &dyn Array, factor: &FactorArgument) -> i32 {
     }
 }
 
-pub fn arithmetic_row(v: &dyn Array, arithmetic_expr: &ArithmeticArgument) -> i32 {
+pub fn arithmetic_row(v: &dyn Array, arithmetic_expr: &ArithmeticArgument) -> Val {
     let init = factor_row(v, arithmetic_expr.init());
     let rest = arithmetic_expr.rest().iter().map(|(op, factor)| {
         (op, factor_row(v, factor))
@@ -68,7 +69,7 @@ pub fn compare_row(v: &dyn Array, compare_expr: &ComparisonExprArgument) -> bool
 /* ---------------------------------------------- */
 /* compare for joins (fused into joins) */
 /* ---------------------------------------------- */
-pub fn jn_compare_extractor(k: Option<&dyn Array>, v1: Option<&dyn Array>, v2: Option<&dyn Array>, extracts: &(bool, bool, usize)) -> i32 {
+pub fn jn_compare_extractor(k: Option<&dyn Array>, v1: Option<&dyn Array>, v2: Option<&dyn Array>, extracts: &(bool, bool, usize)) -> Val {
     let (left_or_right, key_or_value, id) = extracts;
     if !key_or_value {
         // from key
@@ -92,7 +93,7 @@ pub fn jn_compare(k: Option<&dyn Array>, v1: Option<&dyn Array>, v2: Option<&dyn
     compare_ints(left, compare_expr.operator(), right)
 }
 
-pub fn jn_arithmetic(k: Option<&dyn Array>, v1: Option<&dyn Array>, v2: Option<&dyn Array>, arithmetic_expr: &ArithmeticArgument) -> i32 {
+pub fn jn_arithmetic(k: Option<&dyn Array>, v1: Option<&dyn Array>, v2: Option<&dyn Array>, arithmetic_expr: &ArithmeticArgument) -> Val {
     let init = jn_factor(k, v1, v2, arithmetic_expr.init());
     let rest = arithmetic_expr.rest().iter().map(|(op, factor)| {
         (op, jn_factor(k, v1, v2, factor))
@@ -101,7 +102,7 @@ pub fn jn_arithmetic(k: Option<&dyn Array>, v1: Option<&dyn Array>, v2: Option<&
     arithmetic_ints(init, &rest)
 }
 
-pub fn jn_factor(k: Option<&dyn Array>, v1: Option<&dyn Array>, v2: Option<&dyn Array>, factor: &FactorArgument) -> i32 {
+pub fn jn_factor(k: Option<&dyn Array>, v1: Option<&dyn Array>, v2: Option<&dyn Array>, factor: &FactorArgument) -> Val {
     match factor {
         FactorArgument::Var(transformation_arg) => {
             match transformation_arg {

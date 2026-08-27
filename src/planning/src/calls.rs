@@ -5,16 +5,17 @@ use catalog::rule::Catalog;
 use parsing::embedded::{EmbeddedRust, RustReturnType};
 use parsing::head::HeadArg;
 use parsing::rule::{AtomArg, CallPredicate, Const};
+use parsing::Val;
 
 /// One scalar consumed by an embedded call.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum CallValueRef {
     Input(usize),
     Result(usize),
-    Constant(i32),
+    Constant(Val),
 }
 
-/// One call in textual body order. Bindings append an `i32` result to the
+/// One call in textual body order. Bindings append an `i64` result to the
 /// per-row result vector; filters return `bool` and keep or discard the row.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct CallStep {
@@ -147,7 +148,7 @@ impl CallProjection {
                     }
                     AtomArg::Const(Const::Integer(value)) => CallValueRef::Constant(*value),
                     AtomArg::Const(Const::Text(_)) => panic!(
-                        "rule {} passes text to {:?}; embedded calls currently accept only i32",
+                        "rule {} passes text to {:?}; embedded calls currently accept only i64",
                         catalog.rule(),
                         call.function()
                     ),
@@ -161,7 +162,7 @@ impl CallProjection {
 
             let output = match predicate {
                 CallPredicate::Bind { output, .. } => {
-                    if function.return_type() != RustReturnType::I32 {
+                    if function.return_type() != RustReturnType::I64 {
                         panic!(
                             "rule {} binds bool-returning {:?}; use it as a bare @call filter",
                             catalog.rule(),
@@ -181,7 +182,7 @@ impl CallProjection {
                 CallPredicate::Filter(_) => {
                     if function.return_type() != RustReturnType::Bool {
                         panic!(
-                            "rule {} uses i32-returning {:?} as a filter; bind its result with 'Variable = @call(...)'",
+                            "rule {} uses i64-returning {:?} as a filter; bind its result with 'Variable = @call(...)'",
                             catalog.rule(),
                             call.function()
                         );
@@ -309,8 +310,8 @@ mod tests {
     fn lowers_relational_constants_chains_filters_and_head_fields() {
         let projection = projection(
             r#".code rust
-pub fn add(x: i32, y: i32) -> i32 { x + y }
-pub fn keep(x: i32) -> bool { x > 0 }
+pub fn add(x: i64, y: i64) -> i64 { x + y }
+pub fn keep(x: i64) -> bool { x > 0 }
 .endcode
 .in
 .decl Input(x: number)
@@ -342,7 +343,7 @@ Result(X, Z) :- Input(X), Y = @call(add, X, 1), Z = @call(add, Y, 2), @call(keep
     fn rejects_binding_a_boolean_export() {
         projection(
             r#".code rust
-pub fn keep(x: i32) -> bool { x > 0 }
+pub fn keep(x: i64) -> bool { x > 0 }
 .endcode
 .in
 .decl Input(x: number)
@@ -355,11 +356,11 @@ Result(Y) :- Input(X), Y = @call(keep, X).
     }
 
     #[test]
-    #[should_panic(expected = "uses i32-returning")]
+    #[should_panic(expected = "uses i64-returning")]
     fn rejects_using_a_numeric_export_as_a_filter() {
         projection(
             r#".code rust
-pub fn identity(x: i32) -> i32 { x }
+pub fn identity(x: i64) -> i64 { x }
 .endcode
 .in
 .decl Input(x: number)

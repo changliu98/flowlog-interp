@@ -444,14 +444,14 @@ pub fn codegen_min_optimize(_: TokenStream) -> TokenStream {
                     // Phase 1: Transform input tuples to (key, Min_value) pairs
                     // ========================================================
                     // Extract key columns (all but last) and value column (last)
-                    // Convert value to u32 and wrap in Min semiring structure
+                    // Convert value to the Min semiring's unsigned key
                     .inner
                     .flat_map(move |(row, t, _)| {
                         let mut key = reading::row::Row::<#key_arity>::new();
                         for i in 0..#key_arity {
                             key.push(row.column(i));
                         }
-                        let value = row.column(#key_arity) as u32;
+                        let value = row.column(#key_arity) as u64;
                         std::iter::once((key, reading::Min::new(value))).into_iter().map(move |(x, d2)| (x, t.clone(), d2))
                     })
                     .as_collection()
@@ -484,7 +484,7 @@ pub fn codegen_min_optimize(_: TokenStream) -> TokenStream {
                             result.push(key.column(i));
                         }
                         // Push minimized value into the last column (extracted from diff!)
-                        result.push(min_val.value as i32);
+                        result.push(min_val.value as reading::Val);
                         std::iter::once((result, reading::semiring_one())).into_iter().map(move |(x2, d2)| (x2, t.clone(), d2))
                     })
                     .as_collection()
@@ -499,7 +499,7 @@ pub fn codegen_min_optimize(_: TokenStream) -> TokenStream {
                     // Phase 1: Transform fat tuples to (key, Min_value) pairs
                     // =======================================================
                     // Extract key columns (all but last) and value column (last)
-                    // Convert value to u32 and wrap in Min semiring structure
+                    // Convert value to the Min semiring's unsigned key
                     .inner
                     .flat_map(move |(row, t, _)| {
                         let mut key = reading::row::FatRow::new();
@@ -511,7 +511,7 @@ pub fn codegen_min_optimize(_: TokenStream) -> TokenStream {
                         }
                             
                         // Extract the last column as the value to minimize
-                        let value = row.column(arity - 1) as u32;
+                        let value = row.column(arity - 1) as u64;
                         std::iter::once((key, reading::Min::new(value))).into_iter().map(move |(x, d2)| (x, t.clone(), d2))
                     })
                     .as_collection()
@@ -544,7 +544,7 @@ pub fn codegen_min_optimize(_: TokenStream) -> TokenStream {
                         }
                             
                         // Push minimized value as the last column
-                        result.push(min_val.value as i32);
+                        result.push(min_val.value as reading::Val);
                             
                         std::iter::once((result, reading::semiring_one())).into_iter().map(move |(x2, d2)| (x2, t.clone(), d2))
                     })

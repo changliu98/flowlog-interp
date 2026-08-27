@@ -5,19 +5,18 @@ use syn::{FnArg, Item, ReturnType, Type, Visibility};
 
 /// Scalar results that an embedded Rust function may expose to `@call`.
 ///
-/// FlowLog's physical rows currently contain only `i32` values.  An `i32`
-/// result can therefore bind a rule variable, while a `bool` result is used as
-/// a body filter.
+/// FlowLog's physical rows contain `i64` values, so an `i64` result can bind a
+/// rule variable, while a `bool` result is used as a body filter.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum RustReturnType {
-    I32,
+    I64,
     Bool,
 }
 
 impl fmt::Display for RustReturnType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::I32 => write!(f, "i32"),
+            Self::I64 => write!(f, "i64"),
             Self::Bool => write!(f, "bool"),
         }
     }
@@ -100,10 +99,10 @@ impl EmbeddedRust {
 
             for argument in &signature.inputs {
                 match argument {
-                    FnArg::Typed(argument) if is_plain_type(&argument.ty, "i32") => {}
+                    FnArg::Typed(argument) if is_plain_type(&argument.ty, "i64") => {}
                     FnArg::Typed(argument) => {
                         return Err(format!(
-                            "embedded Rust export {name:?} has unsupported argument type {}; only i32 inputs are supported",
+                            "embedded Rust export {name:?} has unsupported argument type {}; the @call ABI is i64, so only i64 inputs are supported",
                             display_type(&argument.ty)
                         ));
                     }
@@ -116,19 +115,19 @@ impl EmbeddedRust {
             }
 
             let return_type = match &signature.output {
-                ReturnType::Type(_, output) if is_plain_type(output, "i32") => RustReturnType::I32,
+                ReturnType::Type(_, output) if is_plain_type(output, "i64") => RustReturnType::I64,
                 ReturnType::Type(_, output) if is_plain_type(output, "bool") => {
                     RustReturnType::Bool
                 }
                 ReturnType::Type(_, output) => {
                     return Err(format!(
-                        "embedded Rust export {name:?} returns {}; only i32 and bool results are supported",
+                        "embedded Rust export {name:?} returns {}; the @call ABI is i64, so only i64 and bool results are supported",
                         display_type(output)
                     ));
                 }
                 ReturnType::Default => {
                     return Err(format!(
-                        "embedded Rust export {name:?} must return i32 or bool"
+                        "embedded Rust export {name:?} must return i64 or bool"
                     ));
                 }
             };
@@ -272,9 +271,9 @@ mod tests {
     fn extracts_and_describes_public_rust_functions() {
         let program = r#".code rust
 use std::cmp::min;
-pub fn clamp(x: i32, limit: i32) -> i32 { min(x, limit) }
-pub fn positive(x: i32) -> bool { x > 0 }
-fn helper(x: i32) -> i32 { x + 1 }
+pub fn clamp(x: i64, limit: i64) -> i64 { min(x, limit) }
+pub fn positive(x: i64) -> bool { x > 0 }
+fn helper(x: i64) -> i64 { x + 1 }
 .endcode
 .in
 .decl Input(x: number)
@@ -299,7 +298,7 @@ Output(x) :- Input(x).
     #[test]
     fn rejects_an_export_outside_the_physical_scalar_abi() {
         let error =
-            EmbeddedRust::parse("pub fn bad(x: i64) -> i32 { x as i32 }".to_string()).unwrap_err();
-        assert!(error.contains("only i32 inputs are supported"));
+            EmbeddedRust::parse("pub fn bad(x: i32) -> i64 { x as i64 }".to_string()).unwrap_err();
+        assert!(error.contains("the @call ABI is i64, so only i64 inputs are supported"));
     }
 }

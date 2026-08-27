@@ -38,19 +38,19 @@ fn embedded_rust_calls_bind_filter_chain_and_reuse_the_native_cache() {
         r#".code rust
 use std::cmp::min;
 
-fn absolute(value: i32) -> i32 {
+fn absolute(value: i64) -> i64 {
     value.saturating_abs()
 }
 
-pub fn normalize(value: i32, limit: i32) -> i32 {
+pub fn normalize(value: i64, limit: i64) -> i64 {
     min(absolute(value), limit)
 }
 
-pub fn add(value: i32, increment: i32) -> i32 {
+pub fn add(value: i64, increment: i64) -> i64 {
     value.saturating_add(increment)
 }
 
-pub fn keep(value: i32) -> bool {
+pub fn keep(value: i64) -> bool {
     value % 2 == 0
 }
 .endcode
@@ -134,11 +134,11 @@ fn embedded_rust_call_participates_in_a_recursive_fixed_point() {
     fs::write(
         &program_path,
         r#".code rust
-pub fn next(value: i32) -> i32 {
+pub fn next(value: i64) -> i64 {
     value.saturating_add(1)
 }
 
-pub fn at_most(value: i32, limit: i32) -> bool {
+pub fn at_most(value: i64, limit: i64) -> bool {
     value <= limit
 }
 .endcode

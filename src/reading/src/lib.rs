@@ -13,6 +13,9 @@ pub use config::{FALLBACK_ARITY, KV_MAX, PROD_MAX, ROW_MAX};
 // export semiring types and functions for convenience
 pub use semiring::{Semiring, semiring_one, SEMIRING_TYPE, Min};
 
+// the engine-wide scalar value domain, defined once in `parsing`
+pub use parsing::Val;
+
 // feature propagation through dependency chain && mutually exclusive feature configuration
 // workspace
 //     ↓ --features isize-type

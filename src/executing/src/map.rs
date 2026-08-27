@@ -6,13 +6,14 @@ use planning::flow::TransformationFlow;
 use reading::row::Row;
 use reading::row::FatRow;
 use reading::row::Array;
+use reading::Val;
 use crate::compare::*;
 use crate::native_calls::NativeCallModule;
 use planning::compare::ComparisonExprArgument;
 use planning::calls::CallProjection;
 
 
-fn const_eq_deconstructor(constraints: &BaseConstraints) -> Vec<(usize, i32)> {
+fn const_eq_deconstructor(constraints: &BaseConstraints) -> Vec<(usize, Val)> {
     constraints.constant_eq_constraints().iter().filter_map(|(arg, constant)| match arg {
         TransformationArgument::KV((true, id)) => Some((*id, constant.integer())),
         _ => None,
@@ -40,7 +41,7 @@ fn map_deconstructor<const N: usize>(args: &Arc<Vec<TransformationArgument>>) ->
 }
 
 #[inline(always)]
-fn is_filtered<const M: usize>(v: &Row<M>, const_eqs: &[(usize, i32)], var_eqs: &[(usize, usize)], compares: &Vec<ComparisonExprArgument>) -> bool {
+fn is_filtered<const M: usize>(v: &Row<M>, const_eqs: &[(usize, Val)], var_eqs: &[(usize, usize)], compares: &Vec<ComparisonExprArgument>) -> bool {
     const_eqs.iter().all(|(i, constant)| v.column(*i) == *constant) && 
     var_eqs.iter().all(|(i, j)| v.column(*i) == v.column(*j)) &&
     compares.iter().all(|compare| compare_row(v, compare))
@@ -144,7 +145,7 @@ fn map_deconstructor_fat(args: &Arc<Vec<TransformationArgument>>) -> Vec<usize> 
 }
 
 #[inline(always)]
-fn is_filtered_fat(v: &FatRow, const_eqs: &[(usize, i32)], var_eqs: &[(usize, usize)], compares: &Vec<ComparisonExprArgument>) -> bool {
+fn is_filtered_fat(v: &FatRow, const_eqs: &[(usize, Val)], var_eqs: &[(usize, usize)], compares: &Vec<ComparisonExprArgument>) -> bool {
     const_eqs.iter().all(|(i, constant)| v.column(*i) == *constant) && 
     var_eqs.iter().all(|(i, j)| v.column(*i) == v.column(*j)) &&
     compares.iter().all(|compare| compare_row(v, compare))

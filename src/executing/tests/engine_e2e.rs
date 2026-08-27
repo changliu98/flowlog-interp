@@ -402,6 +402,138 @@ Out(k, a1, a2, a3, a4) :- A(k, a1, a2, a3, a4), !B(k).
     assert_eq!(rows(&temp.output("Out")), vec![vec![1, 2, 3, 4, 5]]);
 }
 
+/// An atom none of whose columns are retained downstream is an existential
+/// guard: it contributes that the relation has a row, and nothing else.
+/// "derive if any row exists" is ordinary Datalog and the planner used to have
+/// no signature for it, refusing the rule with `kv_to_kv: null signatures`.
+///
+/// The trigger is the retained signature, not the spelling, so every way of
+/// writing a dead column is covered: all positions wildcards, a named variable
+/// nothing downstream reads, and both again in a rule carrying an embedded
+/// call (which takes a different planning path, since calls skip SIP).
+const GUARD_SPELLINGS: [(&str, &str, &str); 4] = [
+    ("wildcards", "", "out(A) :- s(A), t(_, _)."),
+    ("dead variable", "", "out(A) :- s(A), t(B, _)."),
+    (
+        "wildcards with a call",
+        ".code rust\npub fn pick(x: i64) -> i64 { x }\n.endcode\n",
+        "out(Y) :- s(A), t(_, _), Y = @call(pick, A).",
+    ),
+    (
+        "dead variable with a call",
+        ".code rust\npub fn pick(x: i64) -> i64 { x }\n.endcode\n",
+        "out(Y) :- s(A), t(B, _), Y = @call(pick, A).",
+    ),
+];
+
+fn guard_program(embedded: &str, rule: &str) -> String {
+    format!(
+        "{embedded}.in
+.decl s(c0: number)
+.input s.facts
+.decl t(c0: number, c1: number)
+.input t.facts
+.printsize
+.decl out(c0: number)
+.rule
+{rule}
+"
+    )
+}
+
+#[test]
+fn an_existential_guard_contributes_existence() {
+    for (spelling, embedded, rule) in GUARD_SPELLINGS {
+        let temp = TempTree::new("guard");
+        let program = temp.program(&guard_program(embedded, rule));
+        temp.facts("s", "5\n");
+        temp.facts("t", "7,8\n");
+
+        assert_success(&run(&temp, &program, &[]));
+        assert_eq!(rows(&temp.output("out")), vec![vec![5]], "{spelling}");
+    }
+}
+
+#[test]
+fn an_existential_guard_over_an_empty_relation_derives_nothing() {
+    for (spelling, embedded, rule) in GUARD_SPELLINGS {
+        let temp = TempTree::new("guard-empty");
+        let program = temp.program(&guard_program(embedded, rule));
+        temp.facts("s", "5\n");
+        temp.facts("t", "");
+
+        assert_success(&run(&temp, &program, &[]));
+        assert_eq!(rows(&temp.output("out")), Vec::<Vec<i64>>::new(), "{spelling}");
+    }
+}
+
+/// The guard says whether the relation has a row, so its own cardinality must
+/// not reach the result: three rows of `t` are one existence, not three.
+#[test]
+fn an_existential_guard_does_not_multiply_its_driver() {
+    for (spelling, embedded, rule) in GUARD_SPELLINGS {
+        let temp = TempTree::new("guard-cardinality");
+        let program = temp.program(&guard_program(embedded, rule));
+        temp.facts("s", "5\n6\n");
+        temp.facts("t", "7,8\n9,10\n11,12\n");
+
+        assert_success(&run(&temp, &program, &[]));
+        assert_eq!(
+            rows(&temp.output("out")),
+            vec![vec![5], vec![6]],
+            "{spelling}",
+        );
+    }
+}
+
+#[test]
+fn an_existential_guard_in_a_recursive_rule_reaches_its_fixed_point() {
+    for (spelling, guard) in [("wildcards", "t(_, _)"), ("dead variable", "t(B, _)")] {
+        let temp = TempTree::new("guard-recursive");
+        let program = temp.program(&format!(
+            ".in
+.decl s(c0: number)
+.input s.facts
+.decl arc(x: number, y: number)
+.input arc.facts
+.decl t(c0: number, c1: number)
+.input t.facts
+.printsize
+.decl reach(c0: number)
+.rule
+reach(A) :- s(A), {guard}.
+reach(y) :- reach(x), arc(x, y).
+"
+        ));
+        temp.facts("s", "5\n");
+        temp.facts("arc", "5,6\n6,7\n");
+        temp.facts("t", "7,8\n");
+
+        assert_success(&run(&temp, &program, &[]));
+        assert_eq!(
+            rows(&temp.output("reach")),
+            vec![vec![5], vec![6], vec![7]],
+            "{spelling}",
+        );
+    }
+}
+
+/// The negated form of the same shape is a different question - whether the
+/// relation is empty at all - and an antijoin has no key to answer it on. It is
+/// refused rather than planned onto an absent key.
+#[test]
+fn a_negation_retaining_no_column_is_refused() {
+    let temp = TempTree::new("guard-negated");
+    let program = temp.program(&guard_program("", "out(A) :- s(A), !t(_, _)."));
+    temp.facts("s", "5\n");
+    temp.facts("t", "7,8\n");
+
+    assert_refused(
+        &run(&temp, &program, &[]),
+        "negates t without retaining any of its columns",
+    );
+}
+
 /// The head checks are unit-tested in `parsing::validate`; this asserts that
 /// the binary reaches them, before it reads a fact or assembles a dataflow.
 #[test]

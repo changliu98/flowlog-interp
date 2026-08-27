@@ -227,7 +227,14 @@ impl Transformation {
             (true, false) => format!("Row({}){}", input_signature_name, flow),
             (false, true) => format!("K({}){}", input_signature_name, flow),
             (false, false) => format!("Kv({}){}", input_signature_name, flow),
-            (true, true) => panic!("Transformation::kv_to_kv: null signatures"),
+            // Retaining no column is a signature, not a missing one. It is what
+            // an atom used purely as an existential guard asks for - every
+            // position a wildcard, or every variable dead downstream, as in
+            // `out(A) :- s(A), t(_, _).` - and it means the atom contributes
+            // whether it has a row and nothing else. The projection is the
+            // relation's 0-column image: empty when the relation is empty, one
+            // row otherwise.
+            (true, true) => format!("Exists({}){}", input_signature_name, flow),
         };
            
         let output = 

@@ -23,8 +23,16 @@ use reading::config::{KV_MAX, PROD_MAX, ROW_MAX};
 // `every_dispatch_covers_the_shapes_planned_onto_fixed_size_rows` can check
 // them against that invariant rather than against a second copy of themselves.
 
-/// row -> row: any row in, any row out.
+/// row -> row: any row in, any row out. A projection may retain no column at
+/// all - that is an atom used as an existential guard, whose 0-column image
+/// says whether the relation has a row - so the output starts at zero.
 fn row_row_space() -> Vec<(usize, usize)> {
+    iproduct!(1..=ROW_MAX, 0..=ROW_MAX).collect()
+}
+
+/// row -> row through an embedded call. A call projection is refused unless it
+/// emits at least one field, so this one starts at one.
+fn call_row_space() -> Vec<(usize, usize)> {
     iproduct!(1..=ROW_MAX, 1..=ROW_MAX).collect()
 }
 
@@ -104,10 +112,19 @@ pub fn codegen_row_row(_: TokenStream) -> TokenStream {
     for (iv_, target_) in space {
         let base_type = Ident::new(&format!("rel_{}", iv_), Span::call_site());
         let final_rel = Ident::new(&format!("Collection{}", target_), Span::call_site());
-        arms.push(quote! {
-            (#iv_, #target_) => #final_rel(
-                input_rel.#base_type().flat_map(row_row::<#iv_, #target_>(flow)))
-        });
+        let projection = quote! {
+            #final_rel(input_rel.#base_type().flat_map(row_row::<#iv_, #target_>(flow)))
+        };
+        // A projection retaining no column exists to answer whether the
+        // relation has a row, so one row is what it must contribute. Without
+        // this, the guard would carry its relation's cardinality into whatever
+        // consumes it.
+        let projection = if target_ == 0 {
+            quote! { #projection.dedup() }
+        } else {
+            projection
+        };
+        arms.push(quote! { (#iv_, #target_) => #projection });
     }
 
     let expanded = quote! {
@@ -130,7 +147,7 @@ pub fn codegen_row_row(_: TokenStream) -> TokenStream {
 /* embedded Rust call projection: row → row */
 #[proc_macro]
 pub fn codegen_call_row(_: TokenStream) -> TokenStream {
-    let space = row_row_space();
+    let space = call_row_space();
     let mut arms = vec![];
     for (iv_, target_) in space {
         let base_type = Ident::new(&format!("rel_{}", iv_), Span::call_site());
@@ -677,8 +694,15 @@ mod tests {
     #[test]
     fn every_dispatch_covers_the_shapes_planned_onto_fixed_size_rows() {
         assert_covers(
-            "codegen_row_row / codegen_call_row",
+            "codegen_row_row",
             &row_row_space(),
+            // A projection may retain no column: an atom used as an
+            // existential guard keeps none of them.
+            &iproduct!(rows(), 0..=ROW_MAX).collect::<Vec<_>>(),
+        );
+        assert_covers(
+            "codegen_call_row",
+            &call_row_space(),
             &iproduct!(rows(), rows()).collect::<Vec<_>>(),
         );
         assert_covers(

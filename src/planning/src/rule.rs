@@ -543,6 +543,22 @@ impl RuleQueryPlan {
                 .cloned()
                 .collect::<Vec<AtomArgumentSignature>>(); // discarding const, placeholder, and var_eq signatures
 
+            // An antijoin removes the rows that agree on shared columns, so a
+            // negated atom retaining none has nothing to agree on: `!t(_, _)`
+            // asks whether `t` has any row at all, which is a test on the whole
+            // relation rather than a join against it. The positive form of the
+            // same shape is an existential guard and is supported; this one is
+            // refused rather than planned as an antijoin on an absent key.
+            if negated_atom_var_signatures.is_empty() {
+                panic!(
+                    "rule {} negates {} without retaining any of its columns; a negated atom \
+                     whose every position is a constant or a wildcard tests whether the whole \
+                     relation is empty, which is not supported by this engine version",
+                    catalog.rule(),
+                    catalog.negated_atom_names()[negated_rhs_id],
+                );
+            }
+
             /* determine the head (k, v) for the recursive call */
             let negated_head_key_arguments = catalog.signature_to_argument_strs(&negated_atom_var_signatures);
             let negated_head_key_arguments_set: HashSet<&String> = negated_head_key_arguments.iter().collect();

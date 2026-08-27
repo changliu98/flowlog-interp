@@ -8,13 +8,98 @@ use syn::Ident;
 use reading::config::{KV_MAX, PROD_MAX, ROW_MAX};
 
 /* ------------------------------------------------------------------------ */
+/* the shapes each operator generates a fixed-size arm for */
+/* ------------------------------------------------------------------------ */
+//
+// Every dispatch below is a `match` over runtime arities with a `_` arm that
+// panics, so a shape absent from one of these spaces is a legal program refused
+// by arity. Which shapes must be present is not a free choice: `should_use_fat_
+// mode` plans a collection onto fat rows only when the fixed-size rows cannot
+// hold it, and everything it leaves behind arrives here. The two limits differ
+// and are not interchangeable - a row reaches `ROW_MAX`, while each half of a
+// (key, value) pair is bounded by the generated key/value tables at `KV_MAX` -
+// and reading one for the other is what produced
+// `codegen_aggregation unimplemented for arity 6`. The spaces are named so that
+// `every_dispatch_covers_the_shapes_planned_onto_fixed_size_rows` can check
+// them against that invariant rather than against a second copy of themselves.
+
+/// row -> row: any row in, any row out.
+fn row_row_space() -> Vec<(usize, usize)> {
+    iproduct!(1..=ROW_MAX, 1..=ROW_MAX).collect()
+}
+
+/// row -> (key, value): a row split into two halves of the key/value tables.
+/// A split cannot produce more columns than the row it reads.
+fn row_kv_space() -> Vec<(usize, usize, usize)> {
+    iproduct!(1..=ROW_MAX, 1..=KV_MAX, 1..=KV_MAX)
+        .filter(|&(iv, ok, ov)| iv >= ok + ov)
+        .collect()
+}
+
+/// (key, value) join (key, value) -> row. The dispatch site orders the operands
+/// by value arity, so only `iv0 >= iv1` can arrive.
+fn jn_space() -> Vec<(usize, usize, usize, usize)> {
+    iproduct!(1..=KV_MAX, 1..=KV_MAX, 1..=KV_MAX, 1..=ROW_MAX)
+        .filter(|&(_, iv0, iv1, _)| iv0 >= iv1)
+        .collect()
+}
+
+/// (key, value) join (key,) -> row.
+fn kv_k_jn_space() -> Vec<(usize, usize, usize)> {
+    iproduct!(1..=KV_MAX, 1..=KV_MAX, 1..=ROW_MAX).collect()
+}
+
+/// (key,) join (key,) -> row.
+fn k_k_jn_space() -> Vec<(usize, usize)> {
+    iproduct!(1..=KV_MAX, 1..=ROW_MAX).collect()
+}
+
+/// (∅, value) product (∅, value) -> row, bounded by `PROD_MAX` rather than by
+/// the rows. This one table is deliberately partial: the dispatch falls back to
+/// the fat-row product for every shape outside it, so the arms here are a fast
+/// path and not the operator's domain.
+fn cartesian_space() -> Vec<(usize, usize, usize)> {
+    iproduct!(1..=PROD_MAX, 1..=PROD_MAX, 1..=PROD_MAX)
+        .filter(|&(iv0, iv1, target)| iv0 + iv1 >= target)
+        .collect()
+}
+
+/// (key, value) -> row. The result is a row, so it is bounded by `ROW_MAX` and
+/// not by the key/value table it is flattened from; it is also a projection of
+/// the key and value, so it cannot be wider than both together.
+fn kv_flatten_space() -> Vec<(usize, usize, usize)> {
+    iproduct!(1..=KV_MAX, 1..=KV_MAX, 1..=ROW_MAX)
+        .filter(|&(ik, iv, target)| ik + iv >= target)
+        .collect()
+}
+
+/// (key,) -> row, a projection of the key.
+fn k_flatten_space() -> Vec<(usize, usize)> {
+    iproduct!(1..=KV_MAX, 1..=KV_MAX)
+        .filter(|&(ik, target)| ik >= target)
+        .collect()
+}
+
+/// Group-by columns of an aggregate; the relation's arity is one more. The
+/// group-by key is an ordinary fixed-size row that `reduce_core` arranges by
+/// itself rather than half of a generated join table, so the bound is the row's.
+fn aggregation_space() -> Vec<usize> {
+    (0..ROW_MAX).collect()
+}
+
+/// Relation arity of a min aggregate on the specialised semiring path.
+fn min_optimize_space() -> Vec<usize> {
+    (1..=ROW_MAX).collect()
+}
+
+/* ------------------------------------------------------------------------ */
 /* codegen for maps */
 /* ------------------------------------------------------------------------ */
 
 /* row → row */
 #[proc_macro]
 pub fn codegen_row_row(_: TokenStream) -> TokenStream {
-    let space = iproduct!(1..=ROW_MAX, 1..=ROW_MAX);
+    let space = row_row_space();
     let mut arms = vec![];
     for (iv_, target_) in space {
         let base_type = Ident::new(&format!("rel_{}", iv_), Span::call_site());
@@ -45,7 +130,7 @@ pub fn codegen_row_row(_: TokenStream) -> TokenStream {
 /* embedded Rust call projection: row → row */
 #[proc_macro]
 pub fn codegen_call_row(_: TokenStream) -> TokenStream {
-    let space = iproduct!(1..=ROW_MAX, 1..=ROW_MAX);
+    let space = row_row_space();
     let mut arms = vec![];
     for (iv_, target_) in space {
         let base_type = Ident::new(&format!("rel_{}", iv_), Span::call_site());
@@ -79,8 +164,7 @@ pub fn codegen_call_row(_: TokenStream) -> TokenStream {
 /* row → kv */
 #[proc_macro]
 pub fn codegen_row_kv(_: TokenStream) -> TokenStream {
-    let space =
-        iproduct!(1..=ROW_MAX, 1..=KV_MAX, 1..=KV_MAX).filter(|&(iv, ok, ov)| iv >= ok + ov);
+    let space = row_kv_space();
     let mut arms = vec![];
 
     for (iv_, ok_, ov_) in space {
@@ -117,8 +201,7 @@ pub fn codegen_row_kv(_: TokenStream) -> TokenStream {
 /* ------------------------------------------------------------------------ */
 #[proc_macro]
 pub fn codegen_jn(_: TokenStream) -> TokenStream {
-    let space = iproduct!(1..=KV_MAX, 1..=KV_MAX, 1..=KV_MAX, 1..=ROW_MAX)
-        .filter(|&(_, iv0, iv1, _)| iv0 >= iv1);
+    let space = jn_space();
     let mut arms = vec![];
 
     for (ik0_, iv0_, iv1_, target_) in space {
@@ -161,8 +244,7 @@ pub fn codegen_jn(_: TokenStream) -> TokenStream {
 
 #[proc_macro]
 pub fn codegen_cartesian(_: TokenStream) -> TokenStream {
-    let space = iproduct!(1..=PROD_MAX, 1..=PROD_MAX, 1..=PROD_MAX)
-        .filter(|&(iv0, iv1, target)| iv0 + iv1 >= target);
+    let space = cartesian_space();
     let mut arms = vec![];
 
     for (iv0_, iv1_, target_) in space {
@@ -216,7 +298,7 @@ pub fn codegen_cartesian(_: TokenStream) -> TokenStream {
 /* ------------------------------------------------------------------------ */
 #[proc_macro]
 pub fn codegen_kv_k_jn(_: TokenStream) -> TokenStream {
-    let space = iproduct!(1..=KV_MAX, 1..=KV_MAX, 1..=ROW_MAX);
+    let space = kv_k_jn_space();
 
     let mut arms = vec![];
     for (ik0_, iv0_, target_) in space {
@@ -262,7 +344,7 @@ pub fn codegen_kv_k_jn(_: TokenStream) -> TokenStream {
 /* ------------------------------------------------------------------------ */
 #[proc_macro]
 pub fn codegen_k_k_jn(_: TokenStream) -> TokenStream {
-    let space = iproduct!(1..=KV_MAX, 1..=ROW_MAX);
+    let space = k_k_jn_space();
 
     let mut arms = vec![];
     for (ik0_, target_) in space {
@@ -309,11 +391,7 @@ pub fn codegen_k_k_jn(_: TokenStream) -> TokenStream {
 
 #[proc_macro]
 pub fn codegen_kv_flatten(_: TokenStream) -> TokenStream {
-    // The output of a flatten is a row, so it is bounded by `ROW_MAX` and not
-    // by the key/value table's own `KV_MAX`: an antijoin whose surviving
-    // columns number more than `KV_MAX` is ordinary.
-    let space =
-        iproduct!(1..=KV_MAX, 1..=KV_MAX, 1..=ROW_MAX).filter(|&(ik, iv, target)| ik + iv >= target);
+    let space = kv_flatten_space();
 
     let mut arms = vec![];
     for (ik0_, iv0_, target_) in space {
@@ -347,7 +425,7 @@ pub fn codegen_kv_flatten(_: TokenStream) -> TokenStream {
 
 #[proc_macro]
 pub fn codegen_k_flatten(_: TokenStream) -> TokenStream {
-    let space = iproduct!(1..=KV_MAX, 1..=KV_MAX).filter(|&(ik, target)| ik >= target);
+    let space = k_flatten_space();
 
     let mut arms = vec![];
     for (ik0_, target_) in space {
@@ -384,11 +462,7 @@ pub fn codegen_k_flatten(_: TokenStream) -> TokenStream {
 /* ------------------------------------------------------------------------ */
 #[proc_macro]
 pub fn codegen_aggregation(_: TokenStream) -> TokenStream {
-    // Group-by columns, so the relation's arity is one more. The bound is
-    // `ROW_MAX` because the aggregate's key is an ordinary fixed-size row
-    // arranged by `reduce_core`, not one half of a generated join table: an
-    // aggregate over a relation the rows can hold has an arm.
-    let space = 0..ROW_MAX;
+    let space = aggregation_space();
     let mut arms = vec![];
 
     for key_arity in space {
@@ -437,7 +511,7 @@ pub fn codegen_aggregation(_: TokenStream) -> TokenStream {
 
 #[proc_macro]
 pub fn codegen_min_optimize(_: TokenStream) -> TokenStream {
-    let space = 1..=ROW_MAX; // every arity the fixed-size rows hold
+    let space = min_optimize_space();
     let mut arms = vec![];
 
     for arity in space {
@@ -567,4 +641,121 @@ pub fn codegen_min_optimize(_: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rows and key/value pairs a program can still be holding when it reaches
+    /// the fixed-size dispatch, i.e. everything `should_use_fat_mode` does not
+    /// send to the fat rows.
+    fn rows() -> std::ops::RangeInclusive<usize> {
+        1..=ROW_MAX
+    }
+
+    fn key_value_halves() -> std::ops::RangeInclusive<usize> {
+        1..=KV_MAX
+    }
+
+    fn assert_covers<T: PartialEq + std::fmt::Debug>(name: &str, generated: &[T], required: &[T]) {
+        let missing = required
+            .iter()
+            .filter(|shape| !generated.contains(shape))
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "{name} has no arm for {} shape(s) a program can present, e.g. {:?}; \
+             such a program panics by arity",
+            missing.len(),
+            &missing[..missing.len().min(4)],
+        );
+    }
+
+    #[test]
+    fn every_dispatch_covers_the_shapes_planned_onto_fixed_size_rows() {
+        assert_covers(
+            "codegen_row_row / codegen_call_row",
+            &row_row_space(),
+            &iproduct!(rows(), rows()).collect::<Vec<_>>(),
+        );
+        assert_covers(
+            "codegen_row_kv",
+            &row_kv_space(),
+            &iproduct!(rows(), key_value_halves(), key_value_halves())
+                // A split projects the row, so it cannot widen it.
+                .filter(|&(iv, ok, ov)| iv >= ok + ov)
+                .collect::<Vec<_>>(),
+        );
+        assert_covers(
+            "codegen_jn",
+            &jn_space(),
+            &iproduct!(key_value_halves(), key_value_halves(), key_value_halves(), rows())
+                // The dispatch site swaps the operands so the wider value is first.
+                .filter(|&(_, iv0, iv1, _)| iv0 >= iv1)
+                .collect::<Vec<_>>(),
+        );
+        assert_covers(
+            "codegen_kv_k_jn",
+            &kv_k_jn_space(),
+            &iproduct!(key_value_halves(), key_value_halves(), rows()).collect::<Vec<_>>(),
+        );
+        assert_covers(
+            "codegen_k_k_jn",
+            &k_k_jn_space(),
+            &iproduct!(key_value_halves(), rows()).collect::<Vec<_>>(),
+        );
+        assert_covers(
+            "codegen_kv_flatten",
+            &kv_flatten_space(),
+            &iproduct!(key_value_halves(), key_value_halves(), rows())
+                // The result projects the key and value together.
+                .filter(|&(ik, iv, target)| ik + iv >= target)
+                .collect::<Vec<_>>(),
+        );
+        assert_covers(
+            "codegen_k_flatten",
+            &k_flatten_space(),
+            &iproduct!(key_value_halves(), key_value_halves())
+                // The result projects the key.
+                .filter(|&(ik, target)| ik >= target)
+                .collect::<Vec<_>>(),
+        );
+        assert_covers(
+            "codegen_aggregation",
+            &aggregation_space()
+                .into_iter()
+                .map(|group_by| group_by + 1)
+                .collect::<Vec<_>>(),
+            &rows().collect::<Vec<_>>(),
+        );
+        assert_covers(
+            "codegen_min_optimize",
+            &min_optimize_space(),
+            &rows().collect::<Vec<_>>(),
+        );
+    }
+
+    /// The product table is the one deliberate exception, and it is total by
+    /// fallback rather than by enumeration: `codegen_cartesian` routes anything
+    /// it does not generate through the fat-row product. This records that the
+    /// table really is narrower than the rows, so the fallback is load-bearing
+    /// and not dead code.
+    #[test]
+    fn the_product_table_is_narrower_than_the_rows_and_relies_on_its_fallback() {
+        let generated = cartesian_space();
+        assert!(
+            !generated.contains(&(2, 1, 3)),
+            "the product table now covers (2, 1, 3); if it was widened on purpose, \
+             this test and the fallback should be revisited together",
+        );
+        assert!(
+            generated.iter().all(|&(iv0, iv1, target)| {
+                iv0 <= PROD_MAX && iv1 <= PROD_MAX && target <= PROD_MAX
+            }),
+            "the product table is bounded by PROD_MAX",
+        );
+    }
 }

@@ -328,6 +328,9 @@ FlowLog currently supports `count`, `sum`, `min`, `max` aggregation operators. H
 **Rule heads**  
 Outside an aggregate, a head argument must be a variable, and a head's arity must match the relation's `.decl`. Head constants and head arithmetic are refused before evaluation rather than being dropped from the projection.
 
+**Column types**  
+Every column is a `number`. `.decl` also parses `string`, which is not implemented: a program declaring a `string` column is refused rather than loading an empty relation.
+
 **Compilation**  
 FlowLog currently compiles very slowly due to heavy dependencies (e.g., DD/Timely). On r6525 node, a from-scratch release build can take ~16 minutes.
 

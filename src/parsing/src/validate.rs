@@ -1,12 +1,13 @@
 //! Program-level well-formedness checks that the grammar cannot express.
 //!
-//! The grammar accepts several rule shapes the evaluator has no plan for: a
-//! constant or an arithmetic expression in a rule head, an expression inside an
-//! aggregate, a head whose arity disagrees with its `.decl`, and two rules that
-//! derive one relation under different aggregation operators. Each of those
-//! used to run and quietly answer a different query - a head constant became a
-//! narrower projection, an aggregated expression aggregated its first variable,
-//! the first aggregation operator won for every rule of the relation.
+//! The grammar accepts several shapes the evaluator has no plan for: a constant
+//! or an arithmetic expression in a rule head, an expression inside an
+//! aggregate, a head whose arity disagrees with its `.decl`, two rules that
+//! derive one relation under different aggregation operators, and a `string`
+//! column. Each of those used to run and quietly answer a different query - a
+//! head constant became a narrower projection, an aggregated expression
+//! aggregated its first variable, the first aggregation operator won for every
+//! rule of the relation, a `string` column loaded no rows at all.
 //!
 //! A silently wrong answer is worse than a refusal, so a program carrying one
 //! of these shapes is refused here, before stratification and before any
@@ -17,6 +18,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use crate::aggregation::AggregationOperator;
+use crate::decl::DataType;
 use crate::head::HeadArg;
 use crate::parser::Program;
 use crate::rule::FLRule;
@@ -25,6 +27,8 @@ use crate::rule::FLRule;
 ///
 /// Panics with a message quoting the offending rule or declaration.
 pub fn validate_program(program: &Program) {
+    refuse_unimplemented_column_types(program);
+
     let declared_arity = declared_arities(program);
 
     for rule in program.rules() {
@@ -33,6 +37,27 @@ pub fn validate_program(program: &Program) {
     }
 
     refuse_disagreeing_head_operators(program);
+}
+
+/// Every column of every relation is a `number`.
+///
+/// `string` parses, and nothing implements it: the value domain has no
+/// representation for text, so a `string` column of an input relation matched
+/// no cell and the relation loaded zero rows without a word anywhere. An
+/// unimplemented type is a refusal, not an empty relation.
+fn refuse_unimplemented_column_types(program: &Program) {
+    for declaration in program.edbs().iter().chain(program.idbs().iter()) {
+        for attribute in declaration.attributes() {
+            if matches!(attribute.data_type(), DataType::String) {
+                panic!(
+                    "relation {declaration} declares column {:?} as `string`, and string \
+                     columns are not implemented in this engine version: every value is a \
+                     `number`",
+                    attribute.name()
+                );
+            }
+        }
+    }
 }
 
 /// Every relation arity stated by a `.decl`, input or output.
@@ -176,6 +201,32 @@ mod tests {
              .rule\n\
              R(k, v) :- E(k, v).\n\
              S(k, min(v)) :- E(k, v).",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "string columns are not implemented")]
+    fn refuses_a_string_input_column() {
+        validate(
+            ".in\n\
+             .decl E(k: number, v: string)\n\
+             .printsize\n\
+             .decl R(k: number)\n\
+             .rule\n\
+             R(k) :- E(k, v).",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "string columns are not implemented")]
+    fn refuses_a_string_output_column() {
+        validate(
+            ".in\n\
+             .decl E(k: number, v: number)\n\
+             .printsize\n\
+             .decl R(k: number, v: string)\n\
+             .rule\n\
+             R(k, v) :- E(k, v).",
         );
     }
 

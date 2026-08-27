@@ -54,6 +54,10 @@ impl Attribute {
         }
     }
 
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn data_type(&self) -> &DataType {
         &self.data_type
     }

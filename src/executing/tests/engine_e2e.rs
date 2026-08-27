@@ -201,6 +201,27 @@ R(k, 7) :- E(k, v).
 }
 
 #[test]
+fn a_string_column_refuses_the_run() {
+    let temp = TempTree::new("string-column");
+    let program = temp.program(
+        ".in
+.decl E(k: number, v: string)
+.input E.facts
+.printsize
+.decl R(k: number)
+.rule
+R(k) :- E(k, v).
+",
+    );
+    temp.facts("E", "1,hello\n2,world\n");
+
+    assert_refused(
+        &run(&temp, &program, &[]),
+        "string columns are not implemented",
+    );
+}
+
+#[test]
 fn a_cell_that_is_not_a_number_refuses_the_run() {
     let temp = TempTree::new("bad-cell");
     let program = temp.program(

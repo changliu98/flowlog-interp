@@ -1,4 +1,5 @@
 use differential_dataflow::difference::{IsZero, Monoid, Multiply, Semigroup};
+use parsing::Val;
 use serde::{Deserialize, Serialize};
 
 // Re-export Present for convenience
@@ -38,27 +39,38 @@ pub const SEMIRING_TYPE: &str = "Present";
 pub const SEMIRING_TYPE: &str = "isize";
 
 /// MIN Semiring
+///
+/// The carried value is a `Val`, the engine's own value domain, so that the
+/// derived `Ord` and the `min` below are the order of the values being
+/// aggregated. An unsigned carrier would need an order-preserving encoding of
+/// the signed domain, and the plain cast that stood here instead reversed the
+/// order of every negative value.
 #[derive(Copy, Debug, Clone, Hash, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Min {
-    pub value: u64,
+    pub value: Val,
 }
 
 impl Min {
     /// Creates a new `Min` with a value.
-    pub fn new(value: u64) -> Self {
+    pub fn new(value: Val) -> Self {
         Min { value }
     }
 
-    /// Creates a new `Min` representing infinity (u64::MAX).
+    /// Creates a new `Min` representing infinity (`Val::MAX`).
     /// This serves as the additive identity in the MIN semiring:
     /// min(a, ∞) = a for any value a.
+    ///
+    /// The identity is also a legal value, which is harmless: `min` is
+    /// idempotent, so a group whose true minimum is `Val::MAX` combines to
+    /// `Val::MAX`, and the identity is never treated as an absence
+    /// (`is_zero` is constantly false).
     pub fn infinity() -> Self {
-        Min { value: u64::MAX }
+        Min { value: Val::MAX }
     }
 
     /// Returns true if this Min represents infinity.
     pub fn is_infinity(&self) -> bool {
-        self.value == u64::MAX
+        self.value == Val::MAX
     }
 }
 
@@ -90,8 +102,8 @@ impl Multiply<i64> for Min {
 }
 
 // Convenience implementations for easier use
-impl From<u64> for Min {
-    fn from(value: u64) -> Self {
+impl From<Val> for Min {
+    fn from(value: Val) -> Self {
         Min::new(value)
     }
 }
@@ -117,6 +129,19 @@ mod tests {
         let zero = Min::zero();
         assert!(!zero.is_zero());
         assert!(zero.is_infinity());
-        assert_eq!(zero.value, u64::MAX);
+        assert_eq!(zero.value, Val::MAX);
+    }
+
+    #[test]
+    fn min_orders_negative_values_below_positive_ones() {
+        let mut accumulated = Min::new(3);
+        accumulated.plus_equals(&Min::new(-4));
+        assert_eq!(accumulated.value, -4);
+
+        // The threshold operator of the specialised min path compares two
+        // differences directly, so the derived order has to be the value order.
+        assert!(Min::new(-4) < Min::new(3));
+        assert!(Min::new(-4) < Min::infinity());
+        assert!(Min::new(Val::MIN) < Min::new(0));
     }
 }

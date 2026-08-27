@@ -105,6 +105,41 @@ fn rows(path: &Path) -> Vec<Vec<i64>> {
     rows
 }
 
+const MIN_PROGRAM: &str = ".in
+.decl E(k: number, v: number)
+.input E.facts
+.printsize
+.decl M(k: number, v: number)
+.rule
+M(k, min(v)) :- E(k, v).
+";
+
+#[test]
+fn min_aggregation_orders_negative_values_below_positive_ones() {
+    let temp = TempTree::new("min");
+    let program = temp.program(MIN_PROGRAM);
+    temp.facts("E", "1,3\n1,-4\n1,7\n2,-1\n2,-9\n3,5\n");
+
+    assert_success(&run(&temp, &program, &[]));
+    assert_eq!(
+        rows(&temp.output("M")),
+        vec![vec![1, -4], vec![2, -9], vec![3, 5]],
+    );
+}
+
+#[test]
+fn min_aggregation_orders_negative_values_below_positive_ones_in_fat_mode() {
+    let temp = TempTree::new("min-fat");
+    let program = temp.program(MIN_PROGRAM);
+    temp.facts("E", "1,3\n1,-4\n1,7\n2,-1\n2,-9\n3,5\n");
+
+    assert_success(&run(&temp, &program, &["--fat-mode"]));
+    assert_eq!(
+        rows(&temp.output("M")),
+        vec![vec![1, -4], vec![2, -9], vec![3, 5]],
+    );
+}
+
 #[test]
 fn a_cell_that_is_not_a_number_refuses_the_run() {
     let temp = TempTree::new("bad-cell");

@@ -113,9 +113,9 @@ mod tests {
     }
 
     #[test]
-    fn test_min_zero() {
+    fn min_identity_is_not_a_zero_diff() {
         let zero = Min::zero();
-        assert!(zero.is_zero());
+        assert!(!zero.is_zero());
         assert!(zero.is_infinity());
         assert_eq!(zero.value, u32::MAX);
     }

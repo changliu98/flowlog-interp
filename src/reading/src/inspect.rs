@@ -4,33 +4,31 @@
  */
 // use differential_dataflow::difference::Abelian;
 use differential_dataflow::collection::{AsCollection, VecCollection};
-use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
-use differential_dataflow::operators::threshold::ThresholdTotal;
 use differential_dataflow::{ExchangeData, Hashable};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs::{read_to_string, remove_file, File};
-use std::io::Write;
+use std::fs::{remove_file, File};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use timely::dataflow::operators::Map;
 use timely::dataflow::Scope;
 use timely::order::TotalOrder;
 
-use crate::rel::Rel;
-use crate::semiring_one;
+use crate::rel::{dedup_retained_collection, Rel};
+use crate::Semiring;
 use tracing::{debug, error, info};
 
 // Thread-local storage for file handles to avoid repeatedly opening the same files
 thread_local! {
-    static FILE_HANDLES: RefCell<HashMap<String, Arc<Mutex<File>>>> = RefCell::new(HashMap::new());
+    static FILE_HANDLES: RefCell<HashMap<String, Arc<Mutex<BufWriter<File>>>>> = RefCell::new(HashMap::new());
 }
 
 /// Gets or creates a file handle for the specified path
 ///
 /// Ensures each path has only one file handle and creates parent directories if needed.
-fn get_file_handle(path: &str) -> Arc<Mutex<File>> {
+fn get_file_handle(path: &str) -> Arc<Mutex<BufWriter<File>>> {
     let path_str = path.to_string();
 
     FILE_HANDLES.with(|handles| {
@@ -43,8 +41,9 @@ fn get_file_handle(path: &str) -> Arc<Mutex<File>> {
             }
 
             // Open file for writing
-            let file = File::create(path).expect(&format!("Can not create output file: {}", path));
-            handles_ref.insert(path_str.clone(), Arc::new(Mutex::new(file)));
+            let file = File::create(path)
+                .unwrap_or_else(|error| panic!("Can not create output file {path}: {error}"));
+            handles_ref.insert(path_str.clone(), Arc::new(Mutex::new(BufWriter::new(file))));
         }
 
         Arc::clone(handles_ref.get(&path_str).unwrap())
@@ -52,12 +51,11 @@ fn get_file_handle(path: &str) -> Arc<Mutex<File>> {
 }
 
 /// Prints the size of a relation (number of tuples)
-fn printsize<G, D, R>(rel: &VecCollection<G, D, R>, name: &str, is_recursive: bool)
+fn printsize<G, D>(rel: &VecCollection<G, D, Semiring>, name: &str, is_recursive: bool)
 where
     G: Scope,
     G::Timestamp: Lattice + TotalOrder,
     D: ExchangeData + Hashable,
-    R: Semigroup + ExchangeData,
 {
     let prefix = if is_recursive {
         format!("Delta of (recursive) {}", name)
@@ -65,10 +63,10 @@ where
         format!("Size of (non-recursive) {}", name)
     };
 
-    rel.threshold_semigroup(move |_, _, old| old.is_none().then_some(semiring_one()))
+    dedup_retained_collection(rel)
         .inner
         .flat_map(move |(_, t, _)| {
-            Some(((), 1 as i32))
+            Some(((), 1_i32))
                 .into_iter()
                 .map(move |(x, d2)| (x, t.clone(), d2))
         })
@@ -79,18 +77,17 @@ where
 }
 
 /// Prints the content of a relation (all tuples)
-fn print<G, D, R>(rel: &VecCollection<G, D, R>, name: &str)
+fn print<G, D>(rel: &VecCollection<G, D, Semiring>, name: &str)
 where
     G: Scope,
     G::Timestamp: Lattice + TotalOrder,
     D: ExchangeData + Hashable + std::fmt::Display,
-    R: Semigroup + ExchangeData,
 {
     let name = name.to_owned();
-    rel.threshold_semigroup(move |_, _, old| old.is_none().then_some(semiring_one()))
+    dedup_retained_collection(rel)
         .inner
         .flat_map(move |(x, t, _)| {
-            Some((x, 1 as i32))
+            Some((x, 1_i32))
                 .into_iter()
                 .map(move |(x, d2)| (x, t.clone(), d2))
         })
@@ -100,21 +97,25 @@ where
 }
 
 /// Write relation size
-fn writesize<G, D, R>(rel: &VecCollection<G, D, R>, name: &str, file_path: &str)
+fn writesize<G, D>(
+    rel: &VecCollection<G, D, Semiring>,
+    name: &str,
+    file_path: &str,
+    worker_id: usize,
+)
 where
     G: Scope,
     G::Timestamp: Lattice + TotalOrder,
     D: ExchangeData + Hashable,
-    R: Semigroup + ExchangeData,
 {
-    let file_handle = get_file_handle(&file_path);
-    let file_path = file_path.to_string();
+    let path = format!("{}{}", file_path, worker_id);
+    let file_handle = get_file_handle(&path);
     let name = name.to_string();
 
-    rel.threshold_semigroup(move |_, _, old| old.is_none().then_some(semiring_one()))
+    dedup_retained_collection(rel)
         .inner
         .flat_map(move |(_, t, _)| {
-            Some(((), 1 as i32))
+            Some(((), 1_i32))
                 .into_iter()
                 .map(move |(x, d2)| (x, t.clone(), d2))
         })
@@ -124,34 +125,35 @@ where
         .inspect({
             move |x| {
                 let mut file = file_handle.lock().unwrap();
-                writeln!(file, "{}: {:?}", name, x)
-                    .expect(&format!("Can not write size: {}", file_path));
+                writeln!(file, "{}: {:?}", name, x).unwrap_or_else(|error| {
+                    panic!("Can not write size to {path}: {error}")
+                });
             }
         });
 }
 
 /// Flush relation data to a file
-fn write<G, D, R>(rel: &VecCollection<G, D, R>, file_path: &str, worker_id: usize)
+fn write<G, D>(rel: &VecCollection<G, D, Semiring>, file_path: &str, worker_id: usize)
 where
     G: Scope,
     G::Timestamp: Lattice + TotalOrder,
     D: ExchangeData + Hashable + std::fmt::Display,
-    R: Semigroup + ExchangeData,
 {
     let path = format!("{}{}", file_path, worker_id);
     let file_handle = get_file_handle(&path);
 
-    rel.threshold_semigroup(move |_, _, old| old.is_none().then_some(semiring_one()))
+    dedup_retained_collection(rel)
         .inner
         .flat_map(move |(x, t, _)| {
-            Some((x, 1 as i32))
+            Some((x, 1_i32))
                 .into_iter()
                 .map(move |(x, d2)| (x, t.clone(), d2))
         })
         .as_collection()
         .inspect(move |(data, _time, _delta)| {
             let mut file = file_handle.lock().unwrap();
-            writeln!(file, "{}", data).expect(&format!("Can not write: {}", path));
+            writeln!(file, "{}", data)
+                .unwrap_or_else(|error| panic!("Can not write to {path}: {error}"));
         });
 
     // alternative (faster)
@@ -235,24 +237,24 @@ where
 }
 
 /// Writes a relation size with any arity to a file
-pub fn writesize_generic<G>(rel: &Rel<G>, name: &str, file_path: &str)
+pub fn writesize_generic<G>(rel: &Rel<G>, name: &str, file_path: &str, worker_id: usize)
 where
     G: Scope,
     G::Timestamp: Lattice + TotalOrder,
 {
     if rel.is_fat() {
-        writesize(rel.rel_fat(), name, file_path)
+        writesize(rel.rel_fat(), name, file_path, worker_id)
     } else {
         let arity = rel.arity();
         match arity {
-            1 => writesize(rel.rel_1(), name, file_path),
-            2 => writesize(rel.rel_2(), name, file_path),
-            3 => writesize(rel.rel_3(), name, file_path),
-            4 => writesize(rel.rel_4(), name, file_path),
-            5 => writesize(rel.rel_5(), name, file_path),
-            6 => writesize(rel.rel_6(), name, file_path),
-            7 => writesize(rel.rel_7(), name, file_path),
-            8 => writesize(rel.rel_8(), name, file_path),
+            1 => writesize(rel.rel_1(), name, file_path, worker_id),
+            2 => writesize(rel.rel_2(), name, file_path, worker_id),
+            3 => writesize(rel.rel_3(), name, file_path, worker_id),
+            4 => writesize(rel.rel_4(), name, file_path, worker_id),
+            5 => writesize(rel.rel_5(), name, file_path, worker_id),
+            6 => writesize(rel.rel_6(), name, file_path, worker_id),
+            7 => writesize(rel.rel_7(), name, file_path, worker_id),
+            8 => writesize(rel.rel_8(), name, file_path, worker_id),
             _ => unreachable!("arity {} should be handled by fixed-size variants", arity),
         }
     }
@@ -268,33 +270,43 @@ where
 /// - `output_dir`: The directory containing worker partition files.
 /// - `worker_count`: Number of workers (used to find all partial files).
 pub fn merge_relation_partitions(output_path: &str, worker_count: usize) {
-    let file_handle = get_file_handle(&format!("{}", output_path));
-
-    // Read and concatenate all existing worker files
-    let merged_content = (0..worker_count)
-        .filter_map(|worker_id| {
-            let part_path = format!("{}{}", output_path, worker_id);
-            match read_to_string(&part_path) {
-                Ok(content) => Some(content),
-                Err(_) => {
-                    if worker_id == 0 {
-                        // log a warning
-                        debug!("Warning: missing or unreadable file {}", part_path);
-                    }
-                    None
-                }
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("");
-
-    let mut file = file_handle.lock().unwrap();
-    // Dump the merged content into the main output file
-    if let Err(e) = file.write_all(merged_content.as_bytes()) {
-        error!("Error to write merged file {}: {}", output_path, e);
+    if let Some(parent) = Path::new(output_path).parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            error!("Error to create output directory {}: {}", parent.display(), error);
+            return;
+        }
     }
 
-    // Attempt to remove all partial files, ignore failure
+    let output = match File::create(output_path) {
+        Ok(output) => output,
+        Err(error) => {
+            error!("Error to create merged file {}: {}", output_path, error);
+            return;
+        }
+    };
+    let mut output = BufWriter::new(output);
+
+    for worker_id in 0..worker_count {
+        let part_path = format!("{}{}", output_path, worker_id);
+        match File::open(&part_path) {
+            Ok(part) => {
+                if let Err(error) = io::copy(&mut BufReader::new(part), &mut output) {
+                    error!("Error to merge partition {}: {}", part_path, error);
+                    return;
+                }
+            }
+            Err(error) => {
+                debug!("Missing or unreadable partition {}: {}", part_path, error);
+            }
+        }
+    }
+
+    if let Err(error) = output.flush() {
+        error!("Error to flush merged file {}: {}", output_path, error);
+        return;
+    }
+    drop(output);
+
     for worker_id in 0..worker_count {
         let part_path = format!("{}{}", output_path, worker_id);
         let _ = remove_file(&part_path);
@@ -307,7 +319,43 @@ pub fn merge_relation_partitions(output_path: &str, worker_count: usize) {
 pub fn close_all_files() {
     FILE_HANDLES.with(|handles| {
         let mut handles_ref = handles.borrow_mut();
-        handles_ref.clear(); // Dropping all Arc<Mutex<File>> will close the files
+        handles_ref.clear();
     });
     debug!("All output files closed");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn partition_merge_streams_in_worker_order_and_removes_parts() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should follow Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "flowlog-interp-output-{}-{nonce}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&directory).expect("create output fixture directory");
+        let output = directory.join("Result.csv");
+        let output_string = output.to_string_lossy();
+        std::fs::write(format!("{}0", output_string), b"1\n2\n")
+            .expect("write worker zero partition");
+        std::fs::write(format!("{}1", output_string), b"3\n")
+            .expect("write worker one partition");
+
+        merge_relation_partitions(&output_string, 3);
+
+        assert_eq!(
+            std::fs::read(&output).expect("read merged output"),
+            b"1\n2\n3\n",
+        );
+        assert!(!Path::new(&format!("{}0", output_string)).exists());
+        assert!(!Path::new(&format!("{}1", output_string)).exists());
+        std::fs::remove_dir_all(directory).expect("remove output fixture directory");
+    }
 }

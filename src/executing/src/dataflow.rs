@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use itertools::Itertools;
 use tracing::{debug, info};
 
@@ -36,8 +36,28 @@ pub fn program_execution(
     fat_mode: bool,
     idb_map: HashMap<String, AggregationHeadIDB>,
 ) {
-    timely::execute_from_args(args.timely_args().into_iter(), move |worker| {
-        let timer = ::std::time::Instant::now();
+    let timely_args = args.timely_args();
+    let output_paths = args.csvs().map(|csv_path| {
+        strata
+            .program()
+            .idbs()
+            .iter()
+            .map(|relation| format!("{}/csvs/{}.csv", csv_path, relation.name()))
+            .collect::<Vec<_>>()
+    });
+    let size_output_path = args
+        .csvs()
+        .map(|csv_path| format!("{}/csvs/size.txt", csv_path));
+    let recursive_output_names = group_plans
+        .iter()
+        .filter(|group_plan| group_plan.is_recursive())
+        .flat_map(|group_plan| group_plan.heads().into_keys())
+        .collect::<HashSet<_>>();
+    let timer = ::std::time::Instant::now();
+    let worker_timer = timer;
+
+    let guards = timely::execute_from_args(timely_args.into_iter(), move |worker| {
+        let timer = worker_timer;
         let peers = worker.peers();
         let id = worker.index(); 
 
@@ -72,9 +92,7 @@ pub fn program_execution(
             }
             
 
-            for (group_plan_idx, group_plan) in group_plans.iter().enumerate() {
-                let is_last_group_plan = group_plan_idx == group_plans.len() - 1; // last group plan is the final strata (must print size)
-                
+            for group_plan in &group_plans {
                 if !group_plan.is_recursive() {
                     /* construct dataflow for a non-recursive strata */ 
                     for next_transformation in group_plan.strata_plan() {
@@ -97,13 +115,17 @@ pub fn program_execution(
 
                                 Transformation::RowToK { flow, is_no_op, .. } => { // (2) leaf op for semijn or aj
                                     assert!(ik == 0 && ov == 0);
-                                    let output_rel = if *is_no_op { Arc::clone(input_rel) } else { Arc::new(codegen_row_row!()) };
+                                    let output_rel = if *is_no_op {
+                                        Arc::clone(input_rel)
+                                    } else {
+                                        Arc::new(codegen_row_row!().dedup())
+                                    };
                                     k_map.insert(
                                         Arc::clone(output_signature), 
                                         (Arc::clone(&output_rel), Arc::new(output_rel.arrange_set()))
                                     );
                                 },
-    
+
                                 Transformation::RowToKv { flow, .. } => { // (3) leaf op for jn
                                     assert_eq!(ik, 0);
                                     let output_kv = Arc::new(codegen_row_kv!());
@@ -179,7 +201,7 @@ pub fn program_execution(
                     );
 
                     /* inspect idbs of the non-recursive strata (optional) */
-                    if tracing::level_enabled!(tracing::Level::DEBUG) || is_last_group_plan {
+                    if tracing::level_enabled!(tracing::Level::DEBUG) {
                         inspector(
                             &group_plan.head_signatures_set(), 
                             &mut row_map,
@@ -434,21 +456,6 @@ pub fn program_execution(
                         .into_iter()
                         .sorted_by_key(|(sig, _)| sig.name().to_owned())
                     {
-                        let rel_name = recursive_signature.name();
-                        
-                        // only output if rel is IDBs
-                        if strata.program().idbs().iter().any(|idb| idb.name() == rel_name) {
-                            // printsize the relation
-                            printsize_generic(&recursive_rel, &format!("[{}]", rel_name), true);
-                            if let Some(csv_path) = args.csvs() {
-                                // write IDB to csv
-                                writesize_generic(&recursive_rel, &rel_name, &format!("{}/csvs/size.txt", csv_path));
-                                let full_path = format!("{}/csvs/{}.csv", csv_path, rel_name);
-                                write_generic(&recursive_rel, &full_path, id);
-                            }
-                        }
-                        
-
                         // if the rel is in the row_map, it will be overwritten
                         row_map.insert(
                             recursive_signature,
@@ -458,6 +465,32 @@ pub fn program_execution(
                 }
             } // end of a strata (group plan)
 
+            for idb in strata.program().idbs() {
+                let rel_name = idb.name();
+                let signature = Arc::new(CollectionSignature::new_atom(rel_name));
+                let Some(rel) = row_map.get(&signature) else {
+                    continue;
+                };
+
+                printsize_generic(
+                    rel,
+                    &format!("[{}]", rel_name),
+                    recursive_output_names.contains(rel_name),
+                );
+                if let Some(csv_path) = args.csvs() {
+                    writesize_generic(
+                        rel,
+                        rel_name,
+                        &format!("{}/csvs/size.txt", csv_path),
+                        id,
+                    );
+                    write_generic(
+                        rel,
+                        &format!("{}/csvs/{}.csv", csv_path, rel_name),
+                        id,
+                    );
+                }
+            }
 
             /* exports */
             session_map
@@ -508,20 +541,21 @@ pub fn program_execution(
         while worker.step() {
             // spinning
         }
-
-        if id == 0 {
-            let time_elapsed = timer.elapsed(); // <--- end of clock excluding output
-            info!("{:?}:\tDataflow executed", time_elapsed);
-
-            if let Some(csv_path) = args.csvs() {
-                for relation in strata.program().idbs() {
-                    let full_path = format!("{}/csvs/{}.csv", csv_path, relation.name());
-                    debug!("flusing {} to {}.csv", relation.name(), full_path); // actually merging flushed partitions
-                    merge_relation_partitions(&full_path, peers); 
-                }
-            }
-        }
     }).expect("execute_from_args dies");
-}
 
-    
+    let peers = guards.guards().len();
+    for result in guards.join() {
+        result.expect("timely worker panicked");
+    }
+
+    info!("{:?}:\tDataflow executed", timer.elapsed());
+    if let Some(output_paths) = output_paths {
+        for output_path in output_paths {
+            debug!("merging worker partitions into {}", output_path);
+            merge_relation_partitions(&output_path, peers);
+        }
+    }
+    if let Some(size_output_path) = size_output_path {
+        merge_relation_partitions(&size_output_path, peers);
+    }
+}

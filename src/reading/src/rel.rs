@@ -1,7 +1,9 @@
 use paste::paste;
 use std::sync::Arc;
 
-use timely::dataflow::operators::{Concatenate, Map};
+use timely::dataflow::operators::Concatenate;
+#[cfg(all(feature = "present-type", not(feature = "isize-type")))]
+use timely::dataflow::operators::Map;
 use timely::dataflow::scopes::Child;
 use timely::dataflow::Scope;
 use timely::dataflow::ScopeParent;
@@ -16,8 +18,11 @@ use differential_dataflow::operators::iterate::SemigroupVariable;
 use differential_dataflow::operators::ThresholdTotal;
 use differential_dataflow::AsCollection;
 use differential_dataflow::Data;
+use differential_dataflow::ExchangeData;
+use differential_dataflow::Hashable;
 
 use crate::arrangements::ArrangedDict;
+#[cfg(all(feature = "present-type", not(feature = "isize-type")))]
 use crate::semiring_one;
 use crate::Semiring;
 
@@ -32,6 +37,92 @@ use crate::row::FatRow;
 use crate::arrangements::ArrangedSet;
 use crate::row::Array;
 use crate::row::Row;
+
+#[cfg(all(feature = "present-type", not(feature = "isize-type")))]
+pub(crate) fn dedup_collection<G, D>(
+    collection: &VecCollection<G, D, Semiring>,
+) -> VecCollection<G, D, Semiring>
+where
+    G: Scope,
+    G::Timestamp: Data + Lattice + TotalOrder,
+    D: ExchangeData + Hashable,
+{
+    collection.consolidate()
+}
+
+#[cfg(all(feature = "isize-type", not(feature = "present-type")))]
+pub(crate) fn dedup_collection<G, D>(
+    collection: &VecCollection<G, D, Semiring>,
+) -> VecCollection<G, D, Semiring>
+where
+    G: Scope,
+    G::Timestamp: Data + Lattice + TotalOrder,
+    D: ExchangeData + Hashable,
+{
+    collection.threshold_total(|_, count| if *count > 0 { 1 } else { 0 })
+}
+
+#[cfg(all(feature = "present-type", not(feature = "isize-type")))]
+pub(crate) fn dedup_retained_collection<G, D>(
+    collection: &VecCollection<G, D, Semiring>,
+) -> VecCollection<G, D, Semiring>
+where
+    G: Scope,
+    G::Timestamp: Data + Lattice + TotalOrder,
+    D: ExchangeData + Hashable,
+{
+    collection.threshold_semigroup(move |_, _, old| old.is_none().then_some(semiring_one()))
+}
+
+#[cfg(all(feature = "isize-type", not(feature = "present-type")))]
+pub(crate) fn dedup_retained_collection<G, D>(
+    collection: &VecCollection<G, D, Semiring>,
+) -> VecCollection<G, D, Semiring>
+where
+    G: Scope,
+    G::Timestamp: Data + Lattice + TotalOrder,
+    D: ExchangeData + Hashable,
+{
+    collection.threshold_total(|_, count| if *count > 0 { 1 } else { 0 })
+}
+
+#[cfg(all(feature = "present-type", not(feature = "isize-type")))]
+fn subtract_collection<G, D>(
+    collection: &VecCollection<G, D, Semiring>,
+    other: &VecCollection<G, D, Semiring>,
+) -> VecCollection<G, D, Semiring>
+where
+    G: Scope,
+    G::Timestamp: Data + Lattice + TotalOrder,
+    D: ExchangeData + Hashable,
+{
+    collection
+        .inner
+        .flat_map(move |(data, time, _)| std::iter::once((data, time, 1i32)))
+        .as_collection()
+        .concat(
+            &other
+                .inner
+                .flat_map(move |(data, time, _)| std::iter::once((data, time, -1i32)))
+                .as_collection(),
+        )
+        .threshold_semigroup(move |_, _, old| old.is_none().then_some(semiring_one()))
+}
+
+#[cfg(all(feature = "isize-type", not(feature = "present-type")))]
+fn subtract_collection<G, D>(
+    collection: &VecCollection<G, D, Semiring>,
+    other: &VecCollection<G, D, Semiring>,
+) -> VecCollection<G, D, Semiring>
+where
+    G: Scope,
+    G::Timestamp: Data + Lattice + TotalOrder,
+    D: ExchangeData + Hashable,
+{
+    dedup_collection(collection)
+        .concat(&dedup_collection(other).negate())
+        .threshold_total(|_, count| if *count > 0 { 1 } else { 0 })
+}
 
 #[inline(always)]
 pub fn row_chop<const M: usize, const K: usize, const V: usize>(
@@ -204,31 +295,38 @@ macro_rules! impl_rels {
 
                     if self.is_fat() {
                         Rel::CollectionFat(
-                            self.rel_fat()
-                                .inner
-                                .flat_map(move |(x, t, _)| Some((x, 1 as i32)).into_iter().map(move |(x, d2)| (x, t.clone(), d2)))
-                                .as_collection()
-                                .concat(&other.rel_fat().inner
-                                    .flat_map(move |(x, t, _)| Some((x, -1 as i32)).into_iter().map(move |(x, d2)| (x, t.clone(), d2)))
-                                    .as_collection())
-                                .threshold_semigroup(move |_, _, old| old.is_none().then_some(semiring_one())),
+                            subtract_collection(self.rel_fat(), other.rel_fat()),
                             self.arity()
                         )
                     } else {
                         match self.arity() {
                             $(
                                 $arity => Rel::[<Collection $arity>](
-                                    self.[<rel_ $arity>]()
-                                        .inner
-                                        .flat_map(move |(x, t, _)| Some((x, 1 as i32)).into_iter().map(move |(x, d2)| (x, t.clone(), d2)))
-                                        .as_collection()
-                                        .concat(&other.[<rel_ $arity>]().inner
-                                            .flat_map(move |(x, t, _)| Some((x, -1 as i32)).into_iter().map(move |(x, d2)| (x, t.clone(), d2)))
-                                            .as_collection())
-                                        .threshold_semigroup(move |_, _, old| old.is_none().then_some(semiring_one()))
+                                    subtract_collection(
+                                        self.[<rel_ $arity>](),
+                                        other.[<rel_ $arity>](),
+                                    )
                                 ),
                             )*
                             _ => unreachable!("subtract: arity {} overflow", self.arity()),
+                        }
+                    }
+                }
+
+                pub fn dedup(&self) -> Rel<G> {
+                    if self.is_fat() {
+                        Rel::CollectionFat(
+                            dedup_collection(self.rel_fat()),
+                            self.arity()
+                        )
+                    } else {
+                        match self.arity() {
+                            $(
+                                $arity => Rel::[<Collection $arity>](
+                                    dedup_collection(self.[<rel_ $arity>]())
+                                ),
+                            )*
+                            _ => unreachable!("dedup: arity {} should be handled by fixed-size variants", self.arity()),
                         }
                     }
                 }
@@ -269,14 +367,14 @@ macro_rules! impl_rels {
                 pub fn threshold(&self) -> Rel<G> {
                     if self.is_fat() {
                         Rel::CollectionFat(
-                            self.rel_fat().threshold_semigroup(move |_, _, old| old.is_none().then_some(semiring_one())),
+                            dedup_retained_collection(self.rel_fat()),
                             self.arity()
                         )
                     } else {
                         match self.arity() {
                             $(
                                 $arity => Rel::[<Collection $arity>](
-                                    self.[<rel_ $arity>]().threshold_semigroup(move |_, _, old| old.is_none().then_some(semiring_one()))
+                                    dedup_retained_collection(self.[<rel_ $arity>]())
                                 ),
                             )*
                             _ => unreachable!("threshold: arity {} should be handled by fixed-size variants", self.arity()),
@@ -628,3 +726,45 @@ impl_double_rels!(
     (8, 7),
     (8, 8)
 );
+
+#[cfg(all(test, feature = "isize-type", not(feature = "present-type")))]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use differential_dataflow::AsCollection;
+    use timely::dataflow::operators::ToStream;
+
+    use super::*;
+
+    #[test]
+    fn subtract_preserves_retractions_before_set_normalization() {
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&updates);
+
+        timely::execute_directly(move |worker| {
+            let captured = Arc::clone(&captured);
+            worker.dataflow::<(), _, _>(|scope| {
+                let collection = vec![(1i32, (), 1isize), (2, (), 2)]
+                    .into_iter()
+                    .to_stream(scope)
+                    .as_collection();
+                let other = vec![(1i32, (), 1isize), (1, (), -1), (2, (), 2)]
+                    .into_iter()
+                    .to_stream(scope)
+                    .as_collection();
+
+                subtract_collection(&collection, &other).inspect(move |(data, _, diff)| {
+                    captured.lock().expect("capture lock").push((*data, *diff));
+                });
+            });
+        });
+
+        let mut consolidated = BTreeMap::new();
+        for (data, diff) in updates.lock().expect("result lock").iter().copied() {
+            *consolidated.entry(data).or_insert(0isize) += diff;
+        }
+        consolidated.retain(|_, diff| *diff != 0);
+        assert_eq!(consolidated, BTreeMap::from([(1, 1)]));
+    }
+}

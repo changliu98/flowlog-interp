@@ -9,6 +9,7 @@ use differential_dataflow::lattice::Lattice;
 use differential_dataflow::Data;
 
 use crate::Semiring;
+#[cfg(all(feature = "present-type", not(feature = "isize-type")))]
 use crate::semiring_one;
 use crate::row::Row;
 use crate::rel::Rel;
@@ -174,17 +175,32 @@ macro_rules! impl_sets {
 
                 pub fn threshold(&self) -> Rel<G> {
                     if self.is_fat() {
-                        // FatRow case
+                        #[cfg(all(feature = "present-type", not(feature = "isize-type")))]
+                        let thresholded = self.set_fat().threshold_semigroup(
+                            move |_, _, old| old.is_none().then_some(semiring_one()),
+                        );
+                        #[cfg(all(feature = "isize-type", not(feature = "present-type")))]
+                        let thresholded = self
+                            .set_fat()
+                            .threshold_total(|_, count| if *count > 0 { 1 } else { 0 });
+
                         Rel::CollectionFat(
-                            self.set_fat().threshold_semigroup(move |_, _, old| old.is_none().then_some(semiring_one())),
+                            thresholded,
                             self.arity()
                         )
                     } else {
-                        // Fixed-size Row<N> case
                         match self {
-                            $( ArrangedSet::[<ArrangedSet $K>](set) => Rel::[<Collection $K>](
-                                set.threshold_semigroup(move |_, _, old| old.is_none().then_some(semiring_one()))
-                                ),
+                            $( ArrangedSet::[<ArrangedSet $K>](set) => {
+                                #[cfg(all(feature = "present-type", not(feature = "isize-type")))]
+                                let thresholded = set.threshold_semigroup(
+                                    move |_, _, old| old.is_none().then_some(semiring_one()),
+                                );
+                                #[cfg(all(feature = "isize-type", not(feature = "present-type")))]
+                                let thresholded = set
+                                    .threshold_total(|_, count| if *count > 0 { 1 } else { 0 });
+
+                                Rel::[<Collection $K>](thresholded)
+                            },
                             )*
                             ArrangedSet::ArrangedSetFat(_, _) => unreachable!("Fat case should be handled elsewhere"),
                         }

@@ -1,22 +1,29 @@
 use crate::aggregation::*;
 use catalog::head::AggregationHeadIDB;
 use macros::codegen_aggregation;
+#[cfg(not(feature = "isize-type"))]
 use macros::codegen_min_optimize;
+#[cfg(not(feature = "isize-type"))]
 use parsing::aggregation::AggregationOperator;
 use planning::collections::CollectionSignature;
 use reading::inspect::printsize_generic;
 use reading::rel::{row_chop, Rel};
+#[cfg(not(feature = "isize-type"))]
 use reading::row::*;
 
+#[cfg(not(feature = "isize-type"))]
 use differential_dataflow::difference::IsZero;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::operators::reduce::ReduceCore;
+#[cfg(not(feature = "isize-type"))]
 use differential_dataflow::operators::ThresholdTotal;
 use differential_dataflow::trace::implementations::{ValBuilder, ValSpine};
+#[cfg(not(feature = "isize-type"))]
 use differential_dataflow::AsCollection;
 use itertools::Itertools;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+#[cfg(not(feature = "isize-type"))]
 use timely::dataflow::operators::Map;
 use timely::order::TotalOrder;
 
@@ -58,6 +65,7 @@ pub fn non_recursive_collector<G>(
                 }
             }
         };
+        let input_rel = Arc::new(input_rel.dedup());
 
         // Check if this is an aggregation rule by looking it up in the aggregation catalog
         if let Some(idb_catalog) = idb_catalogs.get(head_signature.name()) {

@@ -142,13 +142,35 @@ impl Strata {
         // construct (initial) strata and recursive bitmap
         let mut strata = Vec::new();
         let mut is_recursive_strata_bitmap = Vec::new();
+        let mut scc_index_by_rule = vec![usize::MAX; program.rules().len()];
         for &scc_id in &sccs_order {
             if let Some(scc) = rule_sccs.get(&scc_id) {
+                let stratum_index = strata.len();
+                for &rule_id in scc {
+                    scc_index_by_rule[rule_id] = stratum_index;
+                }
                 strata.push(scc.clone());
                 is_recursive_strata_bitmap.push(scc.len() > 1 || 
                     dependency_graph.rule_dependency_map()
                         .get(&scc_id)
                         .map_or(false, |deps| deps.contains(&scc_id)));
+            }
+        }
+
+        for (&rule_id, negated_dependencies) in dependency_graph.negation_dependency_map() {
+            for &dependency_id in negated_dependencies {
+                let stratum_index = scc_index_by_rule[rule_id];
+                if stratum_index == scc_index_by_rule[dependency_id]
+                    && is_recursive_strata_bitmap[stratum_index]
+                {
+                    panic!(
+                        "program is not stratifiable: rule {rule_id} negates rule \
+                         {dependency_id} in the same recursive stratum\nrule {rule_id}: \
+                         {}\nrule {dependency_id}: {}",
+                        program.rules()[rule_id],
+                        program.rules()[dependency_id],
+                    );
+                }
             }
         }
 
@@ -284,5 +306,69 @@ impl fmt::Display for Strata {
         }
 
         write!(f, "{}", strata_str)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use parsing::parser::Lexeme;
+    use parsing::{FlowLogParser, Parser, Rule};
+
+    use super::*;
+
+    fn parse_program(source: &str) -> Program {
+        let parsed = FlowLogParser::parse(Rule::main_grammar, source)
+            .expect("program should parse")
+            .next()
+            .expect("main grammar should produce a program");
+        Program::from_parsed_rule(parsed)
+    }
+
+    #[test]
+    #[should_panic(expected = "program is not stratifiable")]
+    fn self_negation_is_rejected() {
+        let program = parse_program(
+            ".in\n\
+             .decl Edge(x: number)\n\
+             .input Edge.csv\n\
+             .printsize\n\
+             .decl A(x: number)\n\
+             .rule\n\
+             A(x) :- Edge(x), !A(x).",
+        );
+        Strata::from_parser(program);
+    }
+
+    #[test]
+    #[should_panic(expected = "program is not stratifiable")]
+    fn negation_through_mutual_recursion_is_rejected() {
+        let program = parse_program(
+            ".in\n\
+             .decl Edge(x: number)\n\
+             .input Edge.csv\n\
+             .printsize\n\
+             .decl A(x: number)\n\
+             .decl B(x: number)\n\
+             .rule\n\
+             A(x) :- Edge(x), !B(x).\n\
+             B(x) :- A(x).",
+        );
+        Strata::from_parser(program);
+    }
+
+    #[test]
+    fn negation_of_an_earlier_stratum_is_accepted() {
+        let program = parse_program(
+            ".in\n\
+             .decl Edge(x: number)\n\
+             .input Edge.csv\n\
+             .printsize\n\
+             .decl A(x: number)\n\
+             .decl B(x: number)\n\
+             .rule\n\
+             A(x) :- Edge(x).\n\
+             B(x) :- Edge(x), !A(x).",
+        );
+        Strata::from_parser(program);
     }
 }

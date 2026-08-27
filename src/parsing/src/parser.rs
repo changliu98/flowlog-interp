@@ -101,6 +101,10 @@ impl Program {
             .unwrap();
         let mut program = Self::from_parsed_rule(parsed_rule);
         program.embedded_rust = embedded_rust;
+        // A program that parses can still be one the evaluator has no plan for.
+        // Refusing it here keeps every entry point - and every stage after this
+        // one - from having to re-derive that.
+        crate::validate::validate_program(&program);
         program
     }
 }

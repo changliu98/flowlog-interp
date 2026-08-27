@@ -25,6 +25,7 @@ pub mod embedded; // Rust implementations embedded in a .dl program
 pub mod head; // Head expressions in logic rules
 pub mod parser; // Core parsing utilities and traits
 pub mod rule; // Complete rule definitions and structures
+pub mod validate; // Well-formedness checks the grammar cannot express
 
 // External crate imports
 extern crate pest; // Pest parsing expression grammar library

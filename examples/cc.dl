@@ -3,7 +3,7 @@
 .input Arc.csv
 
 .printsize
-.decl CC2(cc: number)
+.decl CC2(node: number, cc: number)
 .decl CC(node: number, cc: number)
 
 .rule

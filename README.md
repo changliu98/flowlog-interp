@@ -323,13 +323,16 @@ cache location is selected in this order: `--call-cache`,
 ## FlowLog Current Limitations (Work In Progress)
 
 **Aggregation**  
-FlowLog currently supports `count`, `sum`, `min`, `max` aggregation operators. However, the aggregate field must be the **last argument** in the head IDB. All rules deriving the same IDB must conform to the same **aggregation type** (e.g. `count`, `sum`).
+FlowLog currently supports `count`, `sum`, `min`, `max` aggregation operators. However, the aggregate field must be the **last argument** in the head IDB. All rules deriving the same IDB must conform to the same **aggregation type** (e.g. `count`, `sum`), and the aggregate must be applied to a single variable. A program that breaks either rule is refused before evaluation, naming the rules that disagree, rather than being evaluated under whichever operator was seen first.
+
+**Rule heads**  
+Outside an aggregate, a head argument must be a variable, and a head's arity must match the relation's `.decl`. Head constants and head arithmetic are refused before evaluation rather than being dropped from the projection.
 
 **Compilation**  
 FlowLog currently compiles very slowly due to heavy dependencies (e.g., DD/Timely). On r6525 node, a from-scratch release build can take ~16 minutes.
 
 **Arithmetic Head**  
-Support for the Arithmetic Head feature is currently unstable and conflicts with the existing SIP optimization. We have therefore moved it to a temporary branch  `nemo_arithmetic`. You can check out this branch to run programs that require this feature (e.g., SSSP). We have confirmed it runs correctly on SSSP, but we do not guarantee correctness in general.
+Support for the Arithmetic Head feature is currently unstable and conflicts with the existing SIP optimization. We have therefore moved it to a temporary branch  `nemo_arithmetic`. You can check out this branch to run programs that require this feature (e.g., SSSP). We have confirmed it runs correctly on SSSP, but we do not guarantee correctness in general. On this branch such a program is refused rather than evaluated with the arithmetic dropped, so `examples/sssp.dl` (`min(0)`, `min(d1 + d2)`) runs only on `nemo_arithmetic`.
 
 ---
 

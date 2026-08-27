@@ -177,6 +177,29 @@ X(a, i) :- W(a, b, c, d, e, f, g, h, i).
     assert_eq!(rows(&temp.output("X")), vec![vec![1, 9]]);
 }
 
+/// The head checks are unit-tested in `parsing::validate`; this asserts that
+/// the binary reaches them, before it reads a fact or assembles a dataflow.
+#[test]
+fn a_head_the_engine_cannot_evaluate_refuses_the_run() {
+    let temp = TempTree::new("head-constant");
+    let program = temp.program(
+        ".in
+.decl E(k: number, v: number)
+.input E.facts
+.printsize
+.decl R(k: number, v: number)
+.rule
+R(k, 7) :- E(k, v).
+",
+    );
+    temp.facts("E", "1,2\n3,4\n");
+
+    assert_refused(
+        &run(&temp, &program, &[]),
+        "head constants and head arithmetic are not supported",
+    );
+}
+
 #[test]
 fn a_cell_that_is_not_a_number_refuses_the_run() {
     let temp = TempTree::new("bad-cell");

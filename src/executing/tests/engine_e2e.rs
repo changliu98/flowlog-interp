@@ -140,6 +140,43 @@ fn min_aggregation_orders_negative_values_below_positive_ones_in_fat_mode() {
     );
 }
 
+/// One relation wider than the fixed-size row representation switches the whole
+/// program to fat rows, so an unrelated aggregate in the same program is
+/// evaluated by the fat kernel. That kernel used to emit nothing at all.
+#[test]
+fn an_aggregate_beside_a_wide_relation_still_produces_rows() {
+    let temp = TempTree::new("fat-aggregate");
+    let program = temp.program(
+        ".in
+.decl W(a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number)
+.input W.facts
+.decl E(k: number, v: number)
+.input E.facts
+.printsize
+.decl S(k: number, v: number)
+.decl C(k: number, v: number)
+.decl X(k: number, v: number)
+.rule
+S(k, sum(v)) :- E(k, v).
+C(k, count(v)) :- E(k, v).
+X(a, i) :- W(a, b, c, d, e, f, g, h, i).
+",
+    );
+    temp.facts("W", "1,2,3,4,5,6,7,8,9\n");
+    temp.facts("E", "1,3\n1,4\n2,10\n2,-4\n");
+
+    let execution = run(&temp, &program, &[]);
+    assert_success(&execution);
+    assert!(
+        String::from_utf8_lossy(&execution.stdout).contains("Fat mode automatically enabled"),
+        "the wide relation should have switched the program to fat rows",
+    );
+
+    assert_eq!(rows(&temp.output("S")), vec![vec![1, 7], vec![2, 6]]);
+    assert_eq!(rows(&temp.output("C")), vec![vec![1, 2], vec![2, 2]]);
+    assert_eq!(rows(&temp.output("X")), vec![vec![1, 9]]);
+}
+
 #[test]
 fn a_cell_that_is_not_a_number_refuses_the_run() {
     let temp = TempTree::new("bad-cell");

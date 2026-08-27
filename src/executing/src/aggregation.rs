@@ -34,6 +34,11 @@ fn aggregate_ints(input: &[Val], op: &AggregationOperator) -> Option<Val> {
 ///
 /// # Returns
 /// A closure that implements the aggregation logic for differential dataflow
+///
+/// `reduce_core` calls this with four arguments: the key, the key's input
+/// values, the output this key already carries (which the operator clears
+/// afterwards), and the updates to emit. The result therefore belongs in the
+/// fourth argument; anything pushed into the third is discarded.
 pub fn aggregation_reduce_logic<const N_GB: usize>(
     aggregation: &Aggregation,
 ) -> impl FnMut(
@@ -44,7 +49,7 @@ pub fn aggregation_reduce_logic<const N_GB: usize>(
 ) {
     let operator = aggregation.operator().clone();
 
-    move |_key, input, _output, updates| {
+    move |_key, input, _existing_output, updates| {
         let mut out = Row::<1>::new();
 
         // Extract values from input rows for aggregation
@@ -111,14 +116,14 @@ pub fn aggregation_reduce_logic_fat(
 ) {
     let operator = aggregation.operator().clone();
 
-    move |_key, input, output, _fuel| {
+    move |_key, input, _existing_output, updates| {
         let mut out = Row::<1>::new();
 
         let values: Vec<Val> = input.iter().map(|(row, _)| row.column(0)).collect();
 
         if let Some(result) = aggregate_ints(&values, &operator) {
             out.push(result);
-            output.push((out, semiring_one()));
+            updates.push((out, semiring_one()));
         }
     }
 }

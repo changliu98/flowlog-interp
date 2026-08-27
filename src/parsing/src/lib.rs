@@ -21,6 +21,7 @@ pub mod aggregation; // Aggregation functions (sum, max, min, count)
 pub mod arithmetic; // Arithmetic expressions and operations
 pub mod compare; // Comparison operations (>, <, =, !=, etc.)
 pub mod decl; // Variable and predicate declarations
+pub mod embedded; // Rust implementations embedded in a .dl program
 pub mod head; // Head expressions in logic rules
 pub mod parser; // Core parsing utilities and traits
 pub mod rule; // Complete rule definitions and structures

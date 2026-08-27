@@ -42,8 +42,13 @@ rule_decl = { (".rule")? ~ rule+ }
 rule = { head ~ ":-" ~ predicates ~ "." ~ optimize? }
 // Comma-separated list of predicates in the rule body
 predicates = { predicate ~ ("," ~ predicate)* }
-// Types of predicates allowed in rule bodies
-predicate = { atom | neg_atom | compare_expr | BOOLEAN } 
+// Types of predicates allowed in rule bodies. A call binding computes one
+// number; a bare call must return bool and filters the current row.
+predicate = { call_binding | call_expr | atom | neg_atom | compare_expr | BOOLEAN }
+call_binding = { variable ~ "=" ~ call_expr }
+call_expr = { "@call" ~ "(" ~ function_name ~ ("," ~ call_arg)* ~ ")" }
+call_arg = { variable | constant }
+function_name = { identifier }
 // Optimization hint directives
 optimize = { ".plan" | ".sip" | ".optimize" }
 

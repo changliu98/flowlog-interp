@@ -5,9 +5,9 @@ pub mod transformations;
 pub mod constraints;
 pub mod flow;
 pub mod arithmetic; 
+pub mod calls;
 pub mod compare;
 
 pub mod program;
 pub mod strata;
 pub mod rule;
-

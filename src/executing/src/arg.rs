@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -36,6 +37,10 @@ pub struct Args {
     /// 0: as is, 1: sip, 2: planning, 3: sip + planning
     #[arg(short = 'O', value_parser = clap::value_parser!(u8).range(0..=3))]
     opt_level: Option<u8>,
+
+    /// directory for content-addressed compiled `.code rust` modules
+    #[arg(long)]
+    call_cache: Option<PathBuf>,
 }
 
 impl Args {
@@ -88,5 +93,9 @@ impl Args {
 
     pub fn opt_level(&self) -> Option<u8> {
         self.opt_level
+    }
+
+    pub fn call_cache(&self) -> Option<&Path> {
+        self.call_cache.as_deref()
     }
 }

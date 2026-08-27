@@ -42,6 +42,7 @@ differential-dataflow = { workspace = true }
 # differential-dataflow = { path = "/users/hangdong/differential" }
 arrayvec = { workspace = true }
 mimalloc = { workspace = true }
-
+libloading = { workspace = true }
+sha2 = { workspace = true }
 
 

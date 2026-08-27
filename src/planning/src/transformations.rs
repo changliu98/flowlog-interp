@@ -2,8 +2,9 @@ use std::fmt;
 use std::sync::Arc;
 use catalog::compare::ComparisonExprPos;
 use parsing::rule::Const;
-use catalog::atoms::AtomArgumentSignature;
+use catalog::atoms::{AtomArgumentSignature, AtomSignature};
 use crate::collections::{Collection, CollectionSignature};
+use crate::calls::CallProjection;
 // use crate::compare::ComparisonExprArgument;
 use crate::flow::TransformationFlow;
 
@@ -18,6 +19,13 @@ use crate::flow::TransformationFlow;
 */
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub enum Transformation {
+    /// Pure embedded Rust calls and the final head projection for one rule.
+    CallRowToRow {
+        input: Arc<Collection>,
+        output: Arc<Collection>,
+        projection: CallProjection,
+    },
+
     /* direct truncate or filtering, e.g. tc(x, y) :- arc(x, y, _) */
     RowToRow {
         input: Arc<Collection>,
@@ -102,6 +110,7 @@ pub enum Transformation {
 impl Transformation {
     pub fn unary(&self) -> &Arc<Collection> {
         match self {
+            Self::CallRowToRow { input, .. } => input,
             Self::RowToRow { input, .. } => input,
             Self::RowToKv { input, .. } => input,
             Self::RowToK { input, .. } => input,
@@ -112,6 +121,7 @@ impl Transformation {
 
     pub fn is_unary(&self) -> bool {
         match self {
+            Self::CallRowToRow { .. } => true,
             Self::RowToRow { .. } => true,
             Self::RowToKv { .. } => true,
             Self::RowToK { .. } => true,
@@ -134,6 +144,7 @@ impl Transformation {
 
     pub fn output(&self) -> &Arc<Collection> {
         match self {
+            Self::CallRowToRow { output, .. } => output,
             Self::RowToRow { output, .. } => output,
             Self::RowToKv { output, .. } => output,
             Self::RowToK { output, .. } => output,
@@ -155,6 +166,9 @@ impl Transformation {
 
     pub fn flow(&self) -> &TransformationFlow {
         match self {
+            Self::CallRowToRow { .. } => {
+                panic!("Transformation::flow() called on an embedded call projection")
+            }
             Self::RowToRow { flow, .. } => flow,
             Self::RowToKv { flow, .. } => flow,
             Self::RowToK { flow, .. } => flow,
@@ -232,6 +246,36 @@ impl Transformation {
             (false, false, false) => Self::KvToKv { input, output, flow },
             (false, false, true) => Self::KvToK { input, output, flow },
             _ => panic!("Transformation::kv_to_kv: unexpected kv to row transformation"),
+        }
+    }
+
+    pub fn call_projection(input: Arc<Collection>, projection: CallProjection) -> Self {
+        assert!(
+            input.key_argument_signatures().is_empty(),
+            "embedded calls must run over a row collection"
+        );
+        assert!(
+            !projection.head().is_empty(),
+            "embedded call projection must emit a non-empty head"
+        );
+
+        let output_value_signatures = (0..projection.head().len())
+            .map(|argument_id| {
+                AtomArgumentSignature::new(AtomSignature::new(true, usize::MAX), argument_id)
+            })
+            .collect::<Vec<_>>();
+        let output = Arc::new(Collection::new(
+            CollectionSignature::UnaryTransformationOutput {
+                name: format!("Call({}){}", input.signature().name(), projection),
+            },
+            &vec![],
+            &output_value_signatures,
+        ));
+
+        Self::CallRowToRow {
+            input,
+            output,
+            projection,
         }
     }
 
@@ -336,6 +380,11 @@ impl Transformation {
 impl fmt::Display for Transformation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CallRowToRow {
+                output,
+                projection,
+                ..
+            } => write!(f, "@ {} {}", projection, output.pprint()),
             Self::RowToRow { output, is_no_op, .. } => {
                 write!(
                     f,
@@ -389,4 +438,3 @@ impl fmt::Display for Transformation {
         }
     }
 }
-

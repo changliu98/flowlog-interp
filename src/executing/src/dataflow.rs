@@ -20,6 +20,7 @@ use crate::transformer::*;
 use crate::Time;
 use crate::Iter;
 use crate::map::*;
+use crate::native_calls::NativeCallModule;
 
 
 use macros::*;
@@ -37,6 +38,12 @@ pub fn program_execution(
     idb_map: HashMap<String, AggregationHeadIDB>,
 ) {
     let timely_args = args.timely_args();
+    let native_calls = strata
+        .program()
+        .embedded_rust()
+        .map(|embedded| NativeCallModule::compile_and_load(embedded, args.call_cache()))
+        .transpose()
+        .unwrap_or_else(|error| panic!("failed to prepare .code rust module: {error}"));
     let output_paths = args.csvs().map(|csv_path| {
         strata
             .program()
@@ -107,6 +114,15 @@ pub fn program_execution(
                             let input_rel = row_map.get(unary.signature()).expect(&format!("row absent for unary op: {}", unary.signature()));
                             
                             match next_transformation {
+                                Transformation::CallRowToRow { projection, .. } => {
+                                    assert!(ik == 0 && ok == 0);
+                                    let native_calls = native_calls.as_ref().expect(
+                                        "call projection planned without an embedded Rust module",
+                                    );
+                                    let output_rel = Arc::new(codegen_call_row!());
+                                    row_map.insert(Arc::clone(output_signature), output_rel);
+                                },
+
                                 Transformation::RowToRow { flow, is_no_op, .. } => { // (1) single op, tc(x, y) :- arc(y, x).                  
                                     assert!(ik == 0 && ok == 0);
                                     let output_rel = if *is_no_op { Arc::clone(input_rel) } else { Arc::new(codegen_row_row!()) };
@@ -304,6 +320,18 @@ pub fn program_execution(
                                     .expect(&format!("row absent for unary op: {}", unary_signature));
 
                                 match next_transformation {
+                                    Transformation::CallRowToRow { projection, .. } => {
+                                        assert!(ik == 0 && ok == 0);
+                                        let native_calls = native_calls.as_ref().expect(
+                                            "call projection planned without an embedded Rust module",
+                                        );
+                                        let output_rel = Arc::new(codegen_call_row!());
+                                        nest_row_map.insert(
+                                            Arc::clone(output_signature),
+                                            output_rel,
+                                        );
+                                    },
+
                                     Transformation::RowToRow { flow, is_no_op, .. } => { // (1) single op, tc(x, y) :- arc(y, x).                  
                                         assert!(ik == 0 && ok == 0);
                                         let output_rel = 

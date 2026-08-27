@@ -160,6 +160,110 @@ impl Lexeme for Atom {
     }
 }
 
+/// A pure function invocation implemented by the program's `.code rust`
+/// section.
+#[derive(Debug, Clone)]
+pub struct CallExpr {
+    function: String,
+    arguments: Vec<AtomArg>,
+}
+
+impl CallExpr {
+    pub fn function(&self) -> &str {
+        &self.function
+    }
+
+    pub fn arguments(&self) -> &[AtomArg] {
+        &self.arguments
+    }
+}
+
+impl fmt::Display for CallExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "@call({}{})",
+            self.function,
+            if self.arguments.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {}",
+                    self.arguments
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        )
+    }
+}
+
+impl Lexeme for CallExpr {
+    fn from_parsed_rule(parsed_rule: Pair<Rule>) -> Self {
+        debug_assert_eq!(parsed_rule.as_rule(), Rule::call_expr);
+        let mut inner = parsed_rule.into_inner();
+        let function = inner.next().unwrap().as_str().to_string();
+        let arguments = inner
+            .map(|argument| {
+                let argument = argument.into_inner().next().unwrap();
+                AtomArg::from_parsed_rule(argument)
+            })
+            .collect();
+        Self {
+            function,
+            arguments,
+        }
+    }
+}
+
+/// A call either binds one numeric result or acts as a boolean body filter.
+#[derive(Debug, Clone)]
+pub enum CallPredicate {
+    Bind { output: String, call: CallExpr },
+    Filter(CallExpr),
+}
+
+impl CallPredicate {
+    pub fn call(&self) -> &CallExpr {
+        match self {
+            Self::Bind { call, .. } | Self::Filter(call) => call,
+        }
+    }
+
+    pub fn output(&self) -> Option<&str> {
+        match self {
+            Self::Bind { output, .. } => Some(output),
+            Self::Filter(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for CallPredicate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bind { output, call } => write!(f, "{output} = {call}"),
+            Self::Filter(call) => write!(f, "{call}"),
+        }
+    }
+}
+
+impl Lexeme for CallPredicate {
+    fn from_parsed_rule(parsed_rule: Pair<Rule>) -> Self {
+        match parsed_rule.as_rule() {
+            Rule::call_binding => {
+                let mut inner = parsed_rule.into_inner();
+                let output = inner.next().unwrap().as_str().to_string();
+                let call = CallExpr::from_parsed_rule(inner.next().unwrap());
+                Self::Bind { output, call }
+            }
+            Rule::call_expr => Self::Filter(CallExpr::from_parsed_rule(parsed_rule)),
+            _ => unreachable!(),
+        }
+    }
+}
+
 /*
     FLRule: <Head> :- <Predicate>, <Predicate>, ...
     Predicate: <Atom> | !<Atom> | <Comparison>
@@ -170,6 +274,7 @@ pub enum Predicate {
     AtomPredicate(Atom),
     NegatedAtomPredicate(Atom),
     ComparePredicate(ComparisonExpr),
+    CallPredicate(CallPredicate),
 }
 
 impl Predicate {
@@ -178,6 +283,7 @@ impl Predicate {
             Self::AtomPredicate(atom) => atom.arguments().iter().collect(),
             Self::NegatedAtomPredicate(atom) => atom.arguments().iter().collect(),
             Self::ComparePredicate(_) => panic!("Predicate.arguments() on cmpr"),
+            Self::CallPredicate(_) => panic!("Predicate.arguments() on call"),
         }
     }
 
@@ -186,6 +292,7 @@ impl Predicate {
             Self::AtomPredicate(atom) => atom.name(),
             Self::NegatedAtomPredicate(atom) => atom.name(),
             Self::ComparePredicate(_) => panic!("Predicate.name() on cmpr"),
+            Self::CallPredicate(call) => call.call().function(),
         }
     }
 }
@@ -197,6 +304,7 @@ impl fmt::Display for Predicate {
             Self::AtomPredicate(atom) => write!(f, "{}", atom),
             Self::NegatedAtomPredicate(atom) => write!(f, "!{}", atom),
             Self::ComparePredicate(expr) => write!(f, "{}", expr),
+            Self::CallPredicate(call) => write!(f, "{}", call),
         }
     }
 }
@@ -217,6 +325,9 @@ impl Lexeme for Predicate {
             Rule::compare_expr => {
                 let compare_expr = ComparisonExpr::from_parsed_rule(parsed_rule);
                 Self::ComparePredicate(compare_expr)
+            }
+            Rule::call_binding | Rule::call_expr => {
+                Self::CallPredicate(CallPredicate::from_parsed_rule(parsed_rule))
             }
             _ => unreachable!(),
         }

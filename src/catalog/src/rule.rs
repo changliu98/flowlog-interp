@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use parsing::compare::ComparisonExpr;
-use parsing::rule::{Atom, AtomArg, Const, FLRule, Predicate};
+use parsing::rule::{Atom, AtomArg, CallPredicate, Const, FLRule, Predicate};
 use parsing::head::{Head, HeadArg};
 use crate::atoms::{AtomSignature, AtomArgumentSignature};
 use crate::filters::BaseFilters;
@@ -25,6 +25,8 @@ pub struct Catalog {
     
     comparison_predicates: Vec<ComparisonExpr>,                                           // comparison predicates
     comparison_predicates_vars_set: Vec<HashSet<String>>,                                 // comparison predicates vars set
+
+    call_predicates: Vec<CallPredicate>,                                                   // embedded pure calls, evaluated after relational predicates
 
     head_arguments_map: HashMap<String, HeadArg>,                                        // head arguments map (for each head argument as a string, map to itself)
 }
@@ -212,6 +214,10 @@ impl Catalog {
         &self.comparison_predicates
     }
 
+    pub fn call_predicates(&self) -> &[CallPredicate] {
+        &self.call_predicates
+    }
+
     pub fn comparison_predicates_vars_set(&self, comp_ids: &Vec<usize>) -> Vec<&String> {
         comp_ids
             .iter()
@@ -299,7 +305,8 @@ impl Catalog {
                 negated_atom_names, 
                 negated_atom_argument_signatures,
                 base_filters,
-                comparison_predicates
+                comparison_predicates,
+                call_predicates,
             ) = Self::populate_argument_signatures(rule);
 
         let argument_presence_map = Self::populate_argument_presence_map(&signature_to_argument_str_map, &atom_argument_signatures, &base_filters);
@@ -328,6 +335,7 @@ impl Catalog {
                base_filters,
                comparison_predicates,
                comparison_predicates_vars_set,
+               call_predicates,
                head_arguments_map,
             }
     }
@@ -477,20 +485,22 @@ impl Catalog {
     pub fn sideways(&self, rule_loc: usize) -> Vec<Catalog> {
         /* basics */
         let base_rule = self.rule();
-        let (mut atoms, negated_atoms, cmprs): (Vec<_>, Vec<_>, Vec<_>) = {
+        let (mut atoms, negated_atoms, cmprs, calls): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) = {
             let mut atoms = Vec::new();
             let mut negated_atoms = Vec::new();
             let mut cmprs = Vec::new();
+            let mut calls = Vec::new();
         
             for predicate in base_rule.rhs() {
                 match predicate {
                     Predicate::AtomPredicate(_) => atoms.push(predicate.clone()),
                     Predicate::NegatedAtomPredicate(_) => negated_atoms.push(predicate.clone()),
                     Predicate::ComparePredicate(_) => cmprs.push(predicate.clone()),
+                    Predicate::CallPredicate(_) => calls.push(predicate.clone()),
                 }
             }
         
-            (atoms, negated_atoms, cmprs)
+            (atoms, negated_atoms, cmprs, calls)
         };
 
         /* targets */
@@ -533,7 +543,12 @@ impl Catalog {
         let final_head = base_rule.head().clone();
         let cores = atoms.into_iter().enumerate().filter_map(|(i, atom)| if self.is_core_atom_bitmap()[i] { Some(atom) } else { None }).collect::<Vec<Predicate>>();
         let active_neg = negated_atoms.into_iter().enumerate().filter_map(|(i, neg_atom)| if is_active_negation_bitmap[i] { Some(neg_atom) } else { None }).collect::<Vec<Predicate>>();
-        let final_rhs = cores.into_iter().chain(active_neg.into_iter()).chain(cmprs.into_iter()).collect::<Vec<Predicate>>();
+        let final_rhs = cores
+            .into_iter()
+            .chain(active_neg)
+            .chain(cmprs)
+            .chain(calls)
+            .collect::<Vec<Predicate>>();
 
         let final_rule = FLRule::new(final_head, final_rhs, base_rule.is_planning(), base_rule.is_sip());
         debug!("\nfinal: {}", final_rule);
@@ -569,7 +584,8 @@ impl Catalog {
             Vec<String>, 
             Vec<Vec<AtomArgumentSignature>>,
             BaseFilters,
-            Vec<ComparisonExpr>
+            Vec<ComparisonExpr>,
+            Vec<CallPredicate>
         ) {
         let mut is_safe_set = HashSet::new();                                                         // verify if every argument_str is safe
         let mut signature_to_argument_str_map = HashMap::new();                      // map each rule atom signature to the variable string
@@ -586,14 +602,15 @@ impl Catalog {
         let mut local_const_map = HashMap::new(); // (2) arc(x, 1), or x = 1
         let mut local_placeholder_set = HashSet::new(); // (3) arc(x, _), or x = _
 
-        let (positive_atoms, negated_atoms, comparison_predicates): (Vec<_>, Vec<_>, Vec<_>) = 
-            r.rhs().iter().fold((Vec::new(), Vec::new(), Vec::new()), |(mut pos, mut neg, mut comp), p| {
+        let (positive_atoms, negated_atoms, comparison_predicates, call_predicates): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) =
+            r.rhs().iter().fold((Vec::new(), Vec::new(), Vec::new(), Vec::new()), |(mut pos, mut neg, mut comp, mut calls), p| {
                 match p {
                     Predicate::AtomPredicate(atom) => pos.push(atom),
                     Predicate::NegatedAtomPredicate(atom) => neg.push(atom),
                     Predicate::ComparePredicate(expr) => comp.push(expr.clone()),
+                    Predicate::CallPredicate(call) => calls.push(call.clone()),
                 }
-                (pos, neg, comp)
+                (pos, neg, comp, calls)
             });
 
         // (i) populate the signatures of positive atoms
@@ -686,7 +703,8 @@ impl Catalog {
             negated_atom_names, 
             negated_atom_argument_signatures,
             BaseFilters::new(local_var_eq_map, local_const_map, local_placeholder_set),
-            comparison_predicates
+            comparison_predicates,
+            call_predicates,
         )
     }
 

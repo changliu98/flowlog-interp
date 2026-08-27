@@ -24,6 +24,7 @@ impl ProgramQueryPlan {
     }
 
     pub fn from_strata(strata: &Strata, disable_sharing: bool, opt_level: Option<u8>) -> Self {
+        let embedded_rust = strata.program().embedded_rust();
         let rule_plans: Vec<(bool, Vec<RuleQueryPlan>)> = strata
             .strata()
             .into_iter()
@@ -36,7 +37,8 @@ impl ProgramQueryPlan {
                     .iter()
                     .flat_map(|&rule| {
                         let catalog = Catalog::from_strata(rule);
-                        let (is_sip, is_planning) = if catalog
+                        let has_calls = !catalog.call_predicates().is_empty();
+                        let (requested_sip, is_planning) = if catalog
                             .is_core_atom_bitmap()
                             .into_iter()
                             .filter(|&x| *x)
@@ -50,6 +52,10 @@ impl ProgramQueryPlan {
                         } else {
                             (false, false)
                         };
+                        // SIP rewrites rule bodies and heads. Keep embedded calls
+                        // attached to their original rule until SIP has a typed
+                        // representation for them.
+                        let is_sip = requested_sip && !has_calls;
 
                         if is_sip { any_sip = true; } // mark if any rule uses sip in a stratum
 
@@ -62,7 +68,13 @@ impl ProgramQueryPlan {
 
                         expanded_catalogs
                             .into_iter()
-                            .map(move |catalog| RuleQueryPlan::from_catalog(&catalog, is_planning)) 
+                            .map(move |catalog| {
+                                RuleQueryPlan::from_catalog_with_embedded(
+                                    &catalog,
+                                    is_planning,
+                                    embedded_rust,
+                                )
+                            })
                     })
                     .collect();
 

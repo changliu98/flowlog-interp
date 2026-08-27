@@ -1,5 +1,5 @@
 use crate::collections::CollectionSignature;
-use crate::rule::RuleQueryPlan;
+use crate::rule::{RuleQueryPlan, TransformationTree};
 use parsing::rule::FLRule;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -97,7 +97,7 @@ impl GroupStrataQueryPlan {
     fn construct_non_recursive(
         seen: &mut HashSet<Arc<CollectionSignature>>,
         root: &Transformation,
-        transformation_tree: &HashMap<Transformation, (Transformation, Transformation)>,
+        transformation_tree: &TransformationTree,
         disable_sharing: bool,
     ) -> Vec<Transformation> {
         let output_signature = root.output().signature();
@@ -114,21 +114,17 @@ impl GroupStrataQueryPlan {
 
         transformation_tree.get(root).map_or_else(
             || vec![root.clone()], // leaf op
-            |(l_root, r_root)| {
+            |children| {
                 // recursive case
                 let mut plan = Vec::new();
-                plan.extend(Self::construct_non_recursive(
-                    seen,
-                    l_root,
-                    transformation_tree,
-                    disable_sharing,
-                ));
-                plan.extend(Self::construct_non_recursive(
-                    seen,
-                    r_root,
-                    transformation_tree,
-                    disable_sharing,
-                ));
+                for child in children {
+                    plan.extend(Self::construct_non_recursive(
+                        seen,
+                        child,
+                        transformation_tree,
+                        disable_sharing,
+                    ));
+                }
                 plan.push(root.clone());
                 plan
             },
@@ -139,7 +135,7 @@ impl GroupStrataQueryPlan {
         seen: &mut HashSet<Arc<CollectionSignature>>,
         nested_seen: &mut HashSet<Arc<CollectionSignature>>,
         root: &Transformation,
-        transformation_tree: &HashMap<Transformation, (Transformation, Transformation)>,
+        transformation_tree: &TransformationTree,
         disable_sharing: bool,
     ) -> (Vec<Transformation>, HashSet<Arc<CollectionSignature>>) {
         let output_signature = root.output().signature();
@@ -171,31 +167,23 @@ impl GroupStrataQueryPlan {
                     HashSet::from([Arc::clone(root.unary().signature())]),
                 )
             },
-            |(l_root, r_root)| {
+            |children| {
                 // recursive case
-                let (l_plan, l_enter_scope) = Self::construct_recursive(
-                    seen,
-                    nested_seen,
-                    l_root,
-                    transformation_tree,
-                    disable_sharing,
-                );
-                let (r_plan, r_enter_scope) = Self::construct_recursive(
-                    seen,
-                    nested_seen,
-                    r_root,
-                    transformation_tree,
-                    disable_sharing,
-                );
-
-                (
-                    l_plan
-                        .into_iter()
-                        .chain(r_plan)
-                        .chain(std::iter::once(root.clone()))
-                        .collect(),
-                    l_enter_scope.union(&r_enter_scope).cloned().collect(),
-                )
+                let mut plan = Vec::new();
+                let mut enter_scope = HashSet::new();
+                for child in children {
+                    let (child_plan, child_enter_scope) = Self::construct_recursive(
+                        seen,
+                        nested_seen,
+                        child,
+                        transformation_tree,
+                        disable_sharing,
+                    );
+                    plan.extend(child_plan);
+                    enter_scope.extend(child_enter_scope);
+                }
+                plan.push(root.clone());
+                (plan, enter_scope)
             },
         )
     }

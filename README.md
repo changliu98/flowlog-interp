@@ -195,6 +195,10 @@ target/release/executing -p examples/reach.dl -f reach -w 8
   <code>2</code> - Structural Planning <br>
   <code>3</code> - Both optimizations (SIP + Planning)</td>
 </tr>
+<tr>
+  <td align="center"><code>--call-cache &lt;DIR&gt;</code></td>
+  <td>Optional cache directory for native modules compiled from <code>.code rust</code>.</td>
+</tr>
 </table>
 
 #### Example Commands
@@ -241,6 +245,73 @@ count_paths(x, z, count(y)) :- edge(x, y), edge(y, z).
 max_salary(dept, max(salary)) :- employee(emp_id, salary), works_in(emp_id, dept).
 ```
 
+### Imperative functions in rule bodies
+
+A program can keep row-local imperative logic in the same `.dl` file with one
+top-level `.code rust` block. Every public top-level function is callable from
+Datalog; private functions, imports, constants, types, and modules remain
+implementation details:
+
+```datalog
+.code rust
+use std::cmp::min;
+
+fn absolute(value: i32) -> i32 {
+    value.saturating_abs()
+}
+
+pub fn normalize(value: i32, limit: i32) -> i32 {
+    min(absolute(value), limit)
+}
+
+pub fn acceptable(value: i32) -> bool {
+    value % 2 == 0
+}
+.endcode
+
+.in
+.decl Input(value: number)
+
+.printsize
+.decl Output(original: number, normalized: number)
+
+.rule
+Output(X, Y) :- Input(X), Y = @call(normalize, X, 255), @call(acceptable, Y).
+```
+
+An `i32`-returning call binds a number with
+`Y = @call(function, arguments...)`. A `bool`-returning call is written bare
+and filters out the row when it returns `false`. Calls can consume `i32`
+constants, variables from positive relational atoms, and results of earlier
+calls. Earlier/later refers to call order in the rule; relational predicates
+retain Datalog's unordered meaning.
+
+The current physical ABI deliberately matches FlowLog's row representation:
+exports must be safe, synchronous, non-generic free functions whose arguments
+are all `i32` and whose result is `i32` or `bool`. Arithmetic/aggregate heads,
+using a call result in another relational predicate or ordinary comparison,
+text arguments, and call rules with no retained relational column to drive
+evaluation are not supported yet. Rules with calls skip SIP rewriting, while
+normal structural planning remains available.
+
+Embedded functions have a **purity contract**: they must be deterministic and
+must not perform I/O, observe time or randomness, mutate external state, or
+otherwise depend on evaluation count or order. Differential Dataflow may run,
+repeat, and reorder a call on multiple workers. Loops, local mutation,
+conditionals, matching, helper functions, and other ordinary imperative Rust
+inside a pure function are fine. A panic is caught at the native boundary and
+reported as a worker failure. Embedded Rust is trusted native code and runs
+with the same privileges as FlowLog.
+
+The block is compiled directly with `rustc`, which must be available at
+runtime. This version supports local code and the Rust standard library, but
+not Cargo dependencies. Compilation is content-addressed over the source, call
+ABI, and `rustc` version. FlowLog loads one shared library per process and
+resolves symbols once per worker, rather than looking them up per tuple. The
+cache location is selected in this order: `--call-cache`,
+`FLOWLOG_CALL_CACHE`, `$XDG_CACHE_HOME/flowlog/calls`,
+`$HOME/.cache/flowlog/calls`, then a temporary directory.
+
 ---
 
 ## FlowLog Current Limitations (Work In Progress)
@@ -276,4 +347,3 @@ git submodule update --init --recursive
 ## Contributing
 
 Contributions are welcome! Feel free to submit a pull request or open an issue.
-

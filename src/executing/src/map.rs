@@ -7,7 +7,9 @@ use reading::row::Row;
 use reading::row::FatRow;
 use reading::row::Array;
 use crate::compare::*;
+use crate::native_calls::NativeCallModule;
 use planning::compare::ComparisonExprArgument;
+use planning::calls::CallProjection;
 
 
 fn const_eq_deconstructor(constraints: &BaseConstraints) -> Vec<(usize, i32)> {
@@ -69,6 +71,26 @@ pub fn row_row<const M: usize, const N: usize>(flow: &TransformationFlow) -> imp
         Some(row)
     } else {
         None
+    }
+}
+
+/// Render the typed call program once, then execute it as one row-local
+/// map/filter. Native symbols are resolved here, not for each tuple.
+pub fn call_row<const M: usize, const N: usize>(
+    projection: &CallProjection,
+    native_calls: &Arc<NativeCallModule>,
+) -> impl FnMut(Row<M>) -> Option<Row<N>> {
+    assert_eq!(projection.input_variables().len(), M);
+    assert_eq!(projection.head().len(), N);
+    let resolved = native_calls.resolve(projection);
+    move |input| {
+        resolved.evaluate(&input).map(|values| {
+            let mut output = Row::<N>::new();
+            for value in values {
+                output.push(value);
+            }
+            output
+        })
     }
 }
 
@@ -152,6 +174,22 @@ pub fn row_row_fat(flow: &TransformationFlow) -> impl FnMut(FatRow) -> Option<Fa
     }
 }
 
+pub fn call_row_fat(
+    projection: &CallProjection,
+    native_calls: &Arc<NativeCallModule>,
+) -> impl FnMut(FatRow) -> Option<FatRow> {
+    let resolved = native_calls.resolve(projection);
+    move |input| {
+        resolved.evaluate(&input).map(|values| {
+            let mut output = FatRow::new();
+            for value in values {
+                output.push(value);
+            }
+            output
+        })
+    }
+}
+
 /* ------------------------------------------------------------------------ */
 /* renders for map from fat row to fat kv */
 /* ------------------------------------------------------------------------ */
@@ -181,5 +219,4 @@ pub fn row_kv_fat(flow: &TransformationFlow) -> impl FnMut(FatRow) -> Option<(Fa
         None
     }
 }
-
 

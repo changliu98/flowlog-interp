@@ -2,6 +2,7 @@ use pest::iterators::Pair;
 use std::{fmt, fs};
 
 use crate::decl::RelDecl; // crate :: the root of the module tree
+use crate::embedded::EmbeddedRust;
 use crate::rule::FLRule;
 use crate::{FlowLogParser, Parser, Rule};
 
@@ -14,6 +15,7 @@ pub struct Program {
     edbs: Vec<RelDecl>,
     idbs: Vec<RelDecl>,
     rules: Vec<FLRule>,
+    embedded_rust: Option<EmbeddedRust>,
 }
 
 impl fmt::Display for Program {
@@ -39,17 +41,26 @@ impl fmt::Display for Program {
             .collect::<Vec<String>>()
             .join("\n");
 
-        write!(
-            f,
-            ".in \n{}\n.printsize \n{}\n.rule \n{}",
-            edbs, idbs, rules
-        )
+        if let Some(embedded) = &self.embedded_rust {
+            writeln!(f, ".code rust")?;
+            write!(f, "{}", embedded.source())?;
+            if !embedded.source().ends_with('\n') {
+                writeln!(f)?;
+            }
+            writeln!(f, ".endcode")?;
+        }
+        write!(f, ".in \n{}\n.printsize \n{}\n.rule \n{}", edbs, idbs, rules)
     }
 }
 
 impl Program {
     pub fn new(edbs: Vec<RelDecl>, idbs: Vec<RelDecl>, rules: Vec<FLRule>) -> Self {
-        Self { edbs, idbs, rules }
+        Self {
+            edbs,
+            idbs,
+            rules,
+            embedded_rust: None,
+        }
     }
 
     pub fn edbs(&self) -> &Vec<RelDecl> {
@@ -64,20 +75,33 @@ impl Program {
         &self.rules
     }
 
+    pub fn embedded_rust(&self) -> Option<&EmbeddedRust> {
+        self.embedded_rust.as_ref()
+    }
+
     pub fn from_str(path: &str) -> Self {
         let unparsed_str = fs::read_to_string(path)
             .unwrap_or_else(|_| panic!("can't read program from \"{}\"", path));
 
-        let parsed_rule = FlowLogParser::parse(Rule::main_grammar, &unparsed_str)
+        Self::from_source(&unparsed_str, path)
+    }
+
+    pub fn from_source(unparsed_str: &str, source_name: &str) -> Self {
+        let (datalog, embedded_rust) = EmbeddedRust::extract(unparsed_str)
+            .unwrap_or_else(|error| panic!("can't parse program from \"{source_name}\":\n{error}"));
+
+        let parsed_rule = FlowLogParser::parse(Rule::main_grammar, &datalog)
             .unwrap_or_else(|error| {
                 panic!(
                     "can't parse program from \"{}\": \n{:?}",
-                    path, error
+                    source_name, error
                 )
             })
             .next()
             .unwrap();
-        Self::from_parsed_rule(parsed_rule)
+        let mut program = Self::from_parsed_rule(parsed_rule);
+        program.embedded_rust = embedded_rust;
+        program
     }
 }
 
@@ -111,7 +135,51 @@ impl Lexeme for Program {
             }
         }
 
-        Self { edbs, idbs, rules }
+        Self {
+            edbs,
+            idbs,
+            rules,
+            embedded_rust: None,
+        }
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::Program;
+    use crate::rule::{CallPredicate, Predicate};
+
+    #[test]
+    fn parses_call_bindings_and_filters_from_a_complete_program() {
+        let source = r#".code rust
+pub fn normalize(x: i32) -> i32 { x.saturating_abs() }
+pub fn keep(x: i32) -> bool { x < 256 }
+.endcode
+.in
+.decl Input(x: number)
+.printsize
+.decl Result(x: number, y: number)
+.rule
+Result(X, Y) :- Input(X), Y = @call(normalize, X), @call(keep, Y).
+"#;
+
+        let program = Program::from_source(source, "inline-test.dl");
+        assert_eq!(program.embedded_rust().unwrap().functions().len(), 2);
+        let rule = &program.rules()[0];
+        assert_eq!(rule.rhs().len(), 3);
+        match &rule.rhs()[1] {
+            Predicate::CallPredicate(CallPredicate::Bind { output, call }) => {
+                assert_eq!(output, "Y");
+                assert_eq!(call.function(), "normalize");
+                assert_eq!(call.arguments().len(), 1);
+            }
+            predicate => panic!("expected a call binding, got {predicate:?}"),
+        }
+        match &rule.rhs()[2] {
+            Predicate::CallPredicate(CallPredicate::Filter(call)) => {
+                assert_eq!(call.function(), "keep");
+            }
+            predicate => panic!("expected a call filter, got {predicate:?}"),
+        }
+    }
+}

@@ -1,24 +1,28 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
-use std::collections::{HashSet, HashMap};
 use std::vec;
 
-use parsing::rule::FLRule;
 use catalog::atoms::{AtomArgumentSignature, AtomSignature};
-use catalog::rule::Catalog;
 use catalog::compare::ComparisonExprPos;
+use catalog::rule::Catalog;
+use parsing::embedded::EmbeddedRust;
+use parsing::rule::FLRule;
 
 use optimizing::optimizer::PlanTree;
-use crate::transformations::Transformation;
+use crate::calls::CallProjection;
 use crate::collections::{CollectionSignature, Collection};
+use crate::transformations::Transformation;
+
+pub type TransformationTree = HashMap<Transformation, Vec<Transformation>>;
 
 #[derive(Debug, Clone)]
 pub struct RuleQueryPlan {
     rule: FLRule,
     dependent_atom_names: HashSet<String>,
     plan: PlanTree,     // join spanning tree
-    last_transformation: Transformation, // root of the binary transformation tree
-    transformation_tree: HashMap<Transformation, (Transformation, Transformation)>, // binary transformation tree
+    last_transformation: Transformation, // root of the transformation tree
+    transformation_tree: TransformationTree,
 }
 
 impl RuleQueryPlan {
@@ -26,7 +30,7 @@ impl RuleQueryPlan {
         &self.rule
     }
 
-    pub fn rule_plan(&self) -> (&Transformation, &HashMap<Transformation, (Transformation, Transformation)>) {
+    pub fn rule_plan(&self) -> (&Transformation, &TransformationTree) {
         (&self.last_transformation, &self.transformation_tree)
     }
  
@@ -36,6 +40,18 @@ impl RuleQueryPlan {
 
     /* main entry */
     pub fn from_catalog(catalog: &Catalog, is_optimized: bool) -> Self {
+        Self::from_catalog_with_embedded(catalog, is_optimized, None)
+    }
+
+    pub fn from_catalog_with_embedded(
+        catalog: &Catalog,
+        is_optimized: bool,
+        embedded_rust: Option<&EmbeddedRust>,
+    ) -> Self {
+        // Validate the typed extension before asking the relational optimizer
+        // to build a tree, so malformed call-only rules get a call-specific
+        // diagnostic rather than an unrelated empty-plan failure.
+        let call_projection = CallProjection::from_catalog(catalog, embedded_rust);
         let plan = PlanTree::from_catalog(catalog, is_optimized);   
         // debug!("join spanning tree: {:?}", plan);
         let mut is_active_negation_bitmap = vec![true; catalog.negated_atom_names().len()];
@@ -52,15 +68,22 @@ impl RuleQueryPlan {
         // all comparison predicates are active initially
         let active_comparison_predicates: Vec<usize> = (0..catalog.comparison_predicates().len()).collect(); 
 
-        // head arithmics decomposed as strings
-        let head_value_arguments: Vec<String> = catalog
-            .head_arguments()
-            .iter()
-            .flat_map(|argument| argument.vars())
-            .map(|var| var.clone())
-            .collect();
+        // A call rule first retains exactly the relational variables consumed by
+        // the row-local call program. The call projection then constructs the
+        // actual rule head. Ordinary rules continue to project their head here.
+        let head_value_arguments: Vec<String> = call_projection
+            .as_ref()
+            .map(|projection| projection.input_variables().to_vec())
+            .unwrap_or_else(|| {
+                catalog
+                    .head_arguments()
+                    .iter()
+                    .flat_map(|argument| argument.vars())
+                    .cloned()
+                    .collect()
+            });
         
-        let (last_transformation, transformation_tree) = Self::recursive_transformations(
+        let (relational_root, mut transformation_tree) = Self::recursive_transformations(
             &catalog,           // ground truth
             &plan.sub_trees(),  // ground truth
             plan.root(),
@@ -76,8 +99,16 @@ impl RuleQueryPlan {
         assert!(is_active_negation_bitmap.iter().all(|&x| !x));
         assert!(is_active_non_core_atom_bitmap.iter().all(|&x| !x));
 
-        // post mapping to get actual head arithmics
-        
+        let last_transformation = if let Some(projection) = call_projection {
+            let call_root = Transformation::call_projection(
+                Arc::clone(relational_root.output()),
+                projection,
+            );
+            transformation_tree.insert(call_root.clone(), vec![relational_root]);
+            call_root
+        } else {
+            relational_root
+        };
 
         Self {
             rule: catalog.rule().clone(),
@@ -100,7 +131,7 @@ impl RuleQueryPlan {
         active_comparison_predicates: &[usize] // invariant: active_comparison_predicates must be subsumed by all variables under the subtree at root
     ) -> (
             Transformation, 
-            HashMap<Transformation, (Transformation, Transformation)>
+            TransformationTree
          ) 
     { 
         /* decompose plan into sub-root ⋈ (...) ⋈ (...) ... */
@@ -286,9 +317,10 @@ impl RuleQueryPlan {
 
                     (
                         base_join.clone(), 
-                        HashMap::from([
-                            (base_join, (left_transformation, right_transformation))
-                        ])
+                        HashMap::from([(
+                            base_join,
+                            vec![left_transformation, right_transformation],
+                        )])
                     )
                 } else {
                     /* some negated case */
@@ -342,7 +374,7 @@ impl RuleQueryPlan {
 
                         antijoin_tree.insert(
                         base_join,
-                        (left_transformation, right_transformation)
+                        vec![left_transformation, right_transformation]
                     );
 
                     (last_antijoin, antijoin_tree)
@@ -368,7 +400,7 @@ impl RuleQueryPlan {
         active_comparison_predicates: &[usize] 
     ) -> (
             Transformation, 
-            HashMap<Transformation, (Transformation, Transformation)>
+            TransformationTree
          )
     {
         let planning_rhs_id = planning_atom_signature.rhs_id();
@@ -487,7 +519,7 @@ impl RuleQueryPlan {
         active_comparison_predicates: &[usize] // only consumed by the negated atoms, not the planning atoms
     ) -> (
             Transformation, 
-            HashMap<Transformation, (Transformation, Transformation)>
+            TransformationTree
          )
     {
         if negated_atom_signatures.is_empty() {
@@ -581,7 +613,7 @@ impl RuleQueryPlan {
 
             tree.insert(
                 root_transformation.clone(),
-                (left_transformation, right_transformation)
+                vec![left_transformation, right_transformation]
             );
 
             (root_transformation, tree)
@@ -598,7 +630,7 @@ impl RuleQueryPlan {
         active_comparison_predicates: &[usize]
     ) -> (
             Transformation, 
-            HashMap<Transformation, (Transformation, Transformation)>
+            TransformationTree
          )
     {
         if subatom_signatures.is_empty() {
@@ -718,7 +750,7 @@ impl RuleQueryPlan {
             
             tree.insert(
                 root_transformation.clone(),
-                (left_transformation, right_transformation)
+                vec![left_transformation, right_transformation]
             );
 
             (root_transformation, tree)
@@ -781,7 +813,7 @@ impl fmt::Display for RuleQueryPlan {
         // helper 
         fn print_transformation(
             f: &mut fmt::Formatter<'_>,
-            transformation_tree: &HashMap<Transformation, (Transformation, Transformation)>,
+            transformation_tree: &TransformationTree,
             transformation: &Transformation,
             visited: &mut HashSet<Transformation>,
             indent: &str,     // indentation string
@@ -803,14 +835,19 @@ impl fmt::Display for RuleQueryPlan {
             visited.insert(transformation.clone());
 
             // recursively print the children with further indentation
-            if let Some(downstream) = transformation_tree.get(transformation) {
+            if let Some(children) = transformation_tree.get(transformation) {
                 let new_indent = format!("{}{}", indent, if is_last { "    " } else { "│   " });
-                
-                // print the right child
-                print_transformation(f, transformation_tree, &downstream.1, visited, &new_indent, false)?;
 
-                // print the left child
-                print_transformation(f, transformation_tree, &downstream.0, visited, &new_indent, true)?;
+                for (index, child) in children.iter().rev().enumerate() {
+                    print_transformation(
+                        f,
+                        transformation_tree,
+                        child,
+                        visited,
+                        &new_indent,
+                        index + 1 == children.len(),
+                    )?;
+                }
             }
 
             Ok(())

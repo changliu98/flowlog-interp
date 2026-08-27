@@ -72,17 +72,17 @@ fn cartesian_space() -> Vec<(usize, usize, usize)> {
         .collect()
 }
 
-/// (key, value) -> row. The result is a row, so it is bounded by `ROW_MAX` and
-/// not by the key/value table it is flattened from; it is also a projection of
-/// the key and value, so it cannot be wider than both together.
-fn kv_flatten_space() -> Vec<(usize, usize, usize)> {
+/// (key, value) antijoin (key,) -> row. The result is a row, so it is bounded
+/// by `ROW_MAX` and not by the key/value table the antijoin reads; it is also a
+/// projection of the key and value, so it cannot be wider than both together.
+fn kv_antijoin_space() -> Vec<(usize, usize, usize)> {
     iproduct!(1..=KV_MAX, 1..=KV_MAX, 1..=ROW_MAX)
         .filter(|&(ik, iv, target)| ik + iv >= target)
         .collect()
 }
 
-/// (key,) -> row, a projection of the key.
-fn k_flatten_space() -> Vec<(usize, usize)> {
+/// (key,) antijoin (key,) -> row, a projection of the key.
+fn k_antijoin_space() -> Vec<(usize, usize)> {
     iproduct!(1..=KV_MAX, 1..=KV_MAX)
         .filter(|&(ik, target)| ik >= target)
         .collect()
@@ -403,36 +403,58 @@ pub fn codegen_k_k_jn(_: TokenStream) -> TokenStream {
 }
 
 /* ------------------------------------------------------------------------ */
-/* codegen for aj flatten */
+/* codegen for antijoins */
 /* ------------------------------------------------------------------------ */
+//
+// An antijoin keeps the records of its positive side whose key no negated
+// record matches, and then projects them onto the rule head. The two steps do
+// not commute: the head may drop a variable that only the negated atom reads,
+// so two candidate records with different antijoin keys can project onto one
+// row, and subtracting the projected rows answers a different question than
+// subtracting the records. Both macros below subtract at the granularity of the
+// antijoin's own (key, value) records - where the operands are the distinct
+// entries of an arrangement, so the difference is an exact set difference - and
+// project the survivors afterwards.
 
 #[proc_macro]
-pub fn codegen_kv_flatten(_: TokenStream) -> TokenStream {
-    let space = kv_flatten_space();
+pub fn codegen_kv_antijoin(_: TokenStream) -> TokenStream {
+    let space = kv_antijoin_space();
 
     let mut arms = vec![];
     for (ik0_, iv0_, target_) in space {
-        let type_0 = Ident::new(&format!("dict_{}_{}", ik0_, iv0_), Span::call_site());
+        let dict_type = Ident::new(&format!("dict_{}_{}", ik0_, iv0_), Span::call_site());
+        let set_type = Ident::new(&format!("set_{}", ik0_), Span::call_site());
         let final_rel = Ident::new(&format!("Collection{}", target_), Span::call_site());
         arms.push(quote! {
             (#ik0_, #iv0_, #target_) => {
-                #final_rel(
-                    dict_0.#type_0().as_collection(aj_flatten::<#ik0_, #iv0_, #target_>(flow))
-                )
+                let candidates = dict_0.#dict_type();
+                let survivors = reading::rel::subtract_collection(
+                    &candidates.as_collection(|key, value| (key.clone(), value.clone())),
+                    &candidates.join_core(
+                        set_1.#set_type(),
+                        |key, value, _| Some((key.clone(), value.clone())),
+                    ),
+                );
+                #final_rel(survivors.map(aj_project::<#ik0_, #iv0_, #target_>(flow)))
             }
         });
     }
 
     let expanded = quote! {
-        if dict_0.is_fat() {
-            CollectionFat(
-                dict_0.dict_fat().as_collection(aj_flatten_fat(flow)),
-                target
-            )
+        if dict_0.is_fat() && set_1.is_fat() {
+            let candidates = dict_0.dict_fat();
+            let survivors = reading::rel::subtract_collection(
+                &candidates.as_collection(|key, value| (key.clone(), value.clone())),
+                &candidates.join_core(
+                    set_1.set_fat(),
+                    |key, value, _| Some((key.clone(), value.clone())),
+                ),
+            );
+            CollectionFat(survivors.map(aj_project_fat(flow)), target)
         } else {
             match (ik0, iv0, target) {
                 #(#arms),*,
-                _ => panic!("codegen_kv_flatten unimplemented for {}, {}, {}", ik0, iv0, target),
+                _ => panic!("codegen_kv_antijoin unimplemented for {}, {}, {}", ik0, iv0, target),
             }
         }
     };
@@ -441,32 +463,43 @@ pub fn codegen_kv_flatten(_: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
-pub fn codegen_k_flatten(_: TokenStream) -> TokenStream {
-    let space = k_flatten_space();
+pub fn codegen_k_antijoin(_: TokenStream) -> TokenStream {
+    let space = k_antijoin_space();
 
     let mut arms = vec![];
     for (ik0_, target_) in space {
-        let type_0 = Ident::new(&format!("set_{}", ik0_), Span::call_site());
+        let set_type = Ident::new(&format!("set_{}", ik0_), Span::call_site());
         let final_rel = Ident::new(&format!("Collection{}", target_), Span::call_site());
         arms.push(quote! {
             (#ik0_, #target_) => {
-                #final_rel(
-                    set_0.#type_0().as_collection(v1_aj_flatten::<#ik0_, #target_>(flow))
-                )
+                let candidates = set_0.#set_type();
+                let survivors = reading::rel::subtract_collection(
+                    &candidates.as_collection(|key, _| key.clone()),
+                    &candidates.join_core(
+                        set_1.#set_type(),
+                        |key, _, _| Some(key.clone()),
+                    ),
+                );
+                #final_rel(survivors.map(v1_aj_project::<#ik0_, #target_>(flow)))
             }
         });
     }
 
     let expanded = quote! {
-        if set_0.is_fat() {
-            CollectionFat(
-                set_0.set_fat().as_collection(v1_aj_flatten_fat(flow)),
-                target
-            )
+        if set_0.is_fat() && set_1.is_fat() {
+            let candidates = set_0.set_fat();
+            let survivors = reading::rel::subtract_collection(
+                &candidates.as_collection(|key, _| key.clone()),
+                &candidates.join_core(
+                    set_1.set_fat(),
+                    |key, _, _| Some(key.clone()),
+                ),
+            );
+            CollectionFat(survivors.map(v1_aj_project_fat(flow)), target)
         } else {
             match (ik0, target) {
                 #(#arms),*,
-                _ => panic!("codegen_k_flatten unimplemented for {}, {}", ik0, target),
+                _ => panic!("codegen_k_antijoin unimplemented for {}, {}", ik0, target),
             }
         }
     };
@@ -732,16 +765,16 @@ mod tests {
             &iproduct!(key_value_halves(), rows()).collect::<Vec<_>>(),
         );
         assert_covers(
-            "codegen_kv_flatten",
-            &kv_flatten_space(),
+            "codegen_kv_antijoin",
+            &kv_antijoin_space(),
             &iproduct!(key_value_halves(), key_value_halves(), rows())
                 // The result projects the key and value together.
                 .filter(|&(ik, iv, target)| ik + iv >= target)
                 .collect::<Vec<_>>(),
         );
         assert_covers(
-            "codegen_k_flatten",
-            &k_flatten_space(),
+            "codegen_k_antijoin",
+            &k_antijoin_space(),
             &iproduct!(key_value_halves(), key_value_halves())
                 // The result projects the key.
                 .filter(|&(ik, target)| ik >= target)

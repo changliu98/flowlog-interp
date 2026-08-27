@@ -260,6 +260,28 @@ pub fn aj_flatten<const K: usize, const V: usize, const N: usize>(
     }
 }
 
+/// Projects one surviving antijoin record onto the rule head.
+///
+/// The antijoin subtracts at the granularity of its own key and value, because
+/// the head projection need not be injective on the key: two candidate records
+/// differing only in a variable that the head drops project onto one row, and
+/// subtracting *those* rows answers a different question. Survivors are
+/// projected here, after the subtraction.
+pub fn aj_project<const K: usize, const V: usize, const N: usize>(
+    flow: &TransformationFlow,
+) -> impl FnMut((Row<K>, Row<V>)) -> Row<N> {
+    let mut flatten = aj_flatten::<K, V, N>(flow);
+    move |(key, value)| flatten(&key, &value)
+}
+
+/// `aj_project` for a key-only antijoin.
+pub fn v1_aj_project<const K: usize, const N: usize>(
+    flow: &TransformationFlow,
+) -> impl FnMut(Row<K>) -> Row<N> {
+    let mut flatten = v1_aj_flatten::<K, N>(flow);
+    move |key| flatten(&key, &())
+}
+
 pub fn v1_aj_flatten<const K: usize, const N: usize>(
     flow: &TransformationFlow,
 ) -> impl FnMut(&Row<K>, &()) -> Row<N> {
@@ -491,6 +513,18 @@ pub fn aj_flatten_fat(flow: &TransformationFlow) -> impl FnMut(&FatRow, &FatRow)
         }
         row
     }
+}
+
+/// Fat-row `aj_project`.
+pub fn aj_project_fat(flow: &TransformationFlow) -> impl FnMut((FatRow, FatRow)) -> FatRow {
+    let mut flatten = aj_flatten_fat(flow);
+    move |(key, value)| flatten(&key, &value)
+}
+
+/// Fat-row `v1_aj_project`.
+pub fn v1_aj_project_fat(flow: &TransformationFlow) -> impl FnMut(FatRow) -> FatRow {
+    let mut flatten = v1_aj_flatten_fat(flow);
+    move |key| flatten(&key, &())
 }
 
 pub fn v1_aj_flatten_fat(flow: &TransformationFlow) -> impl FnMut(&FatRow, &()) -> FatRow {

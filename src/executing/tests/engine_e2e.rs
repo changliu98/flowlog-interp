@@ -534,6 +534,157 @@ fn a_negation_retaining_no_column_is_refused() {
     );
 }
 
+/// An antijoin keeps the body solutions no negated row matches, and only then
+/// projects them onto the head. The two steps do not commute: `L` below is read
+/// by the negated atom and dropped by the head, so two solutions that differ
+/// only in `L` project onto one row.
+///
+/// Subtracting the *projected* rows answers a different question, and answered
+/// it differently in each build - the default build derived a row every one of
+/// whose solutions was blocked, and the isize build dropped a row that had an
+/// unblocked solution. Both are silently wrong answers.
+const ANTIJOIN_PROGRAM: &str = ".in
+.decl candidate(f: number, o: number, l: number)
+.input candidate.facts
+.decl blocked(f: number, o: number, l: number)
+.input blocked.facts
+.printsize
+.decl unblocked(f: number, o: number)
+.rule
+unblocked(F, O) :- candidate(F, O, L), !blocked(F, O, L).
+";
+
+fn antijoin_case(label: &str, candidates: &str, blocked: &str, expected: Vec<Vec<i64>>) {
+    let temp = TempTree::new(&format!("antijoin-{label}"));
+    let program = temp.program(ANTIJOIN_PROGRAM);
+    temp.facts("candidate", candidates);
+    temp.facts("blocked", blocked);
+
+    assert_success(&run(&temp, &program, &[]));
+    assert_eq!(rows(&temp.output("unblocked")), expected, "{label}");
+}
+
+#[test]
+fn an_antijoin_answers_per_solution_and_not_per_projected_row() {
+    // One solution: the case that was already right.
+    antijoin_case("one-blocked", "0,2,3\n", "0,2,3\n", vec![]);
+    antijoin_case("one-unblocked", "0,2,3\n", "", vec![vec![0, 2]]);
+
+    // Two solutions projecting onto one head row: the bug. Every solution
+    // blocked means the row is not derived.
+    antijoin_case("two-all-blocked", "0,2,3\n0,2,4\n", "0,2,3\n0,2,4\n", vec![]);
+    antijoin_case(
+        "three-all-blocked",
+        "0,2,3\n0,2,4\n0,2,5\n",
+        "0,2,3\n0,2,4\n0,2,5\n",
+        vec![],
+    );
+
+    // ...and one surviving solution still derives it, which is the answer the
+    // set-difference-after-projection reading loses.
+    antijoin_case("two-one-blocked", "0,2,3\n0,2,4\n", "0,2,3\n", vec![vec![0, 2]]);
+    antijoin_case("two-none-blocked", "0,2,3\n0,2,4\n", "", vec![vec![0, 2]]);
+
+    // Two head rows, each decided on its own solutions.
+    antijoin_case(
+        "distinct-heads",
+        "0,2,3\n0,2,4\n0,5,3\n0,5,4\n",
+        "0,2,3\n0,2,4\n0,5,3\n",
+        vec![vec![0, 5]],
+    );
+}
+
+/// The same shape where the antijoin's positive side carries no value beyond
+/// its key, which is a different operator (`NjKK`) and had the same defect.
+#[test]
+fn a_key_only_antijoin_answers_per_solution() {
+    for (label, blocked, expected) in [
+        ("all blocked", "0,3\n0,4\n", Vec::new()),
+        ("one blocked", "0,3\n", vec![vec![0]]),
+        ("none blocked", "", vec![vec![0]]),
+    ] {
+        let temp = TempTree::new("antijoin-key-only");
+        let program = temp.program(
+            ".in
+.decl candidate(f: number, l: number)
+.input candidate.facts
+.decl blocked(f: number, l: number)
+.input blocked.facts
+.printsize
+.decl unblocked(f: number)
+.rule
+unblocked(F) :- candidate(F, L), !blocked(F, L).
+",
+        );
+        temp.facts("candidate", "0,3\n0,4\n");
+        temp.facts("blocked", blocked);
+
+        assert_success(&run(&temp, &program, &[]));
+        assert_eq!(rows(&temp.output("unblocked")), expected, "{label}");
+    }
+}
+
+#[test]
+fn an_antijoin_inside_a_recursive_stratum_answers_per_solution() {
+    let temp = TempTree::new("antijoin-recursive");
+    let program = temp.program(
+        ".in
+.decl seed(f: number, l: number)
+.input seed.facts
+.decl blocked(f: number, l: number)
+.input blocked.facts
+.decl step(f: number, g: number)
+.input step.facts
+.printsize
+.decl live(f: number, l: number)
+.decl reach(f: number)
+.rule
+live(F, L) :- seed(F, L).
+live(G, L) :- live(F, L), step(F, G).
+reach(F) :- live(F, L), !blocked(F, L).
+",
+    );
+    temp.facts("seed", "0,3\n0,4\n");
+    temp.facts("step", "0,1\n");
+    // Every pair the fixed point reaches is blocked except (1, 4).
+    temp.facts("blocked", "0,3\n0,4\n1,3\n");
+
+    assert_success(&run(&temp, &program, &[]));
+    assert_eq!(
+        rows(&temp.output("live")),
+        vec![vec![0, 3], vec![0, 4], vec![1, 3], vec![1, 4]],
+    );
+    assert_eq!(rows(&temp.output("reach")), vec![vec![1]]);
+}
+
+#[test]
+fn an_antijoin_inside_a_recursive_stratum_blocks_every_solution() {
+    let temp = TempTree::new("antijoin-recursive-blocked");
+    let program = temp.program(
+        ".in
+.decl seed(f: number, l: number)
+.input seed.facts
+.decl blocked(f: number, l: number)
+.input blocked.facts
+.decl step(f: number, g: number)
+.input step.facts
+.printsize
+.decl live(f: number, l: number)
+.decl reach(f: number)
+.rule
+live(F, L) :- seed(F, L).
+live(G, L) :- live(F, L), step(F, G).
+reach(F) :- live(F, L), !blocked(F, L).
+",
+    );
+    temp.facts("seed", "0,3\n0,4\n");
+    temp.facts("step", "0,1\n");
+    temp.facts("blocked", "0,3\n0,4\n1,3\n1,4\n");
+
+    assert_success(&run(&temp, &program, &[]));
+    assert_eq!(rows(&temp.output("reach")), Vec::<Vec<i64>>::new());
+}
+
 /// The head checks are unit-tested in `parsing::validate`; this asserts that
 /// the binary reaches them, before it reads a fact or assembles a dataflow.
 #[test]

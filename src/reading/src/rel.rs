@@ -86,8 +86,17 @@ where
     collection.threshold_total(|_, count| if *count > 0 { 1 } else { 0 })
 }
 
+/// Set difference: the records of `collection` that `other` does not contain.
+///
+/// Both operands must be duplicate-free. The difference is computed by giving
+/// each record of `collection` a `+1` and each record of `other` a `-1` and
+/// keeping the positive remainder, so a record that arrives twice on one side
+/// and once on the other survives - which is a wrong answer, not a smaller
+/// one. Every caller subtracts at a granularity where its records are distinct
+/// by construction (the entries of an arrangement), and the projection that
+/// could merge them is applied afterwards.
 #[cfg(all(feature = "present-type", not(feature = "isize-type")))]
-fn subtract_collection<G, D>(
+pub fn subtract_collection<G, D>(
     collection: &VecCollection<G, D, Semiring>,
     other: &VecCollection<G, D, Semiring>,
 ) -> VecCollection<G, D, Semiring>
@@ -106,11 +115,21 @@ where
                 .flat_map(move |(data, time, _)| std::iter::once((data, time, -1i32)))
                 .as_collection(),
         )
-        .threshold_semigroup(move |_, _, old| old.is_none().then_some(semiring_one()))
+        // A positive remainder, not merely a non-zero one: a record present
+        // only in `other` accumulates to -1, and "it is here" is not the answer
+        // to "is it in `collection` and not in `other`". This is the predicate
+        // the isize build already applies.
+        .threshold_semigroup(move |_, remainder, old| {
+            (*remainder > 0 && old.is_none()).then_some(semiring_one())
+        })
 }
 
+/// Set difference: the records of `collection` that `other` does not contain.
+///
+/// See the `present-type` variant above for the contract; this one deduplicates
+/// its operands first, because the incremental mode carries real multiplicities.
 #[cfg(all(feature = "isize-type", not(feature = "present-type")))]
-fn subtract_collection<G, D>(
+pub fn subtract_collection<G, D>(
     collection: &VecCollection<G, D, Semiring>,
     other: &VecCollection<G, D, Semiring>,
 ) -> VecCollection<G, D, Semiring>

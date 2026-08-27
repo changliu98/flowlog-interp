@@ -147,13 +147,7 @@ where
     let (_, dict_0) = kv_map.get(large).expect("dict for kv aj k");
     let (_, set_1) = k_map.get(small).expect("set for kv aj k");
 
-    /* i32 version 
-        let substract_rel = codegen_kv_k_jn!().negate();
-        Arc::new(codegen_kv_flatten!().concat(&substract_rel))
-    */
-
-    /* boolean version */
-    Arc::new(codegen_kv_flatten!().subtract(&codegen_kv_k_jn!()))
+    Arc::new(codegen_kv_antijoin!())
 }
 
 
@@ -181,12 +175,6 @@ where
     let (_, set_0) = k_map.get(large).expect("0 for k aj k");
     let (_, set_1) = k_map.get(small).expect("1 for k aj k");
 
-    /* i32 version 
-        let substract_rel = codegen_k_k_jn!().negate();
-        Arc::new(codegen_k_flatten!().concat(&substract_rel))
-    */
-
-    /* boolean version */
-    Arc::new(codegen_k_flatten!().subtract(&codegen_k_k_jn!()))
+    Arc::new(codegen_k_antijoin!())
 }
                                         

@@ -189,21 +189,21 @@ pub fn codegen_cartesian(_: TokenStream) -> TokenStream {
     let expanded = quote! {
         if rel_0.is_fat() && rel_1.is_fat() {
             CollectionFat(
-                rel_0.rel_fat()
-                     .map(|x| ((), x))
-                     .arrange_by_key()
-                     .join_core(
-                        &rel_1.rel_fat()
-                              .map(|x| ((), x))
-                              .arrange_by_key(),
-                            cartesian_logic_fat(flow)
-                     ),
+                cartesian_fat_rows(rel_0.rel_fat(), rel_1.rel_fat(), flow),
                 target
             )
         } else {
             match (iv0, iv1, target) {
                 #(#arms),*,
-                _ => panic!("codegen_cartesian unimplemented for {}, {}, {}", iv0, iv1, target),
+                // The fixed-size arms above reach `PROD_MAX`, which is narrower
+                // than the row representation itself. Every wider shape is a
+                // legal cross-join, so it is computed on fat rows and narrowed
+                // back, making the operator total over every arity the engine
+                // supports rather than over `PROD_MAX` alone.
+                _ => Rel::from_fat_rows(
+                    cartesian_fat_rows(&rel_0.to_fat_rows(), &rel_1.to_fat_rows(), flow),
+                    target,
+                ),
             }
         }
     };

@@ -217,6 +217,52 @@ macro_rules! impl_rels {
                     }
                 }
 
+                /// Re-represents this relation as fat rows.
+                ///
+                /// The fat row carries any arity and the fixed-size rows are an
+                /// optimization over it, so an operator whose generated table
+                /// does not cover a shape can widen its operands, run the
+                /// general implementation once, and narrow the result back with
+                /// `from_fat_rows`. The cost is one row copy per tuple, and no
+                /// allocation for arities within `FALLBACK_ARITY`.
+                pub fn to_fat_rows(&self) -> VecCollection<G, FatRow, Semiring> {
+                    if self.is_fat() {
+                        return self.rel_fat().clone();
+                    }
+                    match self.arity() {
+                        $(
+                            $arity => self.[<rel_ $arity>]().map(|row| {
+                                let mut wide = FatRow::new();
+                                for column in 0..$arity {
+                                    wide.push(row.column(column));
+                                }
+                                wide
+                            }),
+                        )*
+                        _ => unreachable!("to_fat_rows: arity {} overflows the fixed-size rows", self.arity()),
+                    }
+                }
+
+                /// Re-represents fat rows as the relation of the given arity.
+                ///
+                /// The inverse of `to_fat_rows`. An arity the fixed-size rows do
+                /// not reach stays fat, which is the representation such a
+                /// relation would have had anyway.
+                pub fn from_fat_rows(rows: VecCollection<G, FatRow, Semiring>, arity: usize) -> Rel<G> {
+                    match arity {
+                        $(
+                            $arity => Rel::[<Collection $arity>](rows.map(|row| {
+                                let mut narrow = Row::<$arity>::new();
+                                for column in 0..$arity {
+                                    narrow.push(row.column(column));
+                                }
+                                narrow
+                            })),
+                        )*
+                        _ => Rel::CollectionFat(rows, arity),
+                    }
+                }
+
                 pub fn arrange_set(&self) -> ArrangedSet<G> {
                     if self.is_fat() {
                         // fat case

@@ -7,12 +7,37 @@ use reading::arrangements::ArrangedDict;
 use reading::arrangements::ArrangedSet;
 use reading::rel::Rel::*;
 use reading::rel::Rel;
+use reading::row::FatRow;
+use reading::Semiring;
 
+use differential_dataflow::collection::VecCollection;
 use differential_dataflow::lattice::Lattice;
+use timely::dataflow::Scope;
 use timely::order::TotalOrder;
 use differential_dataflow::Data;
 use macros::*;
 use crate::jn::*;
+
+/// The Cartesian product of two relations, over fat rows.
+///
+/// This is the general implementation: fat rows carry any arity, so it is
+/// written once and serves both the globally fat mode and the fallback taken by
+/// `codegen_cartesian` for the shapes its fixed-size table does not generate.
+fn cartesian_fat_rows<G>(
+    rel_0: &VecCollection<G, FatRow, Semiring>,
+    rel_1: &VecCollection<G, FatRow, Semiring>,
+    flow: &TransformationFlow,
+) -> VecCollection<G, FatRow, Semiring>
+where
+    G: Scope,
+    G::Timestamp: Data + Lattice + TotalOrder,
+{
+    use differential_dataflow::operators::arrange::ArrangeByKey;
+    rel_0.map(|row| ((), row)).arrange_by_key().join_core(
+        &rel_1.map(|row| ((), row)).arrange_by_key(),
+        cartesian_logic_fat(flow),
+    )
+}
 
 pub fn cartesian<G>(
     large: &Arc<CollectionSignature>,

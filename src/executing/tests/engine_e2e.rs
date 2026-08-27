@@ -244,6 +244,79 @@ R(k, v) :- E(k, v).
     );
 }
 
+/// A cross-join - two atoms sharing no variable - is ordinary Datalog, and the
+/// generated fixed-size product table reaches only `PROD_MAX = 2`. Both of
+/// these shapes are outside it: joining a singleton against a graph relation is
+/// the common case, and neither operand nor output is wide by any other
+/// measure.
+#[test]
+fn a_cross_join_wider_than_the_generated_product_table_still_runs() {
+    let temp = TempTree::new("cross-2-1-3");
+    let program = temp.program(
+        ".in
+.decl Round(r: number)
+.input Round.facts
+.decl Arc(x: number, y: number)
+.input Arc.facts
+.printsize
+.decl Out(r: number, x: number, y: number)
+.rule
+Out(r, x, y) :- Round(r), Arc(x, y).
+",
+    );
+    temp.facts("Round", "7\n8\n");
+    temp.facts("Arc", "1,2\n3,4\n");
+
+    assert_success(&run(&temp, &program, &[]));
+    assert_eq!(
+        rows(&temp.output("Out")),
+        vec![
+            vec![7, 1, 2],
+            vec![7, 3, 4],
+            vec![8, 1, 2],
+            vec![8, 3, 4],
+        ],
+    );
+}
+
+#[test]
+fn a_cross_join_of_a_singleton_against_a_wide_relation_still_runs() {
+    let temp = TempTree::new("cross-1-3-4");
+    let program = temp.program(
+        ".in
+.decl Round(r: number)
+.input Round.facts
+.decl Tri(x: number, y: number, z: number)
+.input Tri.facts
+.printsize
+.decl Out(r: number, x: number, y: number, z: number)
+.rule
+Out(r, x, y, z) :- Round(r), Tri(x, y, z).
+",
+    );
+    temp.facts("Round", "7\n8\n");
+    temp.facts("Tri", "1,2,3\n4,5,6\n");
+
+    let expected = vec![
+        vec![7, 1, 2, 3],
+        vec![7, 4, 5, 6],
+        vec![8, 1, 2, 3],
+        vec![8, 4, 5, 6],
+    ];
+
+    assert_success(&run(&temp, &program, &[]));
+    assert_eq!(rows(&temp.output("Out")), expected);
+
+    // The same product on the globally fat representation, which is the
+    // implementation the fixed-size fallback routes through.
+    let fat = TempTree::new("cross-1-3-4-fat");
+    let fat_program = fat.program(&fs::read_to_string(&program).unwrap());
+    fat.facts("Round", "7\n8\n");
+    fat.facts("Tri", "1,2,3\n4,5,6\n");
+    assert_success(&run(&fat, &fat_program, &["--fat-mode"]));
+    assert_eq!(rows(&fat.output("Out")), expected);
+}
+
 /// The head checks are unit-tested in `parsing::validate`; this asserts that
 /// the binary reaches them, before it reads a fact or assembles a dataflow.
 #[test]

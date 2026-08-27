@@ -107,6 +107,61 @@ fn for_each_line_in_range(
 }
 
 
+/// The longest fragment of an input file quoted back in an error message.
+const QUOTED_FRAGMENT_MAX: usize = 120;
+
+/// Quotes a fragment of an input file for an error message.
+///
+/// Bounded, so that one pathological line cannot become the whole message, and
+/// lossy, so that a fragment which is not valid UTF-8 can still be shown.
+fn quoted(fragment: &[u8]) -> String {
+    let head = &fragment[..fragment.len().min(QUOTED_FRAGMENT_MAX)];
+    let text = String::from_utf8_lossy(head);
+    if fragment.len() > QUOTED_FRAGMENT_MAX {
+        format!("\"{text}\"... ({} bytes)", fragment.len())
+    } else {
+        format!("\"{text}\"")
+    }
+}
+
+/// Reads one cell of an input file, or refuses the file.
+///
+/// A cell that is not a number used to discard the whole row and continue, so a
+/// damaged, mis-delimited or out-of-range input file produced a smaller
+/// relation instead of an error, and every query over it answered confidently
+/// with less data than the file contained. There is no value in the domain that
+/// means "unreadable", so the only honest outcomes are the number or a refusal.
+fn parse_cell(rel_path: &str, line: &[u8], cell: &[u8]) -> Val {
+    let text = std::str::from_utf8(cell).unwrap_or_else(|error| {
+        panic!(
+            "can't read data from \"{rel_path}\": cell {} is not valid UTF-8 ({error}), \
+             on line {}",
+            quoted(cell),
+            quoted(line),
+        )
+    });
+    text.parse::<Val>().unwrap_or_else(|error| {
+        panic!(
+            "can't read data from \"{rel_path}\": cell {} is not a number ({error}), \
+             on line {}; a value is a 64-bit signed integer",
+            quoted(cell),
+            quoted(line),
+        )
+    })
+}
+
+/// Refuses a line whose cell count is not the declared arity of the relation.
+fn refuse_arity_mismatch(rel_path: &str, line: &[u8], rel_arity: usize, values: usize) {
+    if values != rel_arity {
+        panic!(
+            "can't read data from \"{rel_path}\": expected {rel_arity} values, got {values}, \
+             on line {}",
+            quoted(line),
+        );
+    }
+}
+
+
 /* ------------------------------------------------------------------------------------ */
 /* read row for thin relations */
 /* ------------------------------------------------------------------------------------ */
@@ -129,31 +184,20 @@ macro_rules! generate_read_row_functions {
                     }
 
                     for_each_line_in_range(rel_path, id, peers, |line| {
-                        let mut tuple = line.split(|&byte| byte == *delimiter);
-                        let Some(first_value) = tuple
-                            .next()
-                            .and_then(|value| std::str::from_utf8(value).ok())
-                            .and_then(|value| value.parse::<Val>().ok())
-                        else {
-                            return;
-                        };
-
                         let mut row = Row::<$n>::new();
-                        row.push(first_value);
+                        // Counted rather than pushed past the row's capacity, so
+                        // that a wide line is reported as an arity mismatch and
+                        // not as an allocation failure inside the row.
+                        let mut values = 0usize;
 
-                        for value in tuple {
-                            let Some(parsed_value) = std::str::from_utf8(value)
-                                .ok()
-                                .and_then(|value| value.parse::<Val>().ok())
-                            else {
-                                return;
-                            };
-                            row.push(parsed_value);
+                        for cell in line.split(|&byte| byte == *delimiter) {
+                            values += 1;
+                            if values <= rel_arity {
+                                row.push(parse_cell(rel_path, line, cell));
+                            }
                         }
 
-                        if row.arity() != rel_arity {
-                            panic!("expected {} values, got {}", rel_arity, row.arity());
-                        }
+                        refuse_arity_mismatch(rel_path, line, rel_arity, values);
 
                         session.update(row, semiring_one());
                     });
@@ -184,31 +228,17 @@ pub fn read_row_fat(
     let rel_arity = rel_decl.arity();
     
     for_each_line_in_range(rel_path, id, peers, |line| {
-        let mut tuple = line.split(|&byte| byte == *delimiter);
-        let Some(first_value) = tuple
-            .next()
-            .and_then(|value| std::str::from_utf8(value).ok())
-            .and_then(|value| value.parse::<Val>().ok())
-        else {
-            return;
-        };
-
         let mut row = FatRow::new();
-        row.push(first_value);
+        let mut values = 0usize;
 
-        for value in tuple {
-            let Some(parsed_value) = std::str::from_utf8(value)
-                .ok()
-                .and_then(|value| value.parse::<Val>().ok())
-            else {
-                return;
-            };
-            row.push(parsed_value);
+        for cell in line.split(|&byte| byte == *delimiter) {
+            values += 1;
+            if values <= rel_arity {
+                row.push(parse_cell(rel_path, line, cell));
+            }
         }
 
-        if row.arity() != rel_arity {
-            panic!("expected {} values, got {}", rel_arity, row.arity());
-        }
+        refuse_arity_mismatch(rel_path, line, rel_arity, values);
 
         session.update(row, semiring_one());
     });
@@ -370,5 +400,59 @@ mod tests {
         }
 
         std::fs::remove_file(path).expect("remove reader fixture");
+    }
+
+    #[test]
+    fn a_cell_is_read_across_the_whole_value_domain() {
+        assert_eq!(parse_cell("Edge.facts", b"1,-4", b"-4"), -4);
+        assert_eq!(
+            parse_cell("Edge.facts", b"9223372036854775807", b"9223372036854775807"),
+            Val::MAX,
+        );
+        assert_eq!(
+            parse_cell("Edge.facts", b"-9223372036854775808", b"-9223372036854775808"),
+            Val::MIN,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "cell \"abc\" is not a number")]
+    fn a_cell_that_is_not_a_number_refuses_the_file() {
+        parse_cell("/facts/Edge.facts", b"3,abc", b"abc");
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a number")]
+    fn a_cell_outside_the_value_domain_refuses_the_file() {
+        parse_cell(
+            "/facts/Edge.facts",
+            b"3,9223372036854775808",
+            b"9223372036854775808",
+        );
+    }
+
+    #[test]
+    fn a_refusal_names_the_file_and_bounds_the_quoted_line() {
+        let line = vec![b'7'; 4096];
+        let message = std::panic::catch_unwind(|| parse_cell("/facts/Edge.facts", &line, b"x"))
+            .expect_err("an unreadable cell should refuse the file");
+        let message = message
+            .downcast_ref::<String>()
+            .expect("the refusal carries a message");
+
+        assert!(message.contains("/facts/Edge.facts"), "{message}");
+        assert!(message.contains("cell \"x\""), "{message}");
+        assert!(message.contains("(4096 bytes)"), "{message}");
+        assert!(
+            message.len() < 2 * QUOTED_FRAGMENT_MAX + 256,
+            "an unbounded line reached the message: {} bytes",
+            message.len(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "expected 2 values, got 3")]
+    fn a_line_wider_than_the_declared_arity_refuses_the_file() {
+        refuse_arity_mismatch("/facts/Edge.facts", b"1,2,3", 2, 3);
     }
 }

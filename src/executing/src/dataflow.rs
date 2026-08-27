@@ -516,6 +516,7 @@ pub fn program_execution(
                         rel,
                         &format!("{}/csvs/{}.csv", csv_path, rel_name),
                         id,
+                        args.delimiter().as_bytes()[0],
                     );
                 }
             }

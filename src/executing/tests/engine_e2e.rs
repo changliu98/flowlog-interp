@@ -177,6 +177,73 @@ X(a, i) :- W(a, b, c, d, e, f, g, h, i).
     assert_eq!(rows(&temp.output("X")), vec![vec![1, 9]]);
 }
 
+/// A relation the engine wrote must be a relation the engine can read: the
+/// output of one run is the input of the next, and it is how a pipeline of
+/// programs is composed at all.
+#[test]
+fn a_written_relation_reads_back_as_an_input_relation() {
+    const IDENTITY: &str = ".in
+.decl E(k: number, v: number)
+.input E.facts
+.printsize
+.decl R(k: number, v: number)
+.rule
+R(k, v) :- E(k, v).
+";
+
+    let first = TempTree::new("roundtrip-write");
+    let program = first.program(IDENTITY);
+    first.facts("E", "1,2\n3,-4\n9223372036854775807,0\n");
+    assert_success(&run(&first, &program, &[]));
+
+    let written = fs::read_to_string(first.output("R")).unwrap();
+    assert_eq!(
+        {
+            let mut lines = written.lines().collect::<Vec<_>>();
+            lines.sort();
+            lines
+        },
+        vec!["1,2", "3,-4", "9223372036854775807,0"],
+    );
+
+    let second = TempTree::new("roundtrip-read");
+    let program = second.program(IDENTITY);
+    second.facts("E", &written);
+    assert_success(&run(&second, &program, &[]));
+
+    assert_eq!(rows(&second.output("R")), rows(&first.output("R")));
+}
+
+#[test]
+fn a_written_relation_uses_the_configured_delimiter() {
+    let temp = TempTree::new("roundtrip-tab");
+    let program = temp.program(
+        ".in
+.decl E(k: number, v: number)
+.input E.facts
+.printsize
+.decl R(k: number, v: number)
+.rule
+R(k, v) :- E(k, v).
+",
+    );
+    temp.facts("E", "1\t2\n3\t-4\n");
+
+    assert_success(&run(&temp, &program, &["--delimiter", "\t"]));
+    assert_eq!(
+        {
+            let mut lines = fs::read_to_string(temp.output("R"))
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            lines.sort();
+            lines
+        },
+        vec!["1\t2", "3\t-4"],
+    );
+}
+
 /// The head checks are unit-tested in `parsing::validate`; this asserts that
 /// the binary reaches them, before it reads a fact or assembles a dataflow.
 #[test]

@@ -93,7 +93,7 @@ Result(ID, X, Y, Z) :- Input(ID, X), Limit(ID, L), Bias(ID, B), Y = @call(normal
         .map(str::to_string)
         .collect::<Vec<_>>();
     rows.sort();
-    assert_eq!(rows, vec!["1, -3, 3, 4", "3, 300, 255, 256"]);
+    assert_eq!(rows, vec!["1,-3,3,4", "3,300,255,256"]);
 
     let library = find_library(&cache_path).expect("compiled call library missing");
     let first_modified = fs::metadata(&library).unwrap().modified().unwrap();
@@ -114,7 +114,7 @@ Result(ID, X, Y, Z) :- Input(ID, X), Limit(ID, L), Bias(ID, B), Y = @call(normal
         .map(str::to_string)
         .collect::<Vec<_>>();
     fat_rows.sort();
-    assert_eq!(fat_rows, vec!["1, -3, 3, 4", "3, 300, 255, 256"]);
+    assert_eq!(fat_rows, vec!["1,-3,3,4", "3,300,255,256"]);
     let second_modified = fs::metadata(&library).unwrap().modified().unwrap();
     assert_eq!(
         first_modified, second_modified,

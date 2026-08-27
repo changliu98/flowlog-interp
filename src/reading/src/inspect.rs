@@ -17,6 +17,7 @@ use timely::dataflow::Scope;
 use timely::order::TotalOrder;
 
 use crate::rel::{dedup_retained_collection, Rel};
+use crate::row::Array;
 use crate::Semiring;
 use tracing::{debug, error, info};
 
@@ -132,12 +133,34 @@ where
         });
 }
 
+/// Writes one output row the way the reader parses one input row: the
+/// configured delimiter between columns, a newline after the last, and nothing
+/// else.
+///
+/// The `Display` of a row separates columns with a comma *and a space*, which
+/// is fine for a log line and wrong for a data file: an engine-written relation
+/// re-read as an EDB parsed no cell after the first and loaded zero rows, so
+/// the output of one run could not be the input of the next.
+fn write_row(out: &mut impl Write, row: &dyn Array, delimiter: u8) -> io::Result<()> {
+    for column in 0..row.arity() {
+        if column > 0 {
+            out.write_all(std::slice::from_ref(&delimiter))?;
+        }
+        write!(out, "{}", row.column(column))?;
+    }
+    out.write_all(b"\n")
+}
+
 /// Flush relation data to a file
-fn write<G, D>(rel: &VecCollection<G, D, Semiring>, file_path: &str, worker_id: usize)
-where
+fn write<G, D>(
+    rel: &VecCollection<G, D, Semiring>,
+    file_path: &str,
+    worker_id: usize,
+    delimiter: u8,
+) where
     G: Scope,
     G::Timestamp: Lattice + TotalOrder,
-    D: ExchangeData + Hashable + std::fmt::Display,
+    D: ExchangeData + Hashable + Array,
 {
     let path = format!("{}{}", file_path, worker_id);
     let file_handle = get_file_handle(&path);
@@ -152,7 +175,7 @@ where
         .as_collection()
         .inspect(move |(data, _time, _delta)| {
             let mut file = file_handle.lock().unwrap();
-            writeln!(file, "{}", data)
+            write_row(&mut *file, data, delimiter)
                 .unwrap_or_else(|error| panic!("Can not write to {path}: {error}"));
         });
 
@@ -213,24 +236,24 @@ where
 }
 
 /// Writes a relation with any arity to a file
-pub fn write_generic<G>(rel: &Rel<G>, file_path: &str, worker_id: usize)
+pub fn write_generic<G>(rel: &Rel<G>, file_path: &str, worker_id: usize, delimiter: u8)
 where
     G: Scope,
     G::Timestamp: Lattice + TotalOrder,
 {
     if rel.is_fat() {
-        write(rel.rel_fat(), file_path, worker_id)
+        write(rel.rel_fat(), file_path, worker_id, delimiter)
     } else {
         let arity = rel.arity();
         match arity {
-            1 => write(rel.rel_1(), file_path, worker_id),
-            2 => write(rel.rel_2(), file_path, worker_id),
-            3 => write(rel.rel_3(), file_path, worker_id),
-            4 => write(rel.rel_4(), file_path, worker_id),
-            5 => write(rel.rel_5(), file_path, worker_id),
-            6 => write(rel.rel_6(), file_path, worker_id),
-            7 => write(rel.rel_7(), file_path, worker_id),
-            8 => write(rel.rel_8(), file_path, worker_id),
+            1 => write(rel.rel_1(), file_path, worker_id, delimiter),
+            2 => write(rel.rel_2(), file_path, worker_id, delimiter),
+            3 => write(rel.rel_3(), file_path, worker_id, delimiter),
+            4 => write(rel.rel_4(), file_path, worker_id, delimiter),
+            5 => write(rel.rel_5(), file_path, worker_id, delimiter),
+            6 => write(rel.rel_6(), file_path, worker_id, delimiter),
+            7 => write(rel.rel_7(), file_path, worker_id, delimiter),
+            8 => write(rel.rel_8(), file_path, worker_id, delimiter),
             _ => unreachable!("arity {} should be handled by fixed-size variants", arity),
         }
     }

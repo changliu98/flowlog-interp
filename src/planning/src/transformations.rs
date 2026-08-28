@@ -61,7 +61,10 @@ pub enum Transformation {
         flow: TransformationFlow,
     },
 
-    /* when output collection has empty key, it is the last transformation (otherwise it is an intermediate transformation) */
+    /* An empty output key means the output is a row. A rule head asks for one,
+       but so do the operators that read rows rather than arrangements - both
+       sides of a `Cartesian` and the input of a `CallRowToRow` - so a
+       row-shaped output is not by itself the last transformation of a rule. */
     JnKK {
         input: (Arc<Collection>, Arc<Collection>),
         output: Arc<Collection>,

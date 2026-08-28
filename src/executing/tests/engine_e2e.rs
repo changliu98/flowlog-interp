@@ -685,6 +685,89 @@ reach(F) :- live(F, L), !blocked(F, L).
     assert_eq!(rows(&temp.output("reach")), Vec::<Vec<i64>>::new());
 }
 
+/// A row - an output with no key - is what a rule head asks for. It is also
+/// what both sides of a Cartesian product take, and what a row-local call
+/// projection takes, so producing one does not make an operator the last
+/// transformation of a rule. In the recursive rule below the join of `H` and
+/// `A` is a row precisely because the product with `C` reads rows, and it is
+/// the root of nothing.
+///
+/// Inside a recursive stratum every row-shaped output was looked up among that
+/// stratum's rule heads - the lookup that republishes the heads sideways
+/// information passing leaves for later operators to read - and an
+/// intermediate, naming no head, aborted the entire run with
+/// `Missing head signature for: ...`. It names no head because it is not one.
+#[test]
+fn a_row_shaped_intermediate_in_a_recursive_stratum_is_not_a_rule_head() {
+    for (mode, extra) in [("fixed-size rows", &[][..]), ("fat rows", &["--fat-mode"])] {
+        let temp = TempTree::new("row-intermediate");
+        let program = temp.program(
+            ".in
+.decl A(x: number, y: number)
+.input A.facts
+.decl C(z: number)
+.input C.facts
+.printsize
+.decl H(x: number, y: number, z: number)
+.rule
+H(x, y, z) :- A(x, y), C(z).
+H(x, y, z) :- H(x, w, q), A(w, y), C(z).
+",
+        );
+        temp.facts("A", "1,2\n2,3\n");
+        temp.facts("C", "7\n");
+
+        assert_success(&run(&temp, &program, extra));
+        // The transitive closure of A, every pair carrying the one C row.
+        assert_eq!(
+            rows(&temp.output("H")),
+            vec![vec![1, 2, 7], vec![1, 3, 7], vec![2, 3, 7]],
+            "{mode}",
+        );
+    }
+}
+
+/// The same shape in the stratum the lookup was written for: four core atoms
+/// put the recursive rule through sideways information passing under `-O 1`,
+/// so this stratum holds both the sip heads that must be republished and an
+/// intermediate that must not. All three modes answer the same question, and
+/// the answer does not depend on how it was planned.
+#[test]
+fn sideways_information_passing_survives_a_row_shaped_intermediate() {
+    for (mode, extra) in [
+        ("as planned", &[][..]),
+        ("sideways information passing", &["-O", "1"]),
+        ("fat rows", &["--fat-mode"]),
+    ] {
+        let temp = TempTree::new("row-intermediate-sip");
+        let program = temp.program(
+            ".in
+.decl A(x: number, y: number)
+.input A.facts
+.decl B(x: number, y: number)
+.input B.facts
+.decl C(z: number)
+.input C.facts
+.printsize
+.decl H(x: number, y: number, z: number)
+.rule
+H(x, y, z) :- A(x, y), C(z).
+H(x, y, z) :- H(x, w, q), A(w, v), B(v, y), C(z).
+",
+        );
+        temp.facts("A", "1,2\n2,3\n");
+        temp.facts("B", "3,4\n");
+        temp.facts("C", "7\n");
+
+        assert_success(&run(&temp, &program, extra));
+        assert_eq!(
+            rows(&temp.output("H")),
+            vec![vec![1, 2, 7], vec![1, 4, 7], vec![2, 3, 7]],
+            "{mode}",
+        );
+    }
+}
+
 /// The head checks are unit-tested in `parsing::validate`; this asserts that
 /// the binary reaches them, before it reads a fact or assembles a dataflow.
 #[test]

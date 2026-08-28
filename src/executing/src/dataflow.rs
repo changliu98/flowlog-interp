@@ -407,17 +407,37 @@ pub fn program_execution(
                                     (0, _) => { // jn → row
                                         nest_row_map.insert(Arc::clone(output_signature), Arc::clone(&output_rel));
                                         // (sideways) compensate sip rules
-                                        // We do not collect sip rules in the collector, so we need to store them in the next row map
+                                        //
+                                        // A sip head is not an iterative variable of this scope and the
+                                        // collector skips it, so a rule deriving one publishes its rows here,
+                                        // under the head name, where a later rule of the stratum reads them.
                                         // TODO: temporarily way to avoid sip rule, need carefully refactor
                                         // to avoid this in the future
-                                        let head_signatures = group_plan
+                                        //
+                                        // This map is keyed by the *roots* of the stratum's rule plans, and a
+                                        // row-shaped output is not necessarily one of them. A row is also what
+                                        // a Cartesian product takes on both sides and what a row-local call
+                                        // projection takes as input, so an operator feeding either is an
+                                        // ordinary intermediate that happens to be row-shaped. It is the root
+                                        // of no rule, it names no head, and there is nothing to compensate:
+                                        //
+                                        //     H(x, y, z) :- H(x, w, q), A(w, y), C(z).
+                                        //
+                                        // plans the join of H and A as a row for the product with C, and
+                                        // demanding a head for it aborted the whole program.
+                                        //
+                                        // Proceeding here cannot hide a head. A head whose rows really did go
+                                        // missing is still reported, by the collector that reads
+                                        // `last_signatures_map` for that head, and by the operator that reads
+                                        // a sip name it was promised.
+                                        if let Some(head_signatures) = group_plan
                                                 .reverse_last_signatures_map()
                                                 .get(output_signature)
-                                                .expect(&format!("Missing head signature for: {}", output_signature.name()));
-
-                                        for head_signature in head_signatures {
-                                            if head_signature.name().contains("_sip") {
-                                                nest_row_map.insert(Arc::clone(head_signature), Arc::clone(&output_rel));
+                                        {
+                                            for head_signature in head_signatures {
+                                                if head_signature.name().contains("_sip") {
+                                                    nest_row_map.insert(Arc::clone(head_signature), Arc::clone(&output_rel));
+                                                }
                                             }
                                         }
                                     },

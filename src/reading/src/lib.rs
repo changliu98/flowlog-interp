@@ -4,14 +4,14 @@ pub mod inspect;
 pub mod reader;
 pub mod rel;
 pub mod row;
-pub mod session;
 pub mod semiring;
+pub mod session;
 
 // export configuration constants for backwards compatibility
 pub use config::{FALLBACK_ARITY, KV_MAX, PROD_MAX, ROW_MAX};
 
 // export semiring types and functions for convenience
-pub use semiring::{Semiring, semiring_one, SEMIRING_TYPE, Min};
+pub use semiring::{Semiring, semiring_one, semiring_weight, SEMIRING_TYPE, Min};
 
 // the engine-wide scalar value domain, defined once in `parsing`
 pub use parsing::Val;

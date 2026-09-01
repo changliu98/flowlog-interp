@@ -12,13 +12,13 @@ use std::fs::{remove_file, File};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use timely::dataflow::operators::Map;
+use timely::dataflow::operators::{Inspect, Map};
 use timely::dataflow::Scope;
 use timely::order::TotalOrder;
 
 use crate::rel::{dedup_retained_collection, Rel};
 use crate::row::Array;
-use crate::Semiring;
+use crate::{semiring_weight, Semiring, Val};
 use tracing::{debug, error, info};
 
 // Thread-local storage for file handles to avoid repeatedly opening the same files
@@ -185,6 +185,55 @@ fn write<G, D>(
     //     let batch_str = rows.iter().map(|(data, _, _)| format!("{}", data)).collect::<Vec<_>>().join("\n");
     //     writeln!(file, "{}", batch_str).expect(&format!("Can not write to file: {}", path));
     // });
+}
+
+/// Updates captured while materializing a relation at a cache boundary.
+///
+/// The integer difference lets the same capture path work in both the default
+/// `Present` build and the `isize` build. Callers consolidate the updates after
+/// the worker frontier has completed.
+pub type MaterializedUpdates = Arc<Mutex<Vec<(Vec<Val>, isize)>>>;
+
+fn capture<G, D>(rel: &VecCollection<G, D, Semiring>, updates: MaterializedUpdates)
+where
+    G: Scope,
+    G::Timestamp: Lattice + TotalOrder,
+    D: ExchangeData + Hashable + Array,
+{
+    dedup_retained_collection(rel)
+        .inner
+        .inspect(move |(row, _time, difference)| {
+            let values = (0..row.arity())
+                .map(|column| row.column(column))
+                .collect::<Vec<_>>();
+            updates
+                .lock()
+                .expect("materialized relation lock poisoned")
+                .push((values, semiring_weight(difference)));
+        });
+}
+
+/// Materialize a type-erased relation into a process-owned update buffer.
+pub fn capture_generic<G>(rel: &Rel<G>, updates: MaterializedUpdates)
+where
+    G: Scope,
+    G::Timestamp: Lattice + TotalOrder,
+{
+    if rel.is_fat() {
+        capture(rel.rel_fat(), updates);
+    } else {
+        match rel.arity() {
+            1 => capture(rel.rel_1(), updates),
+            2 => capture(rel.rel_2(), updates),
+            3 => capture(rel.rel_3(), updates),
+            4 => capture(rel.rel_4(), updates),
+            5 => capture(rel.rel_5(), updates),
+            6 => capture(rel.rel_6(), updates),
+            7 => capture(rel.rel_7(), updates),
+            8 => capture(rel.rel_8(), updates),
+            arity => unreachable!("arity {arity} should be handled by fixed-size capture variants"),
+        }
+    }
 }
 
 /// Prints the content of a relation with any arity

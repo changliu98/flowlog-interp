@@ -24,6 +24,19 @@ pub fn semiring_one() -> Semiring {
     1
 }
 
+/// Convert an engine difference into an integer weight for materializing a
+/// relation outside the dataflow. `Present` can only report presence, whereas
+/// the incremental build can also report retractions.
+#[cfg(all(feature = "present-type", not(feature = "isize-type")))]
+pub fn semiring_weight(_difference: &Semiring) -> isize {
+    1
+}
+
+#[cfg(all(feature = "isize-type", not(feature = "present-type")))]
+pub fn semiring_weight(difference: &Semiring) -> isize {
+    *difference
+}
+
 // Compile-time check to ensure exactly one semiring feature is enabled
 #[cfg(all(feature = "present-type", feature = "isize-type"))]
 compile_error!("Cannot enable both present-type and isize-type features at once");

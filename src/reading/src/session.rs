@@ -3,9 +3,11 @@ use timely::progress::Timestamp;
 use differential_dataflow::input::InputSession;
 
 use crate::Time;
-use crate::Semiring;
+use crate::{semiring_one, Semiring};
 use crate::row::Row;
 use crate::row::FatRow;
+use crate::row::Array;
+use parsing::Val;
 
 /* ------------------------------------------------------------------------------------ */
 /* session generics */
@@ -31,6 +33,39 @@ macro_rules! impl_input_sessions {
                     match self {
                         $( InputSessionGeneric::[<InputSession $arity>](session) => session.close(), )*
                         InputSessionGeneric::InputSessionFat(session, _) => session.close(),
+                    }
+                }
+
+                /// Insert one type-erased row into this typed input session.
+                ///
+                /// Resident cache entries use `Vec<Val>` because their arity is
+                /// known only after parsing the edited program. The dataflow still
+                /// receives the same fixed-size `Row<N>` representation used by
+                /// file inputs.
+                pub fn update_values(&mut self, values: &[Val]) {
+                    assert_eq!(
+                        values.len(),
+                        self.arity(),
+                        "cached row arity does not match its relation",
+                    );
+
+                    match self {
+                        $(
+                            InputSessionGeneric::[<InputSession $arity>](session) => {
+                                let mut row = Row::<$arity>::new();
+                                for &value in values {
+                                    row.push(value);
+                                }
+                                session.update(row, semiring_one());
+                            }
+                        )*
+                        InputSessionGeneric::InputSessionFat(session, _) => {
+                            let mut row = FatRow::new();
+                            for &value in values {
+                                row.push(value);
+                            }
+                            session.update(row, semiring_one());
+                        }
                     }
                 }
 

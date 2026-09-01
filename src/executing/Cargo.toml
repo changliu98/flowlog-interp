@@ -44,5 +44,4 @@ arrayvec = { workspace = true }
 mimalloc = { workspace = true }
 libloading = { workspace = true }
 sha2 = { workspace = true }
-
-
+serde = { workspace = true, features = ["derive"] }

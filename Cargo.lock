@@ -274,6 +274,7 @@ dependencies = [
  "parsing",
  "planning",
  "reading",
+ "serde",
  "sha2",
  "strata",
  "timely",

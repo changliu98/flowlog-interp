@@ -12,10 +12,11 @@ use planning::strata::GroupStrataQueryPlan;
 use planning::transformations::Transformation;
 use planning::collections::CollectionSignature;
 use crate::arg::Args;
-use crate::dataflow::timely::dataflow::Scope;
+use crate::cache::PreparedCache;
 use crate::collector::non_recursive_collector;
 use crate::collector::recursive_collector;
 use crate::collector::inspector;
+use crate::dataflow::timely::dataflow::Scope;
 use crate::transformer::*;
 use crate::Time;
 use crate::Iter;
@@ -36,6 +37,30 @@ pub fn program_execution(
     group_plans: Vec<GroupStrataQueryPlan>,
     fat_mode: bool,
     idb_map: HashMap<String, AggregationHeadIDB>,
+) {
+    program_execution_inner(args, strata, group_plans, fat_mode, idb_map, None);
+}
+
+/// Execute a program while replacing cache-hit strata with materialized input
+/// collections and capturing every miss at its stratum boundary.
+pub fn program_execution_cached(
+    args: Args,
+    strata: Strata,
+    group_plans: Vec<GroupStrataQueryPlan>,
+    fat_mode: bool,
+    idb_map: HashMap<String, AggregationHeadIDB>,
+    cache: Arc<PreparedCache>,
+) {
+    program_execution_inner(args, strata, group_plans, fat_mode, idb_map, Some(cache));
+}
+
+fn program_execution_inner(
+    args: Args,
+    strata: Strata,
+    group_plans: Vec<GroupStrataQueryPlan>,
+    fat_mode: bool,
+    idb_map: HashMap<String, AggregationHeadIDB>,
+    cache: Option<Arc<PreparedCache>>,
 ) {
     let timely_args = args.timely_args();
     let native_calls = strata
@@ -69,8 +94,9 @@ pub fn program_execution(
         let id = worker.index(); 
 
         /* assemble dataflow */
-        let mut session_map = worker.dataflow::<Time, _, _>(|scope| {
+        let (mut session_map, mut cached_sessions) = worker.dataflow::<Time, _, _>(|scope| {
             let mut session_map = HashMap::new();          // map from each edb name to input session (for data loading)
+            let mut cached_sessions = Vec::new();          // materialized IDBs injected for cache-hit strata
             let mut row_map = HashMap::new();                 // map from row signature (edbs and idbs) to the physical dataflow data
             let mut kv_map = HashMap::new();                  // map from (k, v) signature to the physical dataflow data   
             let mut k_map = HashMap::new();                   // map from (k, ) signature to the physical dataflow data
@@ -99,7 +125,24 @@ pub fn program_execution(
             }
             
 
-            for group_plan in &group_plans {
+            for (group_index, group_plan) in group_plans.iter().enumerate() {
+                let prepared_group = cache
+                    .as_ref()
+                    .map(|prepared| &prepared.groups[group_index]);
+
+                if let Some(entry) = prepared_group.and_then(|group| group.hit.as_ref()) {
+                    for relation in entry.relations.values() {
+                        let (session, input_rel) =
+                            construct_session_and_table(scope, relation.arity, fat_mode);
+                        row_map.insert(
+                            Arc::new(CollectionSignature::new_atom(&relation.name)),
+                            Arc::new(input_rel),
+                        );
+                        cached_sessions.push((session, Arc::clone(&relation.rows)));
+                    }
+                    continue;
+                }
+
                 if !group_plan.is_recursive() {
                     /* construct dataflow for a non-recursive strata */ 
                     for next_transformation in group_plan.strata_plan() {
@@ -511,6 +554,16 @@ pub fn program_execution(
                         );
                     }
                 }
+
+                if let Some(prepared_group) = prepared_group {
+                    for (name, updates) in &prepared_group.captures {
+                        let signature = Arc::new(CollectionSignature::new_atom(name));
+                        let relation = row_map
+                            .get(&signature)
+                            .unwrap_or_else(|| panic!("cache boundary relation {name} is absent"));
+                        capture_generic(relation, Arc::clone(updates));
+                    }
+                }
             } // end of a strata (group plan)
 
             for idb in strata.program().idbs() {
@@ -542,7 +595,7 @@ pub fn program_execution(
             }
 
             /* exports */
-            session_map
+            (session_map, cached_sessions)
         }); 
 
         if id == 0 {
@@ -572,6 +625,15 @@ pub fn program_execution(
                 peers,
                 fat_mode
             );
+        }
+
+        for (mut session, rows) in cached_sessions.drain(..) {
+            for (row_index, row) in rows.iter().enumerate() {
+                if row_index % peers == id {
+                    session.update_values(row);
+                }
+            }
+            session.close();
         }
 
         for rel_decl in strata.program().edbs() {

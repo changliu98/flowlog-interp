@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::path::{Path, PathBuf};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 pub struct Args {
     /// path of the Datalog program
@@ -41,6 +41,14 @@ pub struct Args {
     /// directory for content-addressed compiled `.code rust` modules
     #[arg(long)]
     call_cache: Option<PathBuf>,
+
+    /// run as a resident cache daemon on this Unix-domain socket
+    #[arg(long)]
+    daemon_socket: Option<PathBuf>,
+
+    /// maximum memory retained for materialized stratum outputs
+    #[arg(long, default_value_t = 4096)]
+    cache_max_mib: usize,
 }
 
 impl Args {
@@ -97,5 +105,13 @@ impl Args {
 
     pub fn call_cache(&self) -> Option<&Path> {
         self.call_cache.as_deref()
+    }
+
+    pub fn daemon_socket(&self) -> Option<&Path> {
+        self.daemon_socket.as_deref()
+    }
+
+    pub fn cache_max_bytes(&self) -> usize {
+        self.cache_max_mib.saturating_mul(1024 * 1024)
     }
 }

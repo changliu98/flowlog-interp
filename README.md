@@ -145,6 +145,46 @@ FlowLog currently supports two execution modes for Datalog applications:
 | **Batch Mode** (default) | `cargo build --release` | Static Datalog execution (used in the paper benchmarking) |
 | **Incremental Mode** | `cargo build --release --features isize-type --no-default-features` | Incremental Datalog execution |
 
+### Resident stratum cache
+
+The normal `executing` command remains a one-shot process. For an edit/evaluate
+loop, `--daemon-socket` keeps materialized stratum outputs in memory and reuses
+them across reloads:
+
+```bash
+# Foreground daemon; use a service manager or terminal multiplexer if desired.
+target/release/executing \
+  -p examples/reach.dl \
+  -f reach \
+  -c output \
+  -w 8 \
+  --daemon-socket /tmp/flowlog-reach.sock \
+  --cache-max-mib 4096
+
+# From another shell:
+target/release/flowlogctl -s /tmp/flowlog-reach.sock reload
+target/release/flowlogctl -s /tmp/flowlog-reach.sock stats
+
+# Edit examples/reach.dl, then evaluate only invalidated strata.
+target/release/flowlogctl -s /tmp/flowlog-reach.sock reload
+target/release/flowlogctl -s /tmp/flowlog-reach.sock shutdown
+```
+
+Each command returns one JSON object with cache hits, misses, loaded/captured
+row counts, and resident memory. A reload reparses and restratifies the complete
+program. A cache key binds a stratum to its rules, declarations, embedded Rust,
+engine mode, exact EDB file bytes, and upstream relation versions. Editing a
+downstream rule therefore keeps an unchanged recursive fixed point, while an
+EDB or upstream-rule edit invalidates every dependent stratum. Invalid programs
+return an error without discarding previously valid entries.
+
+This is a materialized-result cache, not mutable dataflow topology. Each reload
+assembles a fresh graph, injects cache hits as input relations, and computes
+misses; arbitrary rule additions and deletions are therefore safe. The cache is
+process-local and LRU-bounded, disappears on shutdown, and still hashes EDB
+files on every reload. Cache-mode planning deliberately avoids cross-stratum
+intermediate sharing so that relation heads form complete reuse boundaries.
+
 
 ---
 

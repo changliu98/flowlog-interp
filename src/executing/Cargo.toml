@@ -2,6 +2,7 @@
 name = "executing"
 version = "0.1.0"
 edition = "2021"
+default-run = "executing"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -45,3 +46,4 @@ mimalloc = { workspace = true }
 libloading = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

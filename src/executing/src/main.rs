@@ -2,6 +2,7 @@ use clap::Parser as ClapParser;
 
 use debugging::debugger;
 use executing::arg::Args;
+use executing::daemon::serve;
 use executing::runner::run_once;
 use mimalloc::MiMalloc;
 use tracing::info;
@@ -23,7 +24,11 @@ fn main() {
 
     debugger::display_info("Arguments", false, format!("{:#?}", args));
 
-    run_once(args);
+    if let Some(socket) = args.daemon_socket().map(ToOwned::to_owned) {
+        serve(args, socket).unwrap_or_else(|error| panic!("cache daemon failed: {error}"));
+    } else {
+        run_once(args);
+    }
 
     info!("success query");
 }

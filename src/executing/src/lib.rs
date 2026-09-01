@@ -3,6 +3,7 @@ pub mod arg;
 pub mod cache;
 pub mod collector;
 pub mod compare;
+pub mod daemon;
 pub mod dataflow;
 pub mod jn;
 pub mod map;

@@ -1,6 +1,7 @@
 use clap::Parser;
 use executing::arg::Args;
 use executing::cache::StrataCache;
+use executing::daemon::{request, serve, DaemonRequest};
 use executing::runner::run_cached;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -63,6 +64,8 @@ fn args_with(program: &Path, facts: &Path, output: &Path, extra: &[&str]) -> Arg
         output.to_str().unwrap().to_string(),
         "--workers".to_string(),
         "2".to_string(),
+        "--cache-max-mib".to_string(),
+        "64".to_string(),
     ];
     arguments.extend(extra.iter().map(|argument| (*argument).to_string()));
     Args::parse_from(arguments)
@@ -116,6 +119,56 @@ fn a_downstream_rule_edit_reuses_the_recursive_upstream_stratum() {
     fs::write(facts.join("Edge.csv"), "1,2\n2,3\n3,4\n4,5\n").unwrap();
     let changed_input = run_cached(args(&program_path, &facts, &output), &mut cache);
     assert_eq!((changed_input.hits, changed_input.misses), (0, 3));
+}
+
+#[test]
+fn the_daemon_reloads_reports_stats_and_removes_its_socket() {
+    let temp = TempTree::new("daemon");
+    let facts = temp.path("facts");
+    fs::create_dir_all(&facts).unwrap();
+    fs::write(facts.join("Edge.csv"), "1,2\n2,3\n").unwrap();
+    let program_path = temp.path("program.dl");
+    fs::write(&program_path, program("Mark(x) :- Reach(1, x).")).unwrap();
+    let output = temp.path("output");
+    let socket = temp.path("flowlog.sock");
+
+    let daemon_args = args(&program_path, &facts, &output);
+    let daemon_socket = socket.clone();
+    let daemon = std::thread::spawn(move || serve(daemon_args, daemon_socket));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !socket.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(socket.exists(), "daemon did not create its socket");
+
+    let cold = request(&socket, DaemonRequest::Reload).unwrap();
+    let cold: serde_json::Value = serde_json::from_str(&cold).unwrap();
+    assert_eq!(cold["ok"], true);
+    assert_eq!(cold["run"]["hits"], 0);
+    assert_eq!(cold["run"]["misses"], 3);
+
+    fs::write(&program_path, ".this is not a FlowLog program\n").unwrap();
+    let invalid = request(&socket, DaemonRequest::Reload).unwrap();
+    let invalid: serde_json::Value = serde_json::from_str(&invalid).unwrap();
+    assert_eq!(invalid["ok"], false);
+    assert_eq!(invalid["cache"]["entries"], 3);
+
+    fs::write(&program_path, program("Mark(x) :- Reach(2, x).")).unwrap();
+    let edited = request(&socket, DaemonRequest::Reload).unwrap();
+    let edited: serde_json::Value = serde_json::from_str(&edited).unwrap();
+    assert_eq!(edited["run"]["hits"], 2);
+    assert_eq!(edited["run"]["misses"], 1);
+
+    let stats = request(&socket, DaemonRequest::Stats).unwrap();
+    let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+    assert_eq!(stats["ok"], true);
+    assert!(stats["cache"]["entries"].as_u64().unwrap() >= 4);
+
+    let shutdown = request(&socket, DaemonRequest::Shutdown).unwrap();
+    let shutdown: serde_json::Value = serde_json::from_str(&shutdown).unwrap();
+    assert_eq!(shutdown["ok"], true);
+    daemon.join().unwrap().unwrap();
+    assert!(!socket.exists(), "daemon left a stale socket behind");
 }
 
 #[test]

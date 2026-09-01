@@ -275,6 +275,7 @@ dependencies = [
  "planning",
  "reading",
  "serde",
+ "serde_json",
  "sha2",
  "strata",
  "timely",

@@ -1,10 +1,14 @@
 use std::fmt;
 // use itertools::Itertools;
 use std::collections::HashSet;
+use std::sync::Arc;
 use tracing::debug;
 
 // use parsing::rule::FLRule;
+use crate::collections::CollectionSignature;
 use crate::rule::RuleQueryPlan;
+use parsing::parser::Program;
+use parsing::rule::FLRule;
 use crate::strata::GroupStrataQueryPlan;
 use catalog::rule::Catalog;
 use strata::stratification::Strata;
@@ -24,91 +28,22 @@ impl ProgramQueryPlan {
     }
 
     pub fn from_strata(strata: &Strata, disable_sharing: bool, opt_level: Option<u8>) -> Self {
-        let embedded_rust = strata.program().embedded_rust();
-        let rule_plans: Vec<(bool, Vec<RuleQueryPlan>)> = strata
-            .strata()
-            .into_iter()
-            .zip(strata.is_recursive_strata_bitmap())
-            .flat_map(|(stratum, is_recursive)| {
-                let mut rule_identifier = 0;
-                let mut any_sip = false;
-
-                let chain: Vec<RuleQueryPlan> = stratum
-                    .iter()
-                    .flat_map(|&rule| {
-                        let catalog = Catalog::from_strata(rule);
-                        let has_calls = !catalog.call_predicates().is_empty();
-                        let (requested_sip, is_planning) = if catalog
-                            .is_core_atom_bitmap()
-                            .into_iter()
-                            .filter(|&x| *x)
-                            .count() > 2 { // optimize for <= 2 core atoms are meaningless
-                            match opt_level {
-                                Some(level) => {
-                                    (level == 1 || level == 3 || rule.is_sip(), level >= 2 || rule.is_planning())
-                                }
-                                None => (rule.is_sip(), rule.is_planning()),
-                            }
-                        } else {
-                            (false, false)
-                        };
-                        // SIP rewrites rule bodies and heads. Keep embedded calls
-                        // attached to their original rule until SIP has a typed
-                        // representation for them.
-                        let is_sip = requested_sip && !has_calls;
-
-                        if is_sip { any_sip = true; } // mark if any rule uses sip in a stratum
-
-                        let expanded_catalogs = if is_sip {
-                            catalog.sideways(rule_identifier)
-                        } else {
-                            vec![catalog]
-                        };
-                        rule_identifier += 1;
-
-                        expanded_catalogs
-                            .into_iter()
-                            .map(move |catalog| {
-                                RuleQueryPlan::from_catalog_with_embedded(
-                                    &catalog,
-                                    is_planning,
-                                    embedded_rust,
-                                )
-                            })
-                    })
-                    .collect();
-
-                // if it is non_recursive and there is some rule using sip, slice into multiple non-recursive strata
-                // (because sideways information passing slices the strata into many cascading strata) 
-                if !*is_recursive && any_sip {
-                    chain.into_iter().map(|plan| (false, vec![plan])).collect() // (to do) this is probably a hacky way to make sideways works
-                } else {
-                    vec![(*is_recursive, chain)] // no change to the strata group since it is recursive or no sip rules
-                }
-            })
-            .collect();
-
-        // debugging for each rule plan in the group
-        for (is_recursive, rule_plans) in &rule_plans {
-            debug!(
-                "-------------------------------- {} strata group --------------------------------",
-                if *is_recursive {
-                    "recursive"
-                } else {
-                    "non-recursive"
-                }
-            );
-            for rule_plan in rule_plans {
-                debug!("{}", rule_plan);
-            }
-        }
-
         // accumulative seen set across all strata
         let mut seen_set = HashSet::new();
-        let program_plan = rule_plans
-            .into_iter()
-            .map(|(is_recursive, rule_plans)| {
-                GroupStrataQueryPlan::new(is_recursive, rule_plans, &mut seen_set, disable_sharing)
+        let program_plan = strata
+            .strata()
+            .iter()
+            .zip(strata.is_recursive_strata_bitmap())
+            .flat_map(|(stratum, &is_recursive)| {
+                plan_rules(
+                    stratum,
+                    is_recursive,
+                    opt_level,
+                    strata.program(),
+                    0,
+                    &mut seen_set,
+                    disable_sharing,
+                )
             })
             .collect();
 
@@ -268,4 +203,102 @@ impl fmt::Display for ProgramQueryPlan {
         }
         Ok(())
     }
+}
+
+/// Plan one stratum's rules: the groups the dataflow assembles for them, in order.
+///
+/// A non-recursive stratum in which any rule takes sideways information passing
+/// is sliced into cascading groups, one per expanded plan, because the sliced
+/// heads are boundaries the next slice reads.  Any other stratum is one group.
+/// Public so that a caller can plan a subset of a stratum -- the state cache
+/// plans exactly the units it must recompute.  Sideways slices are named by
+/// rule identifier alone, so a caller assembling several subsets into one
+/// dataflow passes each a `first_rule_identifier` past the previous subset's.
+pub fn plan_rules(
+    rules: &[&FLRule],
+    is_recursive: bool,
+    opt_level: Option<u8>,
+    program: &Program,
+    first_rule_identifier: usize,
+    seen_set: &mut HashSet<Arc<CollectionSignature>>,
+    disable_sharing: bool,
+) -> Vec<GroupStrataQueryPlan> {
+    let embedded_rust = program.embedded_rust();
+    let mut rule_identifier = first_rule_identifier;
+    let mut any_sip = false;
+
+    let chain: Vec<RuleQueryPlan> = rules
+        .iter()
+        .flat_map(|&rule| {
+            let catalog = Catalog::from_strata(rule);
+            let has_calls = !catalog.call_predicates().is_empty();
+            let (requested_sip, is_planning) = if catalog
+                .is_core_atom_bitmap()
+                .into_iter()
+                .filter(|&x| *x)
+                .count() > 2 { // optimize for <= 2 core atoms are meaningless
+                match opt_level {
+                    Some(level) => {
+                        (level == 1 || level == 3 || rule.is_sip(), level >= 2 || rule.is_planning())
+                    }
+                    None => (rule.is_sip(), rule.is_planning()),
+                }
+            } else {
+                (false, false)
+            };
+            // SIP rewrites rule bodies and heads. Keep embedded calls
+            // attached to their original rule until SIP has a typed
+            // representation for them.
+            let is_sip = requested_sip && !has_calls;
+
+            if is_sip { any_sip = true; } // mark if any rule uses sip in a stratum
+
+            let expanded_catalogs = if is_sip {
+                catalog.sideways(rule_identifier)
+            } else {
+                vec![catalog]
+            };
+            rule_identifier += 1;
+
+            expanded_catalogs
+                .into_iter()
+                .map(move |catalog| {
+                    RuleQueryPlan::from_catalog_with_embedded(
+                        &catalog,
+                        is_planning,
+                        embedded_rust,
+                    )
+                })
+        })
+        .collect();
+
+    // if it is non_recursive and there is some rule using sip, slice into multiple non-recursive strata
+    // (because sideways information passing slices the strata into many cascading strata)
+    let grouped: Vec<(bool, Vec<RuleQueryPlan>)> = if !is_recursive && any_sip {
+        chain.into_iter().map(|plan| (false, vec![plan])).collect() // (to do) this is probably a hacky way to make sideways works
+    } else {
+        vec![(is_recursive, chain)] // no change to the strata group since it is recursive or no sip rules
+    };
+
+    // debugging for each rule plan in the group
+    for (is_recursive, rule_plans) in &grouped {
+        debug!(
+            "-------------------------------- {} strata group --------------------------------",
+            if *is_recursive {
+                "recursive"
+            } else {
+                "non-recursive"
+            }
+        );
+        for rule_plan in rule_plans {
+            debug!("{}", rule_plan);
+        }
+    }
+
+    grouped
+        .into_iter()
+        .map(|(is_recursive, rule_plans)| {
+            GroupStrataQueryPlan::new(is_recursive, rule_plans, seen_set, disable_sharing)
+        })
+        .collect()
 }

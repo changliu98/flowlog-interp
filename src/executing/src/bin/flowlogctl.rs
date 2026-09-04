@@ -15,8 +15,18 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Re-read the program and evaluate cache misses
-    Reload,
+    /// Evaluate a program, reading along the cache
+    Reload {
+        /// program to evaluate (default: the daemon's)
+        #[arg(long)]
+        program: Option<String>,
+        /// fact directory to read (default: the daemon's)
+        #[arg(long)]
+        facts: Option<String>,
+        /// output directory to write (default: the daemon's)
+        #[arg(long)]
+        csvs: Option<String>,
+    },
     /// Report the last run and resident cache size
     Stats,
     /// Ask the daemon to exit cleanly
@@ -26,7 +36,15 @@ enum Command {
 fn main() {
     let args = Args::parse();
     let command = match args.command {
-        Command::Reload => DaemonRequest::Reload,
+        Command::Reload {
+            program,
+            facts,
+            csvs,
+        } => DaemonRequest::Reload {
+            program,
+            facts,
+            csvs,
+        },
         Command::Stats => DaemonRequest::Stats,
         Command::Shutdown => DaemonRequest::Shutdown,
     };

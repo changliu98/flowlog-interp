@@ -363,6 +363,31 @@ macro_rules! generate_construct_var {
 // `construct_var_i(scope: &mut G, arity: usize) -> Rel<G>` for i from 1 to 8
 generate_construct_var!(1, 2, 3, 4, 5, 6, 7, 8);
 
+/* ------------------------------------------------------------------------------------ */
+/* read a whole relation into rows (for the state cache)                                */
+/* ------------------------------------------------------------------------------------ */
+
+/// Reads one relation file into rows, in this process, with the parsing and
+/// the refusals of the dataflow reader: the same delimiter, the same cell
+/// domain, the same arity check, the same message when a file is unreadable.
+pub fn read_relation_rows(rel_decl: &RelDecl, rel_path: &str, delimiter: &u8) -> Vec<Vec<Val>> {
+    let rel_arity = rel_decl.arity();
+    let mut rows = Vec::new();
+    for_each_line_in_range(rel_path, 0, 1, |line| {
+        let mut row = Vec::with_capacity(rel_arity);
+        let mut values = 0usize;
+        for cell in line.split(|&byte| byte == *delimiter) {
+            values += 1;
+            if values <= rel_arity {
+                row.push(parse_cell(rel_path, line, cell));
+            }
+        }
+        refuse_arity_mismatch(rel_path, line, rel_arity, values);
+        rows.push(row);
+    });
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};

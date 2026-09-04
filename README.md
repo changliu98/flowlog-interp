@@ -145,46 +145,56 @@ FlowLog currently supports two execution modes for Datalog applications:
 | **Batch Mode** (default) | `cargo build --release` | Static Datalog execution (used in the paper benchmarking) |
 | **Incremental Mode** | `cargo build --release --features isize-type --no-default-features` | Incremental Datalog execution |
 
-### Resident stratum cache
+### Content-addressed state cache
 
-The normal `executing` command remains a one-shot process. For an edit/evaluate
-loop, `--daemon-socket` keeps materialized stratum outputs in memory and reuses
-them across reloads:
+The normal `executing` command is a one-shot process.  Two flags make it
+reuse work across edits and across processes:
 
 ```bash
-# Foreground daemon; use a service manager or terminal multiplexer if desired.
-target/release/executing \
-  -p examples/reach.dl \
-  -f reach \
-  -c output \
-  -w 8 \
-  --daemon-socket /tmp/flowlog-reach.sock \
-  --cache-max-mib 4096
+# One-shot, reading along a shared on-disk store of relation states.
+target/release/executing -p examples/reach.dl -f reach -c output -w 8 \
+  --cache-dir /tmp/flowlog-states --cache-disk-max-mib 32768
 
-# From another shell:
+# A resident daemon with an in-memory layer over the same store.
+target/release/executing -p examples/reach.dl -f reach -c output -w 8 \
+  --daemon-socket /tmp/flowlog-reach.sock --cache-max-mib 4096 \
+  --cache-dir /tmp/flowlog-states
+
+# From another shell: each reload names its own program, facts and output
+# (defaulting to the daemon's) and runs on its own thread.
 target/release/flowlogctl -s /tmp/flowlog-reach.sock reload
+target/release/flowlogctl -s /tmp/flowlog-reach.sock reload \
+  --program other.dl --facts other-facts --csvs other-output
 target/release/flowlogctl -s /tmp/flowlog-reach.sock stats
-
-# Edit examples/reach.dl, then evaluate only invalidated strata.
-target/release/flowlogctl -s /tmp/flowlog-reach.sock reload
 target/release/flowlogctl -s /tmp/flowlog-reach.sock shutdown
 ```
 
-Each command returns one JSON object with cache hits, misses, loaded/captured
-row counts, and resident memory. A reload reparses and restratifies the complete
-program. A cache key binds a stratum to its rules, declarations, embedded Rust,
-engine mode, exact EDB file bytes, and upstream relation versions. Editing a
-downstream rule therefore keeps an unchanged recursive fixed point, while an
-EDB or upstream-rule edit invalidates every dependent stratum. Invalid programs
-return an error without discarding previously valid entries.
+The cache unit is one recursive stratum, or one relation's rules within a
+non-recursive stratum.  A unit's key is content on both sides: the canonical
+text of its rules -- variables numbered by first appearance, body predicates
+in a name-free order, planning hints dropped, so a renamed, reordered or
+duplicated rule spells the same -- together with the declared types of the
+relations it touches, the embedded Rust when it calls into it, and the digest
+of every input relation's rows.  Evaluation reads along the strata: every key
+of a stratum is computed from settled states, the units the cache holds are
+served, and the rest are assembled into one dataflow over the injected input
+states, captured at their heads, and stored.  An upstream edit that leaves a
+relation's rows unchanged therefore stops invalidating there, and an
+unrelated declaration or clause elsewhere in the program touches nothing.
 
-This is a materialized-result cache, not mutable dataflow topology. Each reload
-assembles a fresh graph, injects cache hits as input relations, and computes
-misses; arbitrary rule additions and deletions are therefore safe. The cache is
-process-local and LRU-bounded, disappears on shutdown, and still hashes EDB
-files on every reload. Cache-mode planning deliberately avoids cross-stratum
-intermediate sharing so that relation heads form complete reuse boundaries.
+Each command returns one JSON object with hits, misses, disk hits, hits that
+followed a miss (`cutoff_hits`, the reuse an identity-keyed cache would have
+lost), loaded and captured row counts, and resident memory; a cached one-shot
+run writes the same object to `<csvs>/csvs/cache-stats.json`.
 
+This is a materialized-state cache, not mutable dataflow topology.  A missed
+unit is recomputed whole, every reload re-parses the program and re-reads the
+fact files, and correctness never depends on a hit.  The in-memory layer is
+process-local and LRU-bounded by estimated bytes; the on-disk store is one
+file per unit version, written whole (temporary file, then rename), verified
+against its digest on every read, and swept by access time when it exceeds
+its budget.  Cache-mode planning avoids cross-stratum intermediate sharing so
+that relation states form complete reuse boundaries.
 
 ---
 

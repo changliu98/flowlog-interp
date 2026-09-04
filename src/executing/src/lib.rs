@@ -1,6 +1,7 @@
 pub mod aggregation;
 pub mod arg;
 pub mod cache;
+pub mod canonical;
 pub mod collector;
 pub mod compare;
 pub mod daemon;

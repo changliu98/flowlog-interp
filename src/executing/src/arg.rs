@@ -46,9 +46,18 @@ pub struct Args {
     #[arg(long)]
     daemon_socket: Option<PathBuf>,
 
-    /// maximum memory retained for materialized stratum outputs
+    /// maximum memory retained for materialized relation states
     #[arg(long, default_value_t = 4096)]
     cache_max_mib: usize,
+
+    /// directory of a content-addressed store of relation states, shared by
+    /// every process that points at it; enables cached evaluation without a daemon
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+
+    /// maximum disk retained under --cache-dir, swept by access time
+    #[arg(long, default_value_t = 32768)]
+    cache_disk_max_mib: usize,
 }
 
 impl Args {
@@ -113,5 +122,34 @@ impl Args {
 
     pub fn cache_max_bytes(&self) -> usize {
         self.cache_max_mib.saturating_mul(1024 * 1024)
+    }
+
+    pub fn cache_dir(&self) -> Option<&Path> {
+        self.cache_dir.as_deref()
+    }
+
+    pub fn cache_disk_max_bytes(&self) -> u64 {
+        (self.cache_disk_max_mib as u64).saturating_mul(1024 * 1024)
+    }
+
+    /// These arguments about another program, fact directory or output
+    /// directory; each `None` keeps the value this process was started with.
+    pub fn with_paths(
+        &self,
+        program: Option<String>,
+        facts: Option<String>,
+        csvs: Option<String>,
+    ) -> Args {
+        let mut args = self.clone();
+        if let Some(program) = program {
+            args.program = program;
+        }
+        if let Some(facts) = facts {
+            args.facts = facts;
+        }
+        if let Some(csvs) = csvs {
+            args.csvs = Some(csvs);
+        }
+        args
     }
 }

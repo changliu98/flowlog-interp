@@ -1,17 +1,26 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+//! Assembling group plans into a differential dataflow.
+//!
+//! `assemble_group` turns one group's transformations into operators over a
+//! scope. `Assembly` is what one evaluation asks a worker set to run: some
+//! computations, each a list of groups over injected input states with the
+//! relations to capture at its boundary. All the computations of an assembly
+//! share one dataflow and one set of input collections, but each has its own
+//! relation maps, so two computations contributing to one head cannot see
+//! each other's rows.
+
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use itertools::Itertools;
-use tracing::{debug, info};
+use tracing::debug;
 
 extern crate timely;
 extern crate differential_dataflow;
 
 // local modules
-use strata::stratification::Strata;
 use planning::strata::GroupStrataQueryPlan;
 use planning::transformations::Transformation;
 use planning::collections::CollectionSignature;
-use crate::arg::Args;
+use crate::accounting::Budget;
 use crate::cache::RelationState;
 use crate::collector::non_recursive_collector;
 use crate::collector::recursive_collector;
@@ -23,40 +32,70 @@ use crate::Iter;
 use crate::map::*;
 use crate::native_calls::NativeCallModule;
 
-
+use parsing::diagnostic::Result;
 use macros::*;
 use reading::rel::Rel::*;
 use reading::rel::DoubleRel::*;
 use reading::rel::{DoubleRel, Rel};
 use reading::arrangements::{ArrangedDict, ArrangedSet};
-use reading::reader::*; 
+use reading::reader::*;
 use reading::inspect::*;
 use catalog::head::AggregationHeadIDB;
+use timely::communication::Allocate;
+use timely::dataflow::operators::probe::Handle as ProbeHandle;
+use timely::worker::Worker;
 
 type RowMap<G> = HashMap<Arc<CollectionSignature>, Arc<Rel<G>>>;
 type KvMap<G> = HashMap<Arc<CollectionSignature>, (Arc<DoubleRel<G>>, Arc<ArrangedDict<G>>)>;
 type KMap<G> = HashMap<Arc<CollectionSignature>, (Arc<Rel<G>>, Arc<ArrangedSet<G>>)>;
 
+/// What `assemble_group` needs beside the plan.
+pub(crate) struct AssemblyContext<'a> {
+    pub fat_mode: bool,
+    pub native_calls: &'a Option<Arc<NativeCallModule>>,
+    pub idb_map: &'a HashMap<String, AggregationHeadIDB>,
+    pub budget: &'a Arc<Budget>,
+    pub program_name: &'a str,
+}
+
 /// Assemble one group's operators into `scope`.
 ///
 /// Inputs are read from the maps and the group's heads are left in `row_map`
-/// when it returns.  Shared by the one-shot path, which assembles every group
-/// of the program into one dataflow, and by the cache path, which assembles
-/// only the missed units of one stratum over injected input states.
+/// when it returns.
 pub(crate) fn assemble_group<G>(
     scope: &mut G,
     group_plan: &GroupStrataQueryPlan,
     row_map: &mut RowMap<G>,
     kv_map: &mut KvMap<G>,
     k_map: &mut KMap<G>,
-    fat_mode: bool,
-    native_calls: &Option<Arc<NativeCallModule>>,
-    idb_map: &HashMap<String, AggregationHeadIDB>,
-) where
+    context: &AssemblyContext<'_>,
+) -> Result<()>
+where
     G: Scope<Timestamp = Time>,
 {
+    let fat_mode = context.fat_mode;
+    let native_calls = context.native_calls;
+    let idb_map = context.idb_map;
+    let budget = context.budget;
+
+    // Every row program is resolved before any operator is built, so a
+    // function that failed to load is a refusal here and never a hole in a
+    // half-assembled scope.
+    let mut runners: HashMap<Arc<CollectionSignature>, Arc<RowProgramRunner>> = HashMap::new();
+    for transformation in group_plan.strata_plan() {
+        if let Transformation::Compute { program, output, .. } = transformation {
+            let runner = RowProgramRunner::new(
+                program,
+                native_calls.as_ref(),
+                budget,
+                context.program_name,
+            )?;
+            runners.insert(Arc::clone(output.signature()), Arc::new(runner));
+        }
+    }
+
     if !group_plan.is_recursive() {
-        /* construct dataflow for a non-recursive strata */ 
+        /* construct dataflow for a non-recursive strata */
         for next_transformation in group_plan.strata_plan() {
             let output = next_transformation.output();
             let output_signature = output.signature();
@@ -67,18 +106,16 @@ pub(crate) fn assemble_group<G>(
                 let unary = next_transformation.unary();
                 let (ik, iv) = unary.arity();
                 let input_rel = row_map.get(unary.signature()).expect(&format!("row absent for unary op: {}", unary.signature()));
-                
+
                 match next_transformation {
-                    Transformation::CallRowToRow { projection, .. } => {
+                    Transformation::Compute { .. } => {
                         assert!(ik == 0 && ok == 0);
-                        let native_calls = native_calls.as_ref().expect(
-                            "call projection planned without an embedded Rust module",
-                        );
-                        let output_rel = Arc::new(codegen_call_row!());
+                        let runner = Arc::clone(&runners[output_signature]);
+                        let output_rel = Arc::new(codegen_row_program!());
                         row_map.insert(Arc::clone(output_signature), output_rel);
                     },
 
-                    Transformation::RowToRow { flow, is_no_op, .. } => { // (1) single op, tc(x, y) :- arc(y, x).                  
+                    Transformation::RowToRow { flow, is_no_op, .. } => { // (1) single op, tc(x, y) :- arc(y, x).
                         assert!(ik == 0 && ok == 0);
                         let output_rel = if *is_no_op { Arc::clone(input_rel) } else { Arc::new(codegen_row_row!()) };
                         row_map.insert(Arc::clone(output_signature), output_rel);
@@ -92,7 +129,7 @@ pub(crate) fn assemble_group<G>(
                             Arc::new(codegen_row_row!().dedup())
                         };
                         k_map.insert(
-                            Arc::clone(output_signature), 
+                            Arc::clone(output_signature),
                             (Arc::clone(&output_rel), Arc::new(output_rel.arrange_set()))
                         );
                     },
@@ -101,7 +138,7 @@ pub(crate) fn assemble_group<G>(
                         assert_eq!(ik, 0);
                         let output_kv = Arc::new(codegen_row_kv!());
                         kv_map.insert(
-                            Arc::clone(output_signature), 
+                            Arc::clone(output_signature),
                             (Arc::clone(&output_kv), Arc::new(output_kv.arrange_dict()))
                         );
                     },
@@ -122,23 +159,23 @@ pub(crate) fn assemble_group<G>(
                     };
 
                 let output_rel = match next_transformation {
-                        Transformation::JnKvKv { .. } => 
-                            kv_jn_kv(large, small, kv_map, ik0, iv0, iv1, target, flow),
+                        Transformation::JnKvKv { .. } =>
+                            kv_jn_kv(large, small, kv_map, ik0, iv0, iv1, target, flow, budget),
 
-                        Transformation::JnKvK { .. } | Transformation::JnKKv { .. } => 
-                            kv_jn_k(large, small, kv_map, k_map, ik0, iv0, iv1, target, flow),
+                        Transformation::JnKvK { .. } | Transformation::JnKKv { .. } =>
+                            kv_jn_k(large, small, kv_map, k_map, ik0, iv0, iv1, target, flow, budget),
 
-                        Transformation::JnKK { .. } => 
-                            k_jn_k(large, small, k_map, ik0, iv0, iv1, target, flow),
+                        Transformation::JnKK { .. } =>
+                            k_jn_k(large, small, k_map, ik0, iv0, iv1, target, flow, budget),
 
                         Transformation::Cartesian { .. } =>
-                            cartesian(large, small, row_map, iv0, iv1, target, flow),
+                            cartesian(large, small, row_map, iv0, iv1, target, flow, budget),
 
-                        Transformation::NjKvK { .. } => 
-                            kv_aj_k(large, small, kv_map, k_map, ik0, iv0, iv1, target, flow),
+                        Transformation::NjKvK { .. } =>
+                            kv_aj_k(large, small, kv_map, k_map, ik0, iv0, iv1, target, flow, budget),
 
-                        Transformation::NjKK { .. } => 
-                            k_aj_k(large, small, k_map, ik0, iv0, iv1, target, flow),
+                        Transformation::NjKK { .. } =>
+                            k_aj_k(large, small, k_map, ik0, iv0, iv1, target, flow, budget),
 
                         _ => panic!("abnormal binary transformation"),
                     };
@@ -149,24 +186,24 @@ pub(crate) fn assemble_group<G>(
                     },
                     (_, 0) => { // jn → k
                         k_map.insert(
-                            Arc::clone(output_signature), 
+                            Arc::clone(output_signature),
                             (Arc::clone(&output_rel), Arc::new(output_rel.arrange_set()))
                         );
                     }
                     _ => { // jn → kv
                         let output_kv = Arc::new(output_rel.arrange_double(ok));
                         kv_map.insert(
-                            Arc::clone(output_signature), 
+                            Arc::clone(output_signature),
                             (Arc::clone(&output_kv), Arc::new(output_kv.arrange_dict()))
                         );
                     }
                 }
             }
-        } 
+        }
 
-        /* concat idbs of the non-recursive strata into row_map */ 
+        /* concat idbs of the non-recursive strata into row_map */
         non_recursive_collector(
-            group_plan.last_signatures_map(), 
+            group_plan.last_signatures_map(),
             row_map,
             idb_map,
         );
@@ -174,30 +211,28 @@ pub(crate) fn assemble_group<G>(
         /* inspect idbs of the non-recursive strata (optional) */
         if tracing::level_enabled!(tracing::Level::DEBUG) {
             inspector(
-                &group_plan.head_signatures_set(), 
+                &group_plan.head_signatures_set(),
                 row_map,
                 false
             );
         }
-        
+
     } else {
         let recursive_out_map = scope.iterative::<Iter, _, _>(|scope| {
-            /* (1) construct iterative variables for strata idbs */ 
+            /* (1) construct iterative variables for strata idbs */
             let head_signatures_set = group_plan.head_signatures_set().clone();
             let mut variables_map = HashMap::with_capacity(head_signatures_set.len());
             let mut variables_next_map = HashMap::with_capacity(head_signatures_set.len());
 
             for (head_name, head_arity) in group_plan.heads().iter().sorted_by_key(|x| x.0) {
-                // (sideways) jump over sip rules
-                // We do not collect sip rules in the collector, we store them in the next row map
-                // TODO: temporarily way to avoid sip rule, need carefully refactor
-                // to avoid this in the future
-                if head_name.contains("_sip") {
+                // A sideways slice is not an iterative variable: later rules of
+                // the group read it from the nested row map.
+                if group_plan.is_sideways_head(head_name) {
                     continue;
                 }
 
                 variables_map.insert(
-                    Arc::new(CollectionSignature::new_atom(head_name)), 
+                    Arc::new(CollectionSignature::new_atom(head_name)),
                     construct_var(scope, *head_arity, fat_mode)
                 );
             }
@@ -208,11 +243,7 @@ pub(crate) fn assemble_group<G>(
 
             let dependent_signatures = group_plan.enter_scope_set();
             for dependent_signature in dependent_signatures.iter().sorted_by_key(|sig| sig.name()) {
-                // (sideways) jump over sip rules
-                // We do not collect sip rules in the collector, we store them in the next row map
-                // TODO: temporarily way to avoid sip rule, need carefully refactor
-                // to avoid this in the future
-                if dependent_signature.name().contains("_sip") {
+                if group_plan.is_sideways_head(dependent_signature.name()) {
                     continue;
                 }
 
@@ -249,7 +280,7 @@ pub(crate) fn assemble_group<G>(
                 } else {
                     // (5) rel defined from this recursive strata
                     assert!(
-                        variables_map.contains_key(dependent_signature), 
+                        variables_map.contains_key(dependent_signature),
                         "dependent {:?} must be defined somewhere of the strata", dependent_signature
                     );
                 }
@@ -275,21 +306,18 @@ pub(crate) fn assemble_group<G>(
                         .expect(&format!("row absent for unary op: {}", unary_signature));
 
                     match next_transformation {
-                        Transformation::CallRowToRow { projection, .. } => {
+                        Transformation::Compute { .. } => {
                             assert!(ik == 0 && ok == 0);
-                            let native_calls = native_calls.as_ref().expect(
-                                "call projection planned without an embedded Rust module",
-                            );
-                            let output_rel = Arc::new(codegen_call_row!());
+                            let runner = Arc::clone(&runners[output_signature]);
+                            let output_rel = Arc::new(codegen_row_program!());
                             nest_row_map.insert(
                                 Arc::clone(output_signature),
                                 output_rel,
                             );
                         },
 
-                        Transformation::RowToRow { flow, is_no_op, .. } => { // (1) single op, tc(x, y) :- arc(y, x).                  
-                            assert!(ik == 0 && ok == 0);
-                            let output_rel = 
+                        Transformation::RowToRow { flow, is_no_op, .. } => { // (1) single op, tc(x, y) :- arc(y, x).
+                            let output_rel =
                                 if *is_no_op && nest_row_map.contains_key(unary_signature) {
                                     Arc::clone(nest_row_map.get(unary_signature).unwrap())
                                 } else {
@@ -300,14 +328,14 @@ pub(crate) fn assemble_group<G>(
 
                         Transformation::RowToK { flow, is_no_op, .. } => { // (2) leaf op for semijn or aj
                             assert!(ik == 0 && ov == 0);
-                            let output_rel = 
+                            let output_rel =
                                 if *is_no_op && nest_row_map.contains_key(unary_signature) {
                                     Arc::clone(nest_row_map.get(unary_signature).unwrap())
                                 } else {
                                     Arc::new(codegen_row_row!().threshold())
                                 };
                             nest_k_map.insert(
-                                Arc::clone(output_signature), 
+                                Arc::clone(output_signature),
                                 (Arc::clone(&output_rel), Arc::new(output_rel.arrange_set()))
                             );
                         },
@@ -316,7 +344,7 @@ pub(crate) fn assemble_group<G>(
                             assert_eq!(ik, 0);
                             let output_kv = Arc::new(codegen_row_kv!());
                             nest_kv_map.insert(
-                                Arc::clone(output_signature), 
+                                Arc::clone(output_signature),
                                 (Arc::clone(&output_kv), Arc::new(output_kv.arrange_dict()))
                             );
                         },
@@ -337,23 +365,23 @@ pub(crate) fn assemble_group<G>(
                     };
 
                     let output_rel = match next_transformation {
-                            Transformation::JnKvKv { .. } => 
-                                kv_jn_kv(large, small, &nest_kv_map, ik0, iv0, iv1, target, flow),
+                            Transformation::JnKvKv { .. } =>
+                                kv_jn_kv(large, small, &nest_kv_map, ik0, iv0, iv1, target, flow, budget),
 
-                            Transformation::JnKvK { .. } | Transformation::JnKKv { .. } => 
-                                kv_jn_k(large, small, &nest_kv_map, &nest_k_map, ik0, iv0, iv1, target, flow),
+                            Transformation::JnKvK { .. } | Transformation::JnKKv { .. } =>
+                                kv_jn_k(large, small, &nest_kv_map, &nest_k_map, ik0, iv0, iv1, target, flow, budget),
 
-                            Transformation::JnKK { .. } => 
-                                k_jn_k(large, small, &nest_k_map, ik0, iv0, iv1, target, flow),
+                            Transformation::JnKK { .. } =>
+                                k_jn_k(large, small, &nest_k_map, ik0, iv0, iv1, target, flow, budget),
 
                             Transformation::Cartesian { .. } =>
-                                cartesian(large, small, &nest_row_map, iv0, iv1, target, flow),
+                                cartesian(large, small, &nest_row_map, iv0, iv1, target, flow, budget),
 
-                            Transformation::NjKvK { .. } => 
-                                kv_aj_k(large, small, &nest_kv_map, &mut nest_k_map, ik0, iv0, iv1, target, flow),
+                            Transformation::NjKvK { .. } =>
+                                kv_aj_k(large, small, &nest_kv_map, &mut nest_k_map, ik0, iv0, iv1, target, flow, budget),
 
-                            Transformation::NjKK { .. } => 
-                                k_aj_k(large, small, &mut nest_k_map, ik0, iv0, iv1, target, flow),
+                            Transformation::NjKK { .. } =>
+                                k_aj_k(large, small, &mut nest_k_map, ik0, iv0, iv1, target, flow, budget),
 
                             _ => panic!("(recursive) abnormal binary transformation"),
                         };
@@ -361,36 +389,24 @@ pub(crate) fn assemble_group<G>(
                     match (ok, ov) {
                         (0, _) => { // jn → row
                             nest_row_map.insert(Arc::clone(output_signature), Arc::clone(&output_rel));
-                            // (sideways) compensate sip rules
+                            // A sideways slice is not an iterative variable of this
+                            // scope and the collector skips it, so a rule deriving one
+                            // publishes its rows here, under the head name, where a
+                            // later rule of the group reads them.
                             //
-                            // A sip head is not an iterative variable of this scope and the
-                            // collector skips it, so a rule deriving one publishes its rows here,
-                            // under the head name, where a later rule of the stratum reads them.
-                            // TODO: temporarily way to avoid sip rule, need carefully refactor
-                            // to avoid this in the future
-                            //
-                            // This map is keyed by the *roots* of the stratum's rule plans, and a
-                            // row-shaped output is not necessarily one of them. A row is also what
-                            // a Cartesian product takes on both sides and what a row-local call
-                            // projection takes as input, so an operator feeding either is an
-                            // ordinary intermediate that happens to be row-shaped. It is the root
-                            // of no rule, it names no head, and there is nothing to compensate:
-                            //
-                            //     H(x, y, z) :- H(x, w, q), A(w, y), C(z).
-                            //
-                            // plans the join of H and A as a row for the product with C, and
-                            // demanding a head for it aborted the whole program.
-                            //
-                            // Proceeding here cannot hide a head. A head whose rows really did go
-                            // missing is still reported, by the collector that reads
-                            // `last_signatures_map` for that head, and by the operator that reads
-                            // a sip name it was promised.
+                            // This map is keyed by the roots of the group's rule plans,
+                            // and a row-shaped output is not necessarily one of them: a
+                            // row is also what a Cartesian product takes on both sides
+                            // and what a row program reads, so an operator feeding either
+                            // is an ordinary intermediate that happens to be row-shaped.
+                            // A head whose rows really did go missing is still reported,
+                            // by the collector that reads `last_signatures_map`.
                             if let Some(head_signatures) = group_plan
                                     .reverse_last_signatures_map()
                                     .get(output_signature)
                             {
                                 for head_signature in head_signatures {
-                                    if head_signature.name().contains("_sip") {
+                                    if group_plan.is_sideways_head(head_signature.name()) {
                                         nest_row_map.insert(Arc::clone(head_signature), Arc::clone(&output_rel));
                                     }
                                 }
@@ -398,14 +414,14 @@ pub(crate) fn assemble_group<G>(
                         },
                         (_, 0) => { // jn → k
                             nest_k_map.insert(
-                                Arc::clone(output_signature), 
+                                Arc::clone(output_signature),
                                 (Arc::clone(&output_rel), Arc::new(output_rel.arrange_set()))
                             );
                         }
                         _ => { // jn → kv
                             let output_kv = Arc::new(output_rel.arrange_double(ok));
                             nest_kv_map.insert(
-                                Arc::clone(output_signature), 
+                                Arc::clone(output_signature),
                                 (Arc::clone(&output_kv), Arc::new(output_kv.arrange_dict()))
                             );
                         }
@@ -414,9 +430,8 @@ pub(crate) fn assemble_group<G>(
             }
 
             /* concatenate and threshold idbs of the recursive strata into the variables_next_map */
-            // debug!("last_signatures_map: {:?}", group_plan.last_signatures_map());
             recursive_collector(
-                group_plan.last_signatures_map(), 
+                group_plan,
                 &nest_row_map,
                 &mut variables_next_map,
                 idb_map
@@ -425,7 +440,7 @@ pub(crate) fn assemble_group<G>(
             /* inspect idbs of the recursive strata (optional) */
             if tracing::level_enabled!(tracing::Level:: DEBUG) {
                 inspector(
-                    &head_signatures_set, 
+                    &head_signatures_set,
                     &mut variables_next_map,
                     true
                 );
@@ -466,231 +481,65 @@ pub(crate) fn assemble_group<G>(
             );
         }
     }
-}
-
-/// The one-shot evaluation: every group of the program in one dataflow, inputs
-/// read from the fact files, outputs written by the dataflow's own sinks.
-pub fn program_execution(
-    args: Args,
-    strata: Strata,
-    group_plans: Vec<GroupStrataQueryPlan>,
-    fat_mode: bool,
-    idb_map: HashMap<String, AggregationHeadIDB>,
-) {
-    let timely_args = args.timely_args();
-    let native_calls = strata
-        .program()
-        .embedded_rust()
-        .map(|embedded| NativeCallModule::compile_and_load(embedded, args.call_cache()))
-        .transpose()
-        .unwrap_or_else(|error| panic!("failed to prepare .code rust module: {error}"));
-    let output_paths = args.csvs().map(|csv_path| {
-        strata
-            .program()
-            .idbs()
-            .iter()
-            .map(|relation| format!("{}/csvs/{}.csv", csv_path, relation.name()))
-            .collect::<Vec<_>>()
-    });
-    let size_output_path = args
-        .csvs()
-        .map(|csv_path| format!("{}/csvs/size.txt", csv_path));
-    let recursive_output_names = group_plans
-        .iter()
-        .filter(|group_plan| group_plan.is_recursive())
-        .flat_map(|group_plan| group_plan.heads().into_keys())
-        .collect::<HashSet<_>>();
-    let timer = ::std::time::Instant::now();
-    let worker_timer = timer;
-
-    let guards = timely::execute_from_args(timely_args.into_iter(), move |worker| {
-        let timer = worker_timer;
-        let peers = worker.peers();
-        let id = worker.index(); 
-
-        /* assemble dataflow */
-        let mut session_map = worker.dataflow::<Time, _, _>(|scope| {
-            let mut session_map = HashMap::new();          // map from each edb name to input session (for data loading)
-            let mut row_map: RowMap<_> = HashMap::new();   // map from row signature (edbs and idbs) to the physical dataflow data
-            let mut kv_map: KvMap<_> = HashMap::new();     // map from (k, v) signature to the physical dataflow data   
-            let mut k_map: KMap<_> = HashMap::new();       // map from (k, ) signature to the physical dataflow data
-
-            /* construct dataflow rels & input session (i.e., file handles) to load the input */
-            for edb in strata.program().edbs() {
-                let edb_name = edb.name();
-                let (session_generic, input_rel) = construct_session_and_table(scope, edb.arity(), fat_mode);
-                    
-                session_map.insert(
-                    edb_name.to_string(), session_generic
-                );
-
-                row_map.insert(
-                    Arc::new(CollectionSignature::new_atom(edb_name)), Arc::new(input_rel)
-                );
-            }
-
-            /* inspect edbs (optional) */
-            if tracing::level_enabled!(tracing::Level::DEBUG) {
-                for (signature, rel) in row_map
-                    .iter()
-                    .sorted_by_key(|(signature, _)| signature.name()) {
-                    printsize_generic(rel, &format!("[{}]", signature.name()), false);
-                }
-            }
-
-            for group_plan in group_plans.iter() {
-                assemble_group(
-                    scope,
-                    group_plan,
-                    &mut row_map,
-                    &mut kv_map,
-                    &mut k_map,
-                    fat_mode,
-                    &native_calls,
-                    &idb_map,
-                );
-            } // end of a strata (group plan)
-
-            for idb in strata.program().idbs() {
-                let rel_name = idb.name();
-                let signature = Arc::new(CollectionSignature::new_atom(rel_name));
-                let Some(rel) = row_map.get(&signature) else {
-                    continue;
-                };
-
-                printsize_generic(
-                    rel,
-                    &format!("[{}]", rel_name),
-                    recursive_output_names.contains(rel_name),
-                );
-                if let Some(csv_path) = args.csvs() {
-                    writesize_generic(
-                        rel,
-                        rel_name,
-                        &format!("{}/csvs/size.txt", csv_path),
-                        id,
-                    );
-                    write_generic(
-                        rel,
-                        &format!("{}/csvs/{}.csv", csv_path, rel_name),
-                        id,
-                        args.delimiter().as_bytes()[0],
-                    );
-                }
-            }
-
-            /* exports */
-            session_map
-        }); 
-
-        if id == 0 {
-            info!("{:?}:\tDataflow assembled", timer.elapsed());
-        }
-
-        /* feeding edb data */ 
-        for rel_decl in strata.program().edbs() {
-            let rel_name = rel_decl.name();
-            let rel_path =     
-                if let Some(path) = rel_decl.path() {
-                    format!("{}/{}", args.facts(), path)
-                } else {
-                    format!("{}/{}.facts", args.facts(), rel_name)
-                };
-                
-            let session_generic = session_map
-                .get_mut(rel_name)
-                .expect(&format!("entry from session_map: {}", rel_name));
-            
-            read_row_generic(
-                rel_decl, 
-                &rel_path, 
-                &args.delimiter().as_bytes()[0], 
-                session_generic, 
-                id, 
-                peers,
-                fat_mode
-            );
-        }
-
-        for rel_decl in strata.program().edbs() {
-            let rel_name = rel_decl.name();
-            session_map
-                .remove(rel_name)
-                .expect(&format!("entry from session_map: {}", rel_name))
-                .close();
-
-            if id == 0 {
-                info!("{:?}:\tData loaded for {}", timer.elapsed(), rel_name);
-            }
-        }
-
-        /* executing the dataflow */
-        while worker.step() {
-            // spinning
-        }
-    }).expect("execute_from_args dies");
-
-    let peers = guards.guards().len();
-    for result in guards.join() {
-        result.expect("timely worker panicked");
-    }
-
-    info!("{:?}:\tDataflow executed", timer.elapsed());
-    if let Some(output_paths) = output_paths {
-        for output_path in output_paths {
-            debug!("merging worker partitions into {}", output_path);
-            merge_relation_partitions(&output_path, peers);
-        }
-    }
-    if let Some(size_output_path) = size_output_path {
-        merge_relation_partitions(&size_output_path, peers);
-    }
+    Ok(())
 }
 
 /// A missing whole unit or individual rule contribution. Its input map is the
 /// complete boundary: a contribution does not inherit its head's earlier rows.
-pub(crate) struct StratumComputation {
+pub struct Computation {
     pub groups: Vec<GroupStrataQueryPlan>,
     pub inputs: BTreeMap<String, Arc<RelationState>>,
     pub captures: BTreeMap<String, MaterializedUpdates>,
 }
 
-/// The missing computations of one stratum, in one dataflow. Input collections
-/// are shared, but each computation has its own relation and arrangement maps:
-/// two rules contributing to the same head must not capture each other's rows.
-pub(crate) fn stratum_execution(
-    args: &Args,
-    computations: Vec<StratumComputation>,
-    fat_mode: bool,
-    idb_map: Arc<HashMap<String, AggregationHeadIDB>>,
-    native_calls: Option<Arc<NativeCallModule>>,
-) {
-    let timely_args = args.timely_args();
-    let mut inputs = BTreeMap::new();
-    for computation in &computations {
-        for (name, state) in &computation.inputs {
-            if let Some(previous) = inputs.insert(name.clone(), Arc::clone(state)) {
-                assert_eq!(
-                    previous.digest, state.digest,
-                    "inconsistent stratum input {name}"
-                );
+/// Everything one dataflow of an evaluation is built from.
+pub struct Assembly {
+    pub computations: Vec<Computation>,
+    pub fat_mode: bool,
+    pub idb_map: Arc<HashMap<String, AggregationHeadIDB>>,
+    pub native_calls: Option<Arc<NativeCallModule>>,
+    pub budget: Arc<Budget>,
+    pub program_name: String,
+}
+
+impl Assembly {
+    /// The union of every computation's inputs. Two computations naming one
+    /// relation name one state: the stratum boundary is one boundary.
+    fn shared_inputs(&self) -> BTreeMap<String, Arc<RelationState>> {
+        let mut inputs = BTreeMap::new();
+        for computation in &self.computations {
+            for (name, state) in &computation.inputs {
+                if let Some(previous) = inputs.insert(name.clone(), Arc::clone(state)) {
+                    let previous: Arc<RelationState> = previous;
+                    assert_eq!(
+                        previous.digest, state.digest,
+                        "inconsistent stratum input {name}"
+                    );
+                }
             }
         }
+        inputs
     }
-    let computations = Arc::new(computations);
-    let inputs = Arc::new(inputs);
 
-    let guards = timely::execute_from_args(timely_args.into_iter(), move |worker| {
+    /// Build every computation into one dataflow on `worker`, feed the
+    /// worker's share of the input rows, and hand back the probe that says
+    /// when the dataflow is complete. Every worker of a set calls this with
+    /// the same assembly, in the same order, which is what timely requires.
+    pub fn build<A: Allocate>(&self, worker: &mut Worker<A>) -> Result<ProbeHandle<Time>> {
         let peers = worker.peers();
-        let id = worker.index();
+        let index = worker.index();
+        let inputs = self.shared_inputs();
+        let context_native = self.native_calls.clone();
 
-        let mut sessions = worker.dataflow::<Time, _, _>(|scope| {
+        let mut failure: Option<parsing::diagnostic::Diagnostic> = None;
+        let (mut sessions, probe) = worker.dataflow::<Time, _, _>(|scope| {
+            let probe = ProbeHandle::new();
             let mut sessions = Vec::new();
             let mut input_map: RowMap<_> = HashMap::new();
 
             for (name, state) in inputs.iter() {
                 let (session, input_rel) =
-                    construct_session_and_table(scope, state.arity, fat_mode);
+                    construct_session_and_table(scope, state.arity, self.fat_mode);
                 input_map.insert(
                     Arc::new(CollectionSignature::new_atom(name)),
                     Arc::new(input_rel),
@@ -698,7 +547,15 @@ pub(crate) fn stratum_execution(
                 sessions.push((session, Arc::clone(&state.rows)));
             }
 
-            for computation in computations.iter() {
+            let context = AssemblyContext {
+                fat_mode: self.fat_mode,
+                native_calls: &context_native,
+                idb_map: &self.idb_map,
+                budget: &self.budget,
+                program_name: &self.program_name,
+            };
+
+            for computation in self.computations.iter() {
                 let mut row_map: RowMap<_> = computation
                     .inputs
                     .keys()
@@ -711,45 +568,52 @@ pub(crate) fn stratum_execution(
                 let mut kv_map: KvMap<_> = HashMap::new();
                 let mut k_map: KMap<_> = HashMap::new();
                 for group_plan in &computation.groups {
-                    assemble_group(
+                    if failure.is_some() {
+                        break;
+                    }
+                    if let Err(diagnostic) = assemble_group(
                         scope,
                         group_plan,
                         &mut row_map,
                         &mut kv_map,
                         &mut k_map,
-                        fat_mode,
-                        &native_calls,
-                        &idb_map,
-                    );
+                        &context,
+                    ) {
+                        failure = Some(diagnostic);
+                    }
+                }
+                if failure.is_some() {
+                    break;
                 }
                 for (name, updates) in &computation.captures {
                     let signature = Arc::new(CollectionSignature::new_atom(name));
                     let relation = row_map.get(&signature).unwrap_or_else(|| {
                         panic!("state boundary relation {name} is absent after its unit")
                     });
-                    capture_generic(relation, Arc::clone(updates));
+                    capture_generic(relation, Arc::clone(updates), &probe);
                 }
             }
 
-            sessions
+            (sessions, probe)
         });
 
+        // Whatever happened while assembling, the sessions must be closed:
+        // an open input keeps the dataflow, and with it the worker, waiting.
         for (mut session, rows) in sessions.drain(..) {
-            for (row_index, row) in rows.iter().enumerate() {
-                if row_index % peers == id {
-                    session.update_values(row);
+            if failure.is_none() {
+                for (row_index, row) in rows.iter().enumerate() {
+                    if row_index % peers == index {
+                        session.update_values(row);
+                    }
                 }
             }
             session.close();
         }
+        debug!("worker {index}/{peers}: dataflow assembled");
 
-        while worker.step() {
-            // spinning
+        match failure {
+            Some(diagnostic) => Err(diagnostic),
+            None => Ok(probe),
         }
-    })
-    .expect("execute_from_args dies");
-
-    for result in guards.join() {
-        result.expect("timely worker panicked");
     }
 }

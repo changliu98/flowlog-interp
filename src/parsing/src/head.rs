@@ -1,4 +1,5 @@
-use crate::{aggregation::Aggregation, arithmetic::Arithmetic, parser::Lexeme, Rule};
+use crate::diagnostic::Result;
+use crate::{aggregation::Aggregation, arithmetic::Arithmetic, parser::Lexeme, Rule, Val};
 use pest::iterators::Pair;
 use std::fmt;
 
@@ -34,6 +35,18 @@ impl HeadArg {
             Self::Var(var) => vec![var],
             Self::Arith(arith) => arith.vars(),
             Self::Aggregation(aggregation) => aggregation.vars(),
+        }
+    }
+
+    pub fn is_aggregation(&self) -> bool {
+        matches!(self, Self::Aggregation(_))
+    }
+
+    pub fn lower_symbols(&mut self, intern: &mut dyn FnMut(&str) -> Result<Val>) -> Result<()> {
+        match self {
+            Self::Var(_) => Ok(()),
+            Self::Arith(arithmetic) => arithmetic.lower_symbols(intern),
+            Self::Aggregation(aggregation) => aggregation.lower_symbols(intern),
         }
     }
 }
@@ -161,6 +174,28 @@ impl Head {
     /// - `empty()` has arity 0
     pub fn arity(&self) -> usize {
         self.head_arguments.len()
+    }
+
+    /// The position of the aggregate argument, if the head has one.
+    pub fn aggregate_position(&self) -> Option<usize> {
+        self.head_arguments
+            .iter()
+            .position(|argument| argument.is_aggregation())
+    }
+
+    /// The aggregate argument, if the head has one.
+    pub fn aggregation(&self) -> Option<&Aggregation> {
+        self.head_arguments.iter().find_map(|argument| match argument {
+            HeadArg::Aggregation(aggregation) => Some(aggregation),
+            _ => None,
+        })
+    }
+
+    pub fn lower_symbols(&mut self, intern: &mut dyn FnMut(&str) -> Result<Val>) -> Result<()> {
+        for argument in &mut self.head_arguments {
+            argument.lower_symbols(intern)?;
+        }
+        Ok(())
     }
 }
 

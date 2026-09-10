@@ -89,4 +89,4 @@ macro_rules! impl_input_sessions {
     };
 }
 
-impl_input_sessions!(1, 2, 3, 4, 5, 6, 7, 8);
+impl_input_sessions!(0, 1, 2, 3, 4, 5, 6, 7, 8);

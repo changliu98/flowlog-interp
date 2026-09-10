@@ -1,5 +1,6 @@
 use crate::arithmetic::Arithmetic;
-use crate::{parser::Lexeme, Rule};
+use crate::diagnostic::Result;
+use crate::{parser::Lexeme, Rule, Val};
 use pest::iterators::Pair;
 use std::fmt;
 
@@ -101,6 +102,14 @@ impl Aggregation {
     /// A reference to the `AggregationOperator` (min, max, count, or sum)
     pub fn operator(&self) -> &AggregationOperator {
         &self.operator
+    }
+
+    pub fn new(operator: AggregationOperator, arithmetic: Arithmetic) -> Self {
+        Self { operator, arithmetic }
+    }
+
+    pub fn lower_symbols(&mut self, intern: &mut dyn FnMut(&str) -> Result<Val>) -> Result<()> {
+        self.arithmetic.lower_symbols(intern)
     }
 }
 

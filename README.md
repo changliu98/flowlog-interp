@@ -2,8 +2,6 @@
   <img src="flowlog_full.png" alt="FlowLog Logo" width="400"/>
 </p>
 
-<!-- <h1 align="center">FlowLog</h1> -->
-
 <p align="center">
   <strong>An efficient, scalable, and extensible Datalog engine built atop Differential Dataflow</strong>
 </p>
@@ -11,15 +9,23 @@
 <p align="center">
   <a href="https://arxiv.org/pdf/2511.00865">Paper</a> •
   <a href="#quick-example">Quick Start</a> •
-  <a href="#datasets">Datasets</a> •
-  <a href="#reproducing-paper-figures">Reproduce Results</a>
+  <a href="#the-engine-as-a-library">Library</a> •
+  <a href="#the-dialect">Dialect</a> •
+  <a href="#evaluation">Evaluation</a> •
+  <a href="#diagnostics">Diagnostics</a>
 </p>
 
 ---
 
 ## Archive Notice
 
-This repository is a public archive. Active development and maintenance have moved to [this repo](https://github.com/flowlog-rs/FlowLog).
+This repository is a public archive of the paper's engine. Active development
+and maintenance have moved to [this repo](https://github.com/flowlog-rs/FlowLog).
+The fork here extends the archive into a general-purpose engine with a
+published contract: a library interface, a typed value domain, embedded
+functions, structured diagnostics, per-evaluation limits, a content-addressed
+state cache and one-step provenance. Everything below the "Paper" section
+describes that contract.
 
 ---
 
@@ -35,55 +41,39 @@ VLDB 2026 (Boston)
 
 ---
 
-## FlowLog Architecture
-
-FlowLog uses a modular architecture that collectively creates a Datalog execution pipeline as follows (also see Figure 1 of the paper):
-
-<!-- <p align="center">
-  <img src="architecture.png" alt="System Architecture" width="700"/>
-</p> -->
+## Architecture
 
 ```
-├── parsing       # Parsing Datalog program
-├── strata        # Stratification
-├── planning      # Generate logical IR and optimize (per rule)
-  ├── catalog       # Generate metadata 
-  └── optimizing    # Query optimization 
-└── executing     # Executor
-  ├── reading       # Reading data from CSV
-  └── macros        # Rust macros for code generate each differential operator
+├── parsing       # grammar, AST, validation and typing, diagnostics
+├── strata        # stratification
+├── planning      # logical plans per rule, row programs, group plans
+  ├── catalog       # per-rule metadata
+  └── optimizing    # join order
+└── executing     # the engine: dataflows, worker sets, cache, symbols, API
+  ├── reading       # rows, relations, arrangements, file reading
+  └── macros        # code generation for each differential operator
 ```
+
+The `executing` package builds the library `flowlog` (an rlib for Rust hosts
+and `libflowlog.so` for the C interface) and two binaries: `executing`, the
+command line, and `flowlogctl`, a client of the service. The command line, the
+service and the C interface are clients of one type, `flowlog::Engine`, and
+add nothing it does not have.
 
 ---
 
 ## Quick Example
 
 ### Environment Setup
+
 ```bash
-# Automated setup (recommended):
-# The env.sh script automatically handles all requirements including:
-# - Rust = 1.89.0 (pinned version for reproducibility)
-# - differential-dataflow = 0.16.2 (paper version for reproducibility)
-# - timely = 0.23.0 (paper version for reproducibility)
-# - ...
-
-# Simply run:
-bash tool/env.sh
-
-# After installation, you may need to start a new terminal session
-# or run `source ~/.bashrc` (or `source ~/.zshrc` if using zsh)
-# so that environment variables and PATH updates take effect.
-
-# Manual verification (optional):
-# To check your Rust version after setup
-rustc --version  # Should show: rustc 1.89.0
+bash tool/env.sh        # pins the toolchain the paper used
+rustc --version
 ```
 
-> **Note on Versions**: For paper reproducibility, we use differential-dataflow 0.16.2 and timely 0.23.0 as reported in the VLDB paper. However, we are actively maintaining FlowLog and catching up with the most updated versions of these dependencies for improved performance.
+Embedded functions need `rustc` at run time (see below); nothing else does.
 
 ### Write a Simple Program
-
-Create a file named `reach.dl` with the following contents. This program computes the set of nodes reachable from the given sources:
 
 ```datalog
 .in
@@ -101,355 +91,423 @@ Reach(y) :- Source(y).
 Reach(y) :- Reach(x), Arc(x, y).
 ```
 
-### Prepare Input Data
-
-Create a directory called `reach` and place the EDB files inside. For this example, you can use [livejournal](https://huggingface.co/datasets/NemoYuu/flowlog_benchmark/blob/main/dataset/csv/livejournal.zip):
-
-```bash
-mkdir -p reach
-cd reach
-curl -LO https://pages.cs.wisc.edu/~m0riarty/dataset/csv/livejournal.zip
-unzip livejournal.zip
-mv livejournal/* ./
-rmdir livejournal
-cd ..
-```
-
 ### Build and Run
+
 ```bash
 cargo build --release
-target/release/executing -p reach.dl -f reach -w 64
+target/release/executing -p reach.dl -f reach -c output -w 8
 ```
+
+Every log line goes to standard error; standard output carries data only
+(the `--check` report).
 
 ---
 
-## FlowLog Build
+## The engine as a library
 
-```bash
-# Release build
-cargo build --release                                             # Batch mode (Present, default)
-cargo build --release --features isize-type --no-default-features # Incremental mode (isize)
+### Rust
+
+```rust
+use flowlog::{Engine, EngineConfig, EvaluationRequest, EvaluationOptions, Inputs, ProgramSource};
+use std::collections::BTreeMap;
+
+let engine = Engine::new(EngineConfig { workers: 4, ..EngineConfig::default() });
+
+let program = ".in\n.decl E(k: number, s: symbol)\n.printsize\n.decl R(s: symbol)\n\
+               .rule\nR(s) :- E(k, s), k > 1.\n";
+let report = engine.check(program, "example.dl")?;          // parse, validate, stratify, plan
+
+let main = engine.intern("main")?;                            // a symbol's cell
+let mut rows = BTreeMap::new();
+rows.insert("E".to_string(), vec![vec![1, main], vec![2, main]]);
+let result = engine.evaluate(EvaluationRequest {
+    program: ProgramSource::Text { name: "example.dl".into(), source: program.into() },
+    inputs: Inputs::Rows(rows),
+    options: EvaluationOptions::default(),
+})?;
+let r = &result.outputs["R"];                                 // every relation's final state
+assert_eq!(engine.symbol_text(r.rows[0][0]).as_deref(), Some("main"));
+println!("{:?}", result.stats);                               // the run's counters
 ```
 
-### Execution Modes
+`Engine::evaluate` never panics: a defect in the engine's own code comes back
+as a diagnostic of kind `internal`. `EvaluationOptions` carries the limits,
+whether to read along the cache, the schedule, and the rows to explain.
 
-FlowLog currently supports two execution modes for Datalog applications:
+### C
 
-- **Batch Mode** (default): Uses `differential_dataflow::difference::Present` for static Datalog semantics. This mode only tracks whether facts are present or absent, making it suitable for high-performance static Datalog execution.
-- **Incremental Mode**: Uses `isize` as the `diff` type for DD's incremental semantics. This allows tracking how many times each fact is derived, supporting incremental view maintenance for Datalog programs.
+`libflowlog.so` exports the interface documented in `src/executing/src/capi.rs`:
 
-#### Build Options
-
-| Execution Mode | Build Command | Use Case |
-|----------------|---------------|----------|
-| **Batch Mode** (default) | `cargo build --release` | Static Datalog execution (used in the paper benchmarking) |
-| **Incremental Mode** | `cargo build --release --features isize-type --no-default-features` | Incremental Datalog execution |
-
-### Content-addressed state cache
-
-The normal `executing` command is a one-shot process.  Two flags make it
-reuse work across edits and across processes:
-
-```bash
-# One-shot, reading along a shared on-disk store of relation states.
-target/release/executing -p examples/reach.dl -f reach -c output -w 8 \
-  --cache-dir /tmp/flowlog-states --cache-disk-max-mib 32768
-
-# A resident daemon with an in-memory layer over the same store.
-target/release/executing -p examples/reach.dl -f reach -c output -w 8 \
-  --daemon-socket /tmp/flowlog-reach.sock --cache-max-mib 4096 \
-  --cache-dir /tmp/flowlog-states
-
-# From another shell: each reload names its own program, facts and output
-# (defaulting to the daemon's) and runs on its own thread.
-target/release/flowlogctl -s /tmp/flowlog-reach.sock reload
-target/release/flowlogctl -s /tmp/flowlog-reach.sock reload \
-  --program other.dl --facts other-facts --csvs other-output
-target/release/flowlogctl -s /tmp/flowlog-reach.sock stats
-target/release/flowlogctl -s /tmp/flowlog-reach.sock shutdown
+```c
+flowlog_engine* flowlog_engine_new(const char* config_json, char** error_json);
+char*           flowlog_check(flowlog_engine*, const char* program, const char* name);
+int64_t         flowlog_intern(flowlog_engine*, const uint8_t* text, size_t length);
+int             flowlog_symbol(flowlog_engine*, int64_t id, const uint8_t** text, size_t* length);
+flowlog_result* flowlog_evaluate(flowlog_engine*, const char* request_json,
+                                 const flowlog_input* inputs, size_t input_count);
+int             flowlog_result_ok(const flowlog_result*);
+char*           flowlog_result_json(const flowlog_result*);        /* stats, witnesses, diagnostic */
+size_t          flowlog_result_relation_count(const flowlog_result*);
+int             flowlog_result_relation(const flowlog_result*, size_t index, const char** name,
+                                        size_t* arity, size_t* rows, const int64_t** cells,
+                                        const char** types);
+void            flowlog_result_free(flowlog_result*);
+void            flowlog_engine_free(flowlog_engine*);
+void            flowlog_string_free(char*);
 ```
 
-The cache unit is one recursive stratum, or one relation's rules within a
-non-recursive stratum.  A unit's key is content on both sides: the canonical
-text of its rules -- variables numbered by first appearance, body predicates
-in a name-free order, planning hints dropped, so a renamed, reordered or
-duplicated rule spells the same -- together with the declared types of the
-relations it touches, the embedded Rust when it calls into it, and the digest
-of every input relation's rows.  Evaluation reads along the strata: every key
-of a stratum is computed from settled states, the units the cache holds are
-served, and the rest are assembled into one dataflow over the injected input
-states, captured at their heads, and stored.  An upstream edit that leaves a
-relation's rows unchanged therefore stops invalidating there, and an
-unrelated declaration or clause elsewhere in the program touches nothing.
+Inputs and outputs are flat row-major `int64_t` cell arrays; symbols cross as
+ids. `config_json` has the fields of `EngineConfig`; `request_json` is
+`{"program": {"text", "name"}, "options": {...}}` with the same options as the
+service. Every failure is a JSON diagnostic.
 
-An exact unit miss for a non-recursive, nonaggregate head first looks up each
-distinct canonical rule's contribution in the same store. Each contribution
-contains only that rule's output, keyed by its body inputs and a separate
-contribution tag. The head is the set union of its active contributions and
-any rows inherited from earlier strata. Adding or replacing a clause therefore
-reuses unchanged clauses; deleting one preserves tuples still supported by
-another clause or by inherited rows. Missing contributions use isolated
-relation maps in the stratum's dataflow, so same-head rules cannot contaminate
-one another. A union whose contributions all hit needs no dataflow.
+### The service
 
-Each command returns one JSON object with unit hits, misses, disk hits, hits
-after any earlier unit miss (`cutoff_hits`, which includes independent units),
-loaded and captured row counts, and resident memory. `contribution_hits`,
-`contribution_misses`, and `contribution_disk_hits` count rule lookups inside
-missed ordinary units; `contribution_rows_loaded` and
-`contribution_rows_cached` count their rows separately from whole-unit rows.
-`rules_evaluated` counts source rules assembled for missing computations,
-before SIP expansion. A cached one-shot run writes the same object to
-`<csvs>/csvs/cache-stats.json`.
+`executing --daemon-socket <path>` serves one engine on a Unix-domain socket,
+protocol version 2: one JSON object per request line, one per response line.
+Evaluations run concurrently, each on its own thread, under the engine's
+admission limit (`--max-concurrent`).
 
-`total_micros` measures the complete native run. `planning_micros`,
-`execution_micros`, `cache_micros`, and `output_micros` separate preparation,
-dataflow computation, cache bookkeeping, and output. `disk_sweep_micros` is
-the cleanup portion of cache time; `disk_sweeps`, `disk_sweep_skips`,
-`disk_files_examined`, `disk_files_removed`, and `disk_bytes_removed` describe
-the cleanup work. These are per-run counters, including in daemon mode.
+```bash
+target/release/executing -p reach.dl -f reach -c output -w 8 \
+  --daemon-socket /tmp/flowlog.sock --cache-max-mib 4096 --cache-dir /tmp/flowlog-states
 
-This reuses materialized rule contributions, without retaining dataflow
-topology or incrementally updating recursive fixed points. A missed recursive
-or aggregate unit is recomputed whole. Every reload re-parses and re-stratifies
-the program and re-reads the fact files; correctness never depends on a hit.
-The in-memory layer is process-local and LRU-bounded by estimated bytes;
-complete units and contributions share the same store and budget. Each entry
-is written whole (temporary file, then rename), verified
-against its digest on every read. Cleanup uses a nonblocking file lock shared
-by all processes using the directory. At most one cleanup slice starts each
-second: it lists one of the 256 existing hash shards and examines metadata
-for at most 4,096 entries. A persisted cursor advances across entries and
-shards; other processes skip maintenance without waiting. Per-shard byte
-estimates enforce the disk budget incrementally, evicting by access time
-within the current slice. The budget is approximate between visits, and
-existing state files remain readable without migration or a cache reset.
-Cache-mode planning avoids cross-stratum intermediate sharing so
-that relation states form complete reuse boundaries.
+target/release/flowlogctl -s /tmp/flowlog.sock evaluate --id one --program other.dl \
+  --facts other-facts --csvs other-output --inline --budget-seconds 30 --explain
+target/release/flowlogctl -s /tmp/flowlog.sock check --program other.dl
+target/release/flowlogctl -s /tmp/flowlog.sock cancel --id one
+target/release/flowlogctl -s /tmp/flowlog.sock stats
+target/release/flowlogctl -s /tmp/flowlog.sock shutdown
+```
+
+Commands: `evaluate` (`program` as `{"path"}` or `{"text","name"}`; `inputs`
+as `{"facts": dir}` or `{"rows": {relation: [[cell, ...], ...]}}` where a
+symbol cell is its text; `output` as `{"csvs": dir}` and/or `{"inline": true}`;
+`options` with `budget_seconds`, `memory_limit_bytes`, `tuple_limit`, `cache`,
+`schedule`, `explain`, `explain_all`), `check`, `cancel`, `stats`, `shutdown`,
+and `reload`, the version 1 form whose paths default to the ones the service
+was started with. Every response carries `version`, `ok`, `command`, the
+request's `id`, the cache occupancy, and on failure a structured `diagnostic`
+beside its rendering in `error`.
 
 ---
 
-## FlowLog Run
+## The dialect
 
-After (release) build, use the `executing` binary to run Datalog programs:
-
-```bash
-# Basic usage
-target/release/executing -p <program.dl> -f <facts_directory> -w <number_threads>
-
-# Example with concrete paths
-target/release/executing -p examples/reach.dl -f reach -w 8
-```
-
-### Command Options
-
-<table>
-<tr>
-  <th align="center">Option</th>
-  <th align="center">Description</th>
-</tr>
-<tr>
-  <td align="center"><code>-p, --program &lt;FILE&gt;</code></td>
-  <td>Path to the Datalog program file (<code>.dl</code> extension)</td>
-</tr>
-<tr>
-  <td align="center"><code>-f, --facts &lt;DIR&gt;</code></td>
-  <td>Directory containing input fact files (EDBs)</td>
-</tr>
-<tr>
-  <td align="center"><code>-c, --csvs &lt;DIR&gt;</code></td>
-  <td><strong>Optional:</strong> Directory for emitting output results (IDBs). If not set, only print IDB sizes in terminal.</td>
-</tr>
-<tr>
-  <td align="center"><code>-d, --delimiter &lt;CHAR&gt;</code></td>
-  <td>Delimiter for input and output files (default: <code>,</code>)</td>
-</tr>
-<tr>
-  <td align="center"><code>-w, --workers &lt;NUM&gt;</code></td>
-  <td>Number of worker threads (default: 1)</td>
-</tr>
-<tr>
-  <td align="center"><code>-O &lt;LEVEL&gt;</code></td>
-  <td>Optimization level (0-3): <br>
-  <code>0</code> - No optimization <br>
-  <code>1</code> - Sideways Information Passing (SIP) <br>
-  <code>2</code> - Structural Planning <br>
-  <code>3</code> - Both optimizations (SIP + Planning)</td>
-</tr>
-<tr>
-  <td align="center"><code>--call-cache &lt;DIR&gt;</code></td>
-  <td>Optional cache directory for native modules compiled from <code>.code rust</code>.</td>
-</tr>
-</table>
-
-#### Example Commands
-
-```bash
-# Basic execution under default settings
-target/release/executing -p examples/reach.dl -f reach
-
-# Multi-threaded (16 threads) execution, flushing IDBs to output/
-target/release/executing -p examples/tc.dl -f tc -c output -w 16
-
-# Robust execution using both SIP and Planning
-target/release/executing -p examples/batik.dl -f batik -d $'\t' -w 32 -O 3
-
-# Debug print RUST_LOG=debug
-RUST_LOG=debug target/release/executing -p examples/batik.dl -f batik -c results -O 2
-```
-
-### Input and Output Files
-
-An input file holds one tuple per line, with columns separated by
-`--delimiter`. Every cell is a `number`. A cell that is not one - a mistyped
-value, a wrong delimiter, a value outside the domain - refuses the run, naming
-the file, the cell and its line; it is not skipped, because a silently smaller
-relation is a silently wrong answer.
-
-With `-c <DIR>`, each output relation is written to
-`<DIR>/csvs/<Relation>.csv` in the same format: one tuple per line, columns
-separated by the same `--delimiter`, no padding. A written relation is
-therefore a valid input file, so one run's output can be another run's EDB.
-Relation sizes are written alongside them to `<DIR>/csvs/size.txt`.
-
-### Datasets
-
-All datasets used in the paper evaluation are publicly available:
-
-**Paper Datasets**: [https://huggingface.co/datasets/NemoYuu/flowlog_benchmark/tree/main/dataset/csv](https://huggingface.co/datasets/NemoYuu/flowlog_benchmark/tree/main/dataset/csv)
-
----
-
-## FlowLog (Datalog) Syntax
-
-FlowLog supports standard Datalog with common extensions:
+### Declarations
 
 ```datalog
-// Simple graph reach
-reach(x) :- source(x).
-reach(y) :- reach(x), edge(x, y).
-
-// constraints
-two_hops(x, z) :- edge(x, y), edge(y, z), x != z.
-
-// negation
-indirect_only(x, z) :- edge(x, y), edge(y, z), !edge(x, z).
-
-// aggregation
-count_paths(x, z, count(y)) :- edge(x, y), edge(y, z).
-max_salary(dept, max(salary)) :- employee(emp_id, salary), works_in(emp_id, dept).
+.in
+.decl Edge(x: number, y: number)      // an input relation, read from Edge.facts
+.input Edge.csv                       // ...or from this file
+.decl Named(name: symbol, k: number)  // `string` is accepted as a spelling of `symbol`
+.printsize
+.decl Reach(x: number, y: number)     // an output relation, written when -c is given
+.decl Any()                           // arity 0: one row, or none
 ```
 
-### Value domain
+A relation no `.decl` names may still be derived and read; validation infers
+its column types from the rules that derive it.
 
-A `number` is a 64-bit signed integer, from `-9223372036854775808` to
-`9223372036854775807`. Program constants, input cells, row columns, aggregate
-results and `@call` arguments and results all live in that one domain.
+### Rules
 
-### Imperative functions in rule bodies
+```datalog
+reach(y) :- reach(x), edge(x, y).                      // recursion
+two_hops(x, z) :- edge(x, y), edge(y, z), x != z.       // comparisons
+indirect(x, z) :- edge(x, y), edge(y, z), !edge(x, z).  // negation (stratified)
+count_paths(x, z, count(y)) :- edge(x, y), edge(y, z).  // aggregation, in any column
+best(min(cost), x) :- offer(x, cost).
+total(x, sum(v * 10 + 1)) :- item(x, v).                // aggregation over an expression
+labelled(x, 7, x + y) :- edge(x, y).                    // head constants and head arithmetic
+main_edge(y) :- edge("main", y).                        // symbol literals
+Any() :- edge(x, y), x > 5.
+```
 
-A program can keep row-local imperative logic in the same `.dl` file with one
-top-level `.code rust` block. Every public top-level function is callable from
-Datalog; private functions, imports, constants, types, and modules remain
-implementation details:
+- A body needs at least one positive atom. Every variable of a negated atom,
+  a comparison or the head must be bound by a positive atom or by an earlier
+  call.
+- Arithmetic is `+ - * / %`, evaluated left to right without precedence over
+  numbers, wrapping on overflow; a zero divisor faults the evaluation. Ordered
+  comparison is defined over numbers; equality over two values of one type.
+- At most one aggregate per head, `count`, `sum`, `min` or `max`, in any
+  column, over a variable or an expression; `sum`, `min` and `max` take
+  numbers. Every rule deriving one relation aggregates the same column with
+  the same operator, or none at all.
+- `True` in a body is dropped; `False` makes the rule derive nothing.
+- Rules may carry `.plan`, `.sip` or `.optimize` hints; `-O` overrides them.
+
+### Values
+
+A cell is a signed 64-bit integer, `Val`. A `number` column holds the value
+itself. A `symbol` column holds text as an id: the first eight bytes of the
+SHA-256 of the UTF-8 text, big-endian, sign bit cleared. The id is a function
+of the text alone, so every engine agrees on it and a host can compute it
+without a round trip (`flowlog::symbols::symbol_id`). The engine's symbol
+table maps ids back to texts and refuses the one collision content-derived
+ids can meet, two texts under one id.
+
+### What validation refuses
+
+A duplicate declaration; a rule with no positive atom; an unbound negated,
+compared or head variable; more than one aggregate in a head; rules that
+aggregate one relation differently; a head or body arity that disagrees with
+a declaration or with another use; a variable typed two ways; a constant of
+the wrong type in a column; arithmetic or ordering over a symbol; an aggregate
+`sum`/`min`/`max` over a symbol; a call to an unknown function, with the wrong
+arity, with an unbound or wildcard argument, or with an argument of the wrong
+type; binding a `bool` function or filtering by a non-`bool` one; a negated
+atom that retains no column (a test on the whole relation, not a join). Each
+is a `validation` diagnostic naming the rule and its line.
+
+---
+
+## Embedded functions
+
+A program keeps row-local imperative logic in `.code rust` ... `.endcode`
+sections. Each section is a *block*: a compilation unit with its own `use`s,
+helpers, types and constants, whose public top-level functions are callable
+from rules. A program may hold any number of blocks; their function names
+share one namespace, and a function cannot call into another block.
 
 ```datalog
 .code rust
-use std::cmp::min;
-
-fn absolute(value: i64) -> i64 {
-    value.saturating_abs()
-}
-
-pub fn normalize(value: i64, limit: i64) -> i64 {
-    min(absolute(value), limit)
-}
-
-pub fn acceptable(value: i64) -> bool {
-    value % 2 == 0
-}
+pub fn normalize(value: i64, limit: i64) -> i64 { value.saturating_abs().min(limit) }
+pub fn acceptable(value: i64) -> bool { value % 2 == 0 }
+pub fn suffixed(name: Symbol) -> Symbol { Symbol::new(&format!("{}_1", name.as_str())) }
 .endcode
-
-.in
-.decl Input(value: number)
-
-.printsize
-.decl Output(original: number, normalized: number)
 
 .rule
 Output(X, Y) :- Input(X), Y = @call(normalize, X, 255), @call(acceptable, Y).
+Renamed(R, K) :- Named(N, K), R = @call(suffixed, N).
 ```
 
-An `i64`-returning call binds a number with
-`Y = @call(function, arguments...)`. A `bool`-returning call is written bare
-and filters out the row when it returns `false`. Calls can consume `i64`
-constants, variables from positive relational atoms, and results of earlier
-calls. Earlier/later refers to call order in the rule; relational predicates
-retain Datalog's unordered meaning.
+- A parameter is `i64` for a `number` or `Symbol` for a `symbol`; a result is
+  `i64`, `bool` or `Symbol`. An `i64`- or `Symbol`-returning call binds a
+  variable with `Y = @call(f, ...)`; a `bool`-returning call is written bare
+  and drops the row when it returns `false`. Arguments are constants,
+  variables bound by positive atoms, and results of earlier calls; a
+  comparison may read a call result.
+- `Symbol` is a type the engine provides to every block: `Symbol::new(&str)`
+  interns a text, `symbol.as_str()` reads one, `symbol.id()` is the cell.
+- Functions are pure by contract: deterministic, no I/O, no clock, no
+  randomness, no external state. Differential dataflow may run, repeat and
+  reorder a call across worker threads.
+- A panic inside a function ends the evaluation with a `function` diagnostic
+  naming the function, the line of its block as written, the program line,
+  and the rule that called it. It never unwinds into the engine.
+- Each block is compiled by `rustc` into a shared library named by the digest
+  of its source, the compiler version and the call interface version
+  (`CALL_ABI_VERSION`), under `--call-cache`, `FLOWLOG_CALL_CACHE`,
+  `$XDG_CACHE_HOME/flowlog/calls`, `$HOME/.cache/flowlog/calls` or a temporary
+  directory. A block that did not change is never rebuilt, whatever else in
+  the program did. A block that does not compile is a `function` diagnostic
+  carrying rustc's report with lines counted inside the block.
+- The call interface is documented in `src/executing/src/native_calls.rs`:
+  one `i64` cell per argument and result, and a context of two callbacks over
+  the engine's symbol table. Embedded Rust is trusted native code and runs
+  with the engine's privileges.
 
-The current physical ABI deliberately matches FlowLog's row representation:
-exports must be safe, synchronous, non-generic free functions whose arguments
-are all `i64` and whose result is `i64` or `bool`. Arithmetic/aggregate heads,
-using a call result in another relational predicate or ordinary comparison,
-text arguments, and call rules with no retained relational column to drive
-evaluation are not supported yet. Rules with calls skip SIP rewriting, while
-normal structural planning remains available.
-
-Embedded functions have a **purity contract**: they must be deterministic and
-must not perform I/O, observe time or randomness, mutate external state, or
-otherwise depend on evaluation count or order. Differential Dataflow may run,
-repeat, and reorder a call on multiple workers. Loops, local mutation,
-conditionals, matching, helper functions, and other ordinary imperative Rust
-inside a pure function are fine. A panic is caught at the native boundary and
-reported as a worker failure. Embedded Rust is trusted native code and runs
-with the same privileges as FlowLog.
-
-The block is compiled directly with `rustc`, which must be available at
-runtime. This version supports local code and the Rust standard library, but
-not Cargo dependencies. Compilation is content-addressed over the source, call
-ABI, and `rustc` version. FlowLog loads one shared library per process and
-resolves symbols once per worker, rather than looking them up per tuple. The
-cache location is selected in this order: `--call-cache`,
-`FLOWLOG_CALL_CACHE`, `$XDG_CACHE_HOME/flowlog/calls`,
-`$HOME/.cache/flowlog/calls`, then a temporary directory.
+Sideways information passing applies to rules with calls; the row program
+stays attached to the final rule of the rewrite.
 
 ---
 
-## FlowLog Current Limitations (Work In Progress)
+## Evaluation
 
-**Aggregation**  
-FlowLog currently supports `count`, `sum`, `min`, `max` aggregation operators. However, the aggregate field must be the **last argument** in the head IDB. All rules deriving the same IDB must conform to the same **aggregation type** (e.g. `count`, `sum`), and the aggregate must be applied to a single variable. A program that breaks either rule is refused before evaluation, naming the rules that disagree, rather than being evaluated under whichever operator was seen first.
+### Row programs
 
-**Rule heads**  
-Outside an aggregate, a head argument must be a variable, and a head's arity must match the relation's `.decl`. Head constants and head arithmetic are refused before evaluation rather than being dropped from the projection.
+A rule's joins produce one row per body solution. Everything row-local that
+remains - calls, comparisons over call results, head arithmetic, head
+constants, the expression under an aggregate - is one *row program*, a
+straight-line sequence of steps over that row followed by the head
+projection. A rule that needs none of it has no row program.
 
-**Column types**  
-Every column is a `number`. `.decl` also parses `string`, which is not implemented: a program declaring a `string` column is refused rather than loading an empty relation.
+### Schedules
 
-**Compilation**  
-FlowLog currently compiles very slowly due to heavy dependencies (e.g., DD/Timely). On r6525 node, a from-scratch release build can take ~16 minutes.
+- **Whole program** (the command line's default without a cache): every
+  stratum in one dataflow, sharing intermediates across strata. Never cached.
+- **Per stratum** (the library's default, and the command line's with
+  `--cached` or `--cache-dir`): one dataflow per stratum, each unit keyed
+  against the state cache.
 
-**Arithmetic Head**  
-Support for the Arithmetic Head feature is currently unstable and conflicts with the existing SIP optimization. We have therefore moved it to a temporary branch  `nemo_arithmetic`. You can check out this branch to run programs that require this feature (e.g., SSSP). We have confirmed it runs correctly on SSSP, but we do not guarantee correctness in general. On this branch such a program is refused rather than evaluated with the arithmetic dropped, so `examples/sssp.dl` (`min(0)`, `min(d1 + d2)`) runs only on `nemo_arithmetic`.
+Both run on the evaluation's own worker set: `workers` threads started for the
+evaluation, handed every dataflow of it in turn, and joined when it ends. The
+set is not shared between evaluations, which is what lets one evaluation be
+cancelled, charged for its memory, and fail on its own. Concurrency across
+evaluations is the engine's admission limit (`max_concurrent`, 0 for none).
+
+### Limits
+
+An evaluation runs under `Limits`: a wall-clock `time`, a `cancel` token the
+caller may trip from another thread, `memory_bytes` its threads may hold at
+once (the allocator attributes every allocation and free on the evaluation's
+threads to it; an estimate exact when an evaluation frees what it allocated),
+and `tuples` it may materialize at unit boundaries. When any is crossed, or
+an operator faults, every operator of the evaluation falls silent, the
+dataflow drains, and the evaluation returns a `resource` (or the fault's)
+diagnostic. The check sits between operators: a function that never returns
+cannot be stopped.
+
+### The state cache
+
+The unit is one recursive stratum, or one relation's rules within a
+non-recursive stratum. A unit's key is content on both sides:
+
+- the canonical text of its rules - variables numbered by first appearance,
+  body predicates in a name-free order, planning hints dropped, so a renamed,
+  reordered or duplicated rule spells the same;
+- the column types of every relation it touches;
+- the source of every block a rule of the unit calls into, and no other block;
+- the digest of every input relation's rows.
+
+Evaluation reads along the strata: every key of a stratum is computed from
+settled states, the units the cache holds are served, and the rest are
+assembled into one dataflow over the injected input states, captured at their
+heads, and stored. An upstream edit that leaves a relation's rows unchanged
+stops invalidating there; an unrelated declaration, clause or block touches
+nothing.
+
+An exact unit miss for a non-recursive, non-aggregate head first looks up each
+distinct canonical rule's *contribution* in the same store, keyed by its body
+inputs alone. The head is the set union of its active contributions and any
+rows inherited from earlier strata: adding or replacing a clause reuses the
+unchanged clauses; deleting one preserves tuples still supported by another.
+A union whose contributions all hit needs no dataflow.
+
+Two tiers hold one key. The memory tier is the default, bounded by
+`cache_memory_bytes` and evicted least recently used. The disk tier is a spill
+a caller asks for (`cache_dir`), shared by every process that points at the
+same directory, bounded by `cache_disk_bytes` and swept by access time in
+bounded slices under a nonblocking lock. An entry carries the texts of the
+symbols in its rows, so a process that never interned them reads them by name;
+entries are written whole and verified against their digest on every read.
+Neither tier is a source of truth: a miss costs one evaluation.
+
+What the cache is not: it retains no dataflow topology and does not
+incrementally update a recursive fixed point. A missed recursive or aggregate
+unit is recomputed whole.
+
+### Counters
+
+Every evaluation returns `CacheRunStats`, and a cached command-line run writes
+it to `<csvs>/csvs/cache-stats.json`:
+
+| counter | meaning |
+|---|---|
+| `strata`, `units` | strata of the program; units keyed |
+| `hits`, `misses`, `disk_hits` | units served / evaluated; hits served from disk |
+| `cutoff_hits` | hits keyed after an earlier miss of the run (an upper bound on early cutoff, independent units included) |
+| `contribution_hits`, `contribution_misses`, `contribution_disk_hits` | rule-level lookups inside missed ordinary units |
+| `rules_evaluated` | source rules assembled into dataflows |
+| `rows_loaded`, `rows_cached`, `contribution_rows_*` | rows served / stored, whole units and contributions separately |
+| `planning_micros`, `execution_micros`, `cache_micros`, `output_micros`, `total_micros` | preparation, dataflow, cache bookkeeping, output, the whole run |
+| `disk_sweep_*` | the disk tier's cleanup work |
+| `entries`, `resident_rows`, `resident_bytes`, `max_bytes` | the memory tier after the run |
+| `peak_memory_bytes`, `materialized_rows` | the evaluation's own footprint |
 
 ---
 
-## FlowLog Example Benchmarks
+## Diagnostics
 
-The `examples/` directory contains several sample Datalog programs demonstrating various features and use cases.
+Every refusal is one `Diagnostic`: a `kind`, one sentence `message`, and the
+places it is about - `location` (`source`, `line`, `column`), `rule`,
+`relations`, `function`, and supplementary `detail` (a compiler's report, a
+panic payload). Kinds: `parse`, `validation`, `stratification`, `planning`,
+`input`, `function`, `evaluation` (a fault on the data, such as division by
+zero), `resource` (a limit or a cancellation), `internal` (a defect of the
+engine, never a verdict on the program).
+
+The library returns it, the service and the C interface serialize it as JSON,
+and the command line prints its rendering on standard error, plus the JSON
+object on its own last line when `FLOWLOG_DIAGNOSTIC_JSON=1`. `check` runs
+every stage short of evaluation, so a program can be validated where it is
+written.
 
 ---
+
+## Provenance
+
+Ask for rows to explain (`EvaluationOptions::explain`, the service's `explain`
+and `explain_all`, the command line's `--explain`) and the result carries a
+`Witness` per row: whether it is present, whether it is an input, the rule
+that derives it with its line, and its parents - for an ordinary rule the
+matched row of every positive atom of the first body solution, for an
+aggregate the solutions of the row's group (those achieving the extremum for
+`min`/`max`), with the group's size. This is one-step provenance over the
+final states; a parent in a recursive relation is explained by another
+request.
+
+---
+
+## Command line
+
+```bash
+target/release/executing -p <program.dl> -f <facts_directory> [-c <output>] [options]
+```
+
+| option | meaning |
+|---|---|
+| `-p, --program <FILE>` | the program |
+| `-f, --facts <DIR>` | input relation files |
+| `-c, --csvs <DIR>` | write outputs to `<DIR>/csvs/<Relation>.csv`, sizes to `size.txt`, counters to `cache-stats.json` |
+| `-d, --delimiter <CHAR>` | column delimiter (default `,`) |
+| `-w, --workers <N>` | worker threads per evaluation (default 1) |
+| `-O <0-3>` | optimization: 1 sideways information passing, 2 structural planning, 3 both |
+| `--fat-mode`, `--no-sharing` | heap rows everywhere; no common-subexpression reuse |
+| `--check` | parse, validate, stratify and plan; print the report as JSON |
+| `--cached` | evaluate per stratum against the memory tier |
+| `--cache-dir <DIR>`, `--cache-max-mib`, `--cache-disk-max-mib` | the disk tier, and both tiers' budgets |
+| `--call-cache <DIR>` | compiled blocks |
+| `--budget-seconds`, `--memory-limit-mib`, `--tuple-limit` | the evaluation's limits |
+| `--explain` | write a witness per output row to `explain.jsonl` |
+| `--daemon-socket <PATH>`, `--max-concurrent <N>` | run the service |
+
+An input file holds one row per line, cells separated by the delimiter: a
+number as its decimal text, a symbol as its text (which may not contain the
+delimiter or a newline). A cell that is not of its column's type refuses the
+run naming the file, the cell and its line. A file for an arity-0 relation
+holds one line per row and nothing on it. A written relation is a valid input
+file, so one run's output can be another run's input.
+
+---
+
+## Versions
+
+- `CALL_ABI_VERSION` (`native_calls.rs`): the call interface; part of every
+  compiled block's digest.
+- `CACHE_ABI` and `STATE_MAGIC` (`cache.rs`): the cache key and the entry
+  format.
+- `PROTOCOL_VERSION` (`daemon.rs`): the service protocol, carried in every
+  response.
+
+---
+
+## Known limits
+
+- The semiring is chosen at build time (`present-type`, the default, or
+  `isize-type`); the observable semantics are set semantics either way.
+- A recursive stratum's iteration counter is 16 bits: a fixed point needing
+  more than 65,535 rounds is outside this build.
+- Fixed-size rows reach `ROW_MAX = 7` columns and key/value halves `KV_MAX =
+  4`; wider shapes are planned onto heap rows automatically.
+- A function that never returns holds its evaluation; limits are checked
+  between operators.
+- A witness lists at most 256 body solutions of an aggregate's group.
+
+---
+
+## Datasets
+
+All datasets used in the paper evaluation are publicly available:
+[https://huggingface.co/datasets/NemoYuu/flowlog_benchmark/tree/main/dataset/csv](https://huggingface.co/datasets/NemoYuu/flowlog_benchmark/tree/main/dataset/csv)
 
 ## Reproducing Paper Figures
 
-This repository includes [FlowLog-Reproduction](https://github.com/HarukiMoriarty/FlowLog-Reproduction) as a git submodule. You can use this submodule to reproduce the experiment figures from the paper. Please initialize submodules after cloning:
+This repository includes [FlowLog-Reproduction](https://github.com/HarukiMoriarty/FlowLog-Reproduction) as a git submodule:
 
 ```bash
 git submodule update --init --recursive
 ```
-
-
----
 
 ## Contributing
 

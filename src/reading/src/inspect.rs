@@ -1,55 +1,20 @@
 /* -----------------------------------------------------------------------------------------------
- * printing methods
+ * inspection and capture
  * -----------------------------------------------------------------------------------------------
  */
-// use differential_dataflow::difference::Abelian;
 use differential_dataflow::collection::{AsCollection, VecCollection};
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::{ExchangeData, Hashable};
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::fs::{remove_file, File};
-use std::io::{self, BufReader, BufWriter, Write};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
-use timely::dataflow::operators::{Inspect, Map};
+use timely::dataflow::operators::probe::Handle as ProbeHandle;
+use timely::dataflow::operators::{Inspect, Map, Probe};
 use timely::dataflow::Scope;
 use timely::order::TotalOrder;
 
 use crate::rel::{dedup_retained_collection, Rel};
 use crate::row::Array;
 use crate::{semiring_weight, Semiring, Val};
-use tracing::{debug, error, info};
-
-// Thread-local storage for file handles to avoid repeatedly opening the same files
-thread_local! {
-    static FILE_HANDLES: RefCell<HashMap<String, Arc<Mutex<BufWriter<File>>>>> = RefCell::new(HashMap::new());
-}
-
-/// Gets or creates a file handle for the specified path
-///
-/// Ensures each path has only one file handle and creates parent directories if needed.
-fn get_file_handle(path: &str) -> Arc<Mutex<BufWriter<File>>> {
-    let path_str = path.to_string();
-
-    FILE_HANDLES.with(|handles| {
-        let mut handles_ref = handles.borrow_mut();
-
-        if !handles_ref.contains_key(&path_str) {
-            // Create directory if it doesn't exist
-            if let Some(parent) = Path::new(path).parent() {
-                std::fs::create_dir_all(parent).expect("Can not create output directory");
-            }
-
-            // Open file for writing
-            let file = File::create(path)
-                .unwrap_or_else(|error| panic!("Can not create output file {path}: {error}"));
-            handles_ref.insert(path_str.clone(), Arc::new(Mutex::new(BufWriter::new(file))));
-        }
-
-        Arc::clone(handles_ref.get(&path_str).unwrap())
-    })
-}
+use tracing::{debug, info};
 
 /// Prints the size of a relation (number of tuples)
 fn printsize<G, D>(rel: &VecCollection<G, D, Semiring>, name: &str, is_recursive: bool)
@@ -97,96 +62,6 @@ where
     // use std::fmt::Display for D (i.e. Row)
 }
 
-/// Write relation size
-fn writesize<G, D>(
-    rel: &VecCollection<G, D, Semiring>,
-    name: &str,
-    file_path: &str,
-    worker_id: usize,
-)
-where
-    G: Scope,
-    G::Timestamp: Lattice + TotalOrder,
-    D: ExchangeData + Hashable,
-{
-    let path = format!("{}{}", file_path, worker_id);
-    let file_handle = get_file_handle(&path);
-    let name = name.to_string();
-
-    dedup_retained_collection(rel)
-        .inner
-        .flat_map(move |(_, t, _)| {
-            Some(((), 1_i32))
-                .into_iter()
-                .map(move |(x, d2)| (x, t.clone(), d2))
-        })
-        .as_collection()
-        .map(|_| ())
-        .consolidate()
-        .inspect({
-            move |x| {
-                let mut file = file_handle.lock().unwrap();
-                writeln!(file, "{}: {:?}", name, x).unwrap_or_else(|error| {
-                    panic!("Can not write size to {path}: {error}")
-                });
-            }
-        });
-}
-
-/// Writes one output row the way the reader parses one input row: the
-/// configured delimiter between columns, a newline after the last, and nothing
-/// else.
-///
-/// The `Display` of a row separates columns with a comma *and a space*, which
-/// is fine for a log line and wrong for a data file: an engine-written relation
-/// re-read as an EDB parsed no cell after the first and loaded zero rows, so
-/// the output of one run could not be the input of the next.
-fn write_row(out: &mut impl Write, row: &dyn Array, delimiter: u8) -> io::Result<()> {
-    for column in 0..row.arity() {
-        if column > 0 {
-            out.write_all(std::slice::from_ref(&delimiter))?;
-        }
-        write!(out, "{}", row.column(column))?;
-    }
-    out.write_all(b"\n")
-}
-
-/// Flush relation data to a file
-fn write<G, D>(
-    rel: &VecCollection<G, D, Semiring>,
-    file_path: &str,
-    worker_id: usize,
-    delimiter: u8,
-) where
-    G: Scope,
-    G::Timestamp: Lattice + TotalOrder,
-    D: ExchangeData + Hashable + Array,
-{
-    let path = format!("{}{}", file_path, worker_id);
-    let file_handle = get_file_handle(&path);
-
-    dedup_retained_collection(rel)
-        .inner
-        .flat_map(move |(x, t, _)| {
-            Some((x, 1_i32))
-                .into_iter()
-                .map(move |(x, d2)| (x, t.clone(), d2))
-        })
-        .as_collection()
-        .inspect(move |(data, _time, _delta)| {
-            let mut file = file_handle.lock().unwrap();
-            write_row(&mut *file, data, delimiter)
-                .unwrap_or_else(|error| panic!("Can not write to {path}: {error}"));
-        });
-
-    // alternative (faster)
-    // .inspect_batch(move |_batch_time, rows| {
-    //     let mut file = file_handle.lock().unwrap();
-    //     let batch_str = rows.iter().map(|(data, _, _)| format!("{}", data)).collect::<Vec<_>>().join("\n");
-    //     writeln!(file, "{}", batch_str).expect(&format!("Can not write to file: {}", path));
-    // });
-}
-
 /// Updates captured while materializing a relation at a cache boundary.
 ///
 /// The integer difference lets the same capture path work in both the default
@@ -194,14 +69,18 @@ fn write<G, D>(
 /// the worker frontier has completed.
 pub type MaterializedUpdates = Arc<Mutex<Vec<(Vec<Val>, isize)>>>;
 
-fn capture<G, D>(rel: &VecCollection<G, D, Semiring>, updates: MaterializedUpdates)
-where
+fn capture<G, D>(
+    rel: &VecCollection<G, D, Semiring>,
+    updates: MaterializedUpdates,
+    probe: &ProbeHandle<G::Timestamp>,
+) where
     G: Scope,
     G::Timestamp: Lattice + TotalOrder,
     D: ExchangeData + Hashable + Array,
 {
     dedup_retained_collection(rel)
         .inner
+        .probe_with(probe)
         .inspect(move |(row, _time, difference)| {
             let values = (0..row.arity())
                 .map(|column| row.column(column))
@@ -213,24 +92,26 @@ where
         });
 }
 
-/// Materialize a type-erased relation into a process-owned update buffer.
-pub fn capture_generic<G>(rel: &Rel<G>, updates: MaterializedUpdates)
+/// Materialize a type-erased relation into a process-owned update buffer,
+/// reporting completion through `probe`.
+pub fn capture_generic<G>(rel: &Rel<G>, updates: MaterializedUpdates, probe: &ProbeHandle<G::Timestamp>)
 where
     G: Scope,
     G::Timestamp: Lattice + TotalOrder,
 {
     if rel.is_fat() {
-        capture(rel.rel_fat(), updates);
+        capture(rel.rel_fat(), updates, probe);
     } else {
         match rel.arity() {
-            1 => capture(rel.rel_1(), updates),
-            2 => capture(rel.rel_2(), updates),
-            3 => capture(rel.rel_3(), updates),
-            4 => capture(rel.rel_4(), updates),
-            5 => capture(rel.rel_5(), updates),
-            6 => capture(rel.rel_6(), updates),
-            7 => capture(rel.rel_7(), updates),
-            8 => capture(rel.rel_8(), updates),
+            0 => capture(rel.rel_0(), updates, probe),
+            1 => capture(rel.rel_1(), updates, probe),
+            2 => capture(rel.rel_2(), updates, probe),
+            3 => capture(rel.rel_3(), updates, probe),
+            4 => capture(rel.rel_4(), updates, probe),
+            5 => capture(rel.rel_5(), updates, probe),
+            6 => capture(rel.rel_6(), updates, probe),
+            7 => capture(rel.rel_7(), updates, probe),
+            8 => capture(rel.rel_8(), updates, probe),
             arity => unreachable!("arity {arity} should be handled by fixed-size capture variants"),
         }
     }
@@ -247,6 +128,7 @@ where
     } else {
         let arity = rel.arity();
         match arity {
+            0 => print(rel.rel_0(), name),
             1 => print(rel.rel_1(), name),
             2 => print(rel.rel_2(), name),
             3 => print(rel.rel_3(), name),
@@ -271,6 +153,7 @@ where
     } else {
         let arity = rel.arity();
         match arity {
+            0 => printsize(rel.rel_0(), name, is_recursive),
             1 => printsize(rel.rel_1(), name, is_recursive),
             2 => printsize(rel.rel_2(), name, is_recursive),
             3 => printsize(rel.rel_3(), name, is_recursive),
@@ -284,150 +167,3 @@ where
     }
 }
 
-/// Writes a relation with any arity to a file
-pub fn write_generic<G>(rel: &Rel<G>, file_path: &str, worker_id: usize, delimiter: u8)
-where
-    G: Scope,
-    G::Timestamp: Lattice + TotalOrder,
-{
-    if rel.is_fat() {
-        write(rel.rel_fat(), file_path, worker_id, delimiter)
-    } else {
-        let arity = rel.arity();
-        match arity {
-            1 => write(rel.rel_1(), file_path, worker_id, delimiter),
-            2 => write(rel.rel_2(), file_path, worker_id, delimiter),
-            3 => write(rel.rel_3(), file_path, worker_id, delimiter),
-            4 => write(rel.rel_4(), file_path, worker_id, delimiter),
-            5 => write(rel.rel_5(), file_path, worker_id, delimiter),
-            6 => write(rel.rel_6(), file_path, worker_id, delimiter),
-            7 => write(rel.rel_7(), file_path, worker_id, delimiter),
-            8 => write(rel.rel_8(), file_path, worker_id, delimiter),
-            _ => unreachable!("arity {} should be handled by fixed-size variants", arity),
-        }
-    }
-}
-
-/// Writes a relation size with any arity to a file
-pub fn writesize_generic<G>(rel: &Rel<G>, name: &str, file_path: &str, worker_id: usize)
-where
-    G: Scope,
-    G::Timestamp: Lattice + TotalOrder,
-{
-    if rel.is_fat() {
-        writesize(rel.rel_fat(), name, file_path, worker_id)
-    } else {
-        let arity = rel.arity();
-        match arity {
-            1 => writesize(rel.rel_1(), name, file_path, worker_id),
-            2 => writesize(rel.rel_2(), name, file_path, worker_id),
-            3 => writesize(rel.rel_3(), name, file_path, worker_id),
-            4 => writesize(rel.rel_4(), name, file_path, worker_id),
-            5 => writesize(rel.rel_5(), name, file_path, worker_id),
-            6 => writesize(rel.rel_6(), name, file_path, worker_id),
-            7 => writesize(rel.rel_7(), name, file_path, worker_id),
-            8 => writesize(rel.rel_8(), name, file_path, worker_id),
-            _ => unreachable!("arity {} should be handled by fixed-size variants", arity),
-        }
-    }
-}
-
-/// Merge CSV output files from multiple workers into a single file.
-///
-/// Each worker produces a file named `<relation_name>_<worker_id>.csv`.
-/// This function merges them into `<relation_name>.csv` and deletes the partial files.
-///
-/// # Arguments
-///
-/// - `output_dir`: The directory containing worker partition files.
-/// - `worker_count`: Number of workers (used to find all partial files).
-pub fn merge_relation_partitions(output_path: &str, worker_count: usize) {
-    if let Some(parent) = Path::new(output_path).parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
-            error!("Error to create output directory {}: {}", parent.display(), error);
-            return;
-        }
-    }
-
-    let output = match File::create(output_path) {
-        Ok(output) => output,
-        Err(error) => {
-            error!("Error to create merged file {}: {}", output_path, error);
-            return;
-        }
-    };
-    let mut output = BufWriter::new(output);
-
-    for worker_id in 0..worker_count {
-        let part_path = format!("{}{}", output_path, worker_id);
-        match File::open(&part_path) {
-            Ok(part) => {
-                if let Err(error) = io::copy(&mut BufReader::new(part), &mut output) {
-                    error!("Error to merge partition {}: {}", part_path, error);
-                    return;
-                }
-            }
-            Err(error) => {
-                debug!("Missing or unreadable partition {}: {}", part_path, error);
-            }
-        }
-    }
-
-    if let Err(error) = output.flush() {
-        error!("Error to flush merged file {}: {}", output_path, error);
-        return;
-    }
-    drop(output);
-
-    for worker_id in 0..worker_count {
-        let part_path = format!("{}{}", output_path, worker_id);
-        let _ = remove_file(&part_path);
-    }
-}
-
-/// Closes all open file handles
-///
-/// Call this function at the end of the program to ensure all files are properly closed.
-pub fn close_all_files() {
-    FILE_HANDLES.with(|handles| {
-        let mut handles_ref = handles.borrow_mut();
-        handles_ref.clear();
-    });
-    debug!("All output files closed");
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use super::*;
-
-    #[test]
-    fn partition_merge_streams_in_worker_order_and_removes_parts() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should follow Unix epoch")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "flowlog-interp-output-{}-{nonce}",
-            std::process::id(),
-        ));
-        std::fs::create_dir_all(&directory).expect("create output fixture directory");
-        let output = directory.join("Result.csv");
-        let output_string = output.to_string_lossy();
-        std::fs::write(format!("{}0", output_string), b"1\n2\n")
-            .expect("write worker zero partition");
-        std::fs::write(format!("{}1", output_string), b"3\n")
-            .expect("write worker one partition");
-
-        merge_relation_partitions(&output_string, 3);
-
-        assert_eq!(
-            std::fs::read(&output).expect("read merged output"),
-            b"1\n2\n3\n",
-        );
-        assert!(!Path::new(&format!("{}0", output_string)).exists());
-        assert!(!Path::new(&format!("{}1", output_string)).exists());
-        std::fs::remove_dir_all(directory).expect("remove output fixture directory");
-    }
-}

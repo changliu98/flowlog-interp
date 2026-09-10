@@ -30,10 +30,11 @@ fn row_row_space() -> Vec<(usize, usize)> {
     iproduct!(1..=ROW_MAX, 0..=ROW_MAX).collect()
 }
 
-/// row -> row through an embedded call. A call projection is refused unless it
-/// emits at least one field, so this one starts at one.
-fn call_row_space() -> Vec<(usize, usize)> {
-    iproduct!(1..=ROW_MAX, 1..=ROW_MAX).collect()
+/// row -> row through a row program. The input may retain no column (a body
+/// that binds no variable drives the program by existence) and the output
+/// may be an arity-0 head, so both start at zero.
+fn row_program_space() -> Vec<(usize, usize)> {
+    iproduct!(0..=ROW_MAX, 0..=ROW_MAX).collect()
 }
 
 /// row -> (key, value): a row split into two halves of the key/value tables.
@@ -113,7 +114,7 @@ pub fn codegen_row_row(_: TokenStream) -> TokenStream {
         let base_type = Ident::new(&format!("rel_{}", iv_), Span::call_site());
         let final_rel = Ident::new(&format!("Collection{}", target_), Span::call_site());
         let projection = quote! {
-            #final_rel(input_rel.#base_type().flat_map(row_row::<#iv_, #target_>(flow)))
+            #final_rel(input_rel.#base_type().flat_map(row_row::<#iv_, #target_>(flow, budget)))
         };
         // A projection retaining no column exists to answer whether the
         // relation has a row, so one row is what it must contribute. Without
@@ -130,7 +131,7 @@ pub fn codegen_row_row(_: TokenStream) -> TokenStream {
     let expanded = quote! {
         if input_rel.is_fat() {
             CollectionFat(
-                input_rel.rel_fat().flat_map(row_row_fat(flow)),
+                input_rel.rel_fat().flat_map(row_row_fat(flow, budget)),
                 target
             )
         } else {
@@ -144,33 +145,41 @@ pub fn codegen_row_row(_: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-/* embedded Rust call projection: row → row */
+/* row program: row → row */
 #[proc_macro]
-pub fn codegen_call_row(_: TokenStream) -> TokenStream {
-    let space = call_row_space();
+pub fn codegen_row_program(_: TokenStream) -> TokenStream {
+    let space = row_program_space();
     let mut arms = vec![];
     for (iv_, target_) in space {
         let base_type = Ident::new(&format!("rel_{}", iv_), Span::call_site());
         let final_rel = Ident::new(&format!("Collection{}", target_), Span::call_site());
-        arms.push(quote! {
-            (#iv_, #target_) => #final_rel(
+        let projection = quote! {
+            #final_rel(
                 input_rel.#base_type().flat_map(
-                    call_row::<#iv_, #target_>(projection, native_calls)
+                    row_program::<#iv_, #target_>(&runner)
                 )
             )
-        });
+        };
+        // An arity-0 head says whether any row reached it; one row is what it
+        // contributes, however many rows did.
+        let projection = if target_ == 0 {
+            quote! { #projection.dedup() }
+        } else {
+            projection
+        };
+        arms.push(quote! { (#iv_, #target_) => #projection });
     }
 
     let expanded = quote! {
         if input_rel.is_fat() {
             CollectionFat(
-                input_rel.rel_fat().flat_map(call_row_fat(projection, native_calls)),
+                input_rel.rel_fat().flat_map(row_program_fat(&runner)),
                 target
             )
         } else {
             match (iv, target) {
                 #(#arms),*,
-                _ => panic!("codegen_call_row unimplemented for {}, {}", iv, target),
+                _ => panic!("codegen_row_program unimplemented for {}, {}", iv, target),
             }
         }
     };
@@ -190,7 +199,7 @@ pub fn codegen_row_kv(_: TokenStream) -> TokenStream {
         arms.push(quote! {
             (#iv_, #ok_, #ov_) => #final_double_rel(
                 input_rel.#base_type()
-                         .flat_map(row_kv::<#iv_, #ok_, #ov_>(flow))
+                         .flat_map(row_kv::<#iv_, #ok_, #ov_>(flow, budget))
                         )
         });
     }
@@ -198,7 +207,7 @@ pub fn codegen_row_kv(_: TokenStream) -> TokenStream {
     let expanded = quote! {
         if input_rel.is_fat() {
             DoubleRelFat(
-                input_rel.rel_fat().flat_map(row_kv_fat(flow)),
+                input_rel.rel_fat().flat_map(row_kv_fat(flow, budget)),
                 ok, // key arity
                 ov  // value arity
             )
@@ -231,7 +240,7 @@ pub fn codegen_jn(_: TokenStream) -> TokenStream {
                     dict_0.#type_0()
                     .join_core(
                         dict_1.#type_1(),
-                        jn_logic::<#ik0_, #iv0_, #iv1_, #target_>(flow)
+                        jn_logic::<#ik0_, #iv0_, #iv1_, #target_>(flow, budget)
                     )
                 )
             }
@@ -244,7 +253,7 @@ pub fn codegen_jn(_: TokenStream) -> TokenStream {
                 dict_0.dict_fat()
                     .join_core(
                         dict_1.dict_fat(),
-                        jn_logic_fat(flow)
+                        jn_logic_fat(flow, budget)
                     ),
                 target
             )
@@ -278,7 +287,7 @@ pub fn codegen_cartesian(_: TokenStream) -> TokenStream {
                             &rel_1.#type_1()
                                   .map(|x| ((), x))
                                   .arrange_by_key(),
-                                cartesian_logic::<#iv0_, #iv1_, #target_>(flow)
+                                cartesian_logic::<#iv0_, #iv1_, #target_>(flow, budget)
                          )
                 )
             }
@@ -288,7 +297,7 @@ pub fn codegen_cartesian(_: TokenStream) -> TokenStream {
     let expanded = quote! {
         if rel_0.is_fat() && rel_1.is_fat() {
             CollectionFat(
-                cartesian_fat_rows(rel_0.rel_fat(), rel_1.rel_fat(), flow),
+                cartesian_fat_rows(rel_0.rel_fat(), rel_1.rel_fat(), flow, budget),
                 target
             )
         } else {
@@ -300,7 +309,7 @@ pub fn codegen_cartesian(_: TokenStream) -> TokenStream {
                 // back, making the operator total over every arity the engine
                 // supports rather than over `PROD_MAX` alone.
                 _ => Rel::from_fat_rows(
-                    cartesian_fat_rows(&rel_0.to_fat_rows(), &rel_1.to_fat_rows(), flow),
+                    cartesian_fat_rows(&rel_0.to_fat_rows(), &rel_1.to_fat_rows(), flow, budget),
                     target,
                 ),
             }
@@ -328,7 +337,7 @@ pub fn codegen_kv_k_jn(_: TokenStream) -> TokenStream {
                     dict_0.#type_0()
                     .join_core(
                         set_1.#type_1(),
-                        v1_jn_logic::<#ik0_, #iv0_, #target_>(flow)
+                        v1_jn_logic::<#ik0_, #iv0_, #target_>(flow, budget)
                     )
                 )
             }
@@ -341,7 +350,7 @@ pub fn codegen_kv_k_jn(_: TokenStream) -> TokenStream {
                 dict_0.dict_fat()
                     .join_core(
                         set_1.set_fat(),
-                        v1_jn_logic_fat(flow)
+                        v1_jn_logic_fat(flow, budget)
                     ),
                 target
             )
@@ -374,7 +383,7 @@ pub fn codegen_k_k_jn(_: TokenStream) -> TokenStream {
                     set_0.#type_0()
                     .join_core(
                         set_1.#type_1(),
-                        v2_jn_logic::<#ik0_, #target_>(flow)
+                        v2_jn_logic::<#ik0_, #target_>(flow, budget)
                     )
                 )
             }
@@ -387,7 +396,7 @@ pub fn codegen_k_k_jn(_: TokenStream) -> TokenStream {
                 set_0.set_fat()
                     .join_core(
                         set_1.set_fat(),
-                        v2_jn_logic_fat(flow)
+                        v2_jn_logic_fat(flow, budget)
                     ),
                 target
             )
@@ -523,12 +532,15 @@ pub fn codegen_aggregation(_: TokenStream) -> TokenStream {
         arms.push(quote! {
             #arity => Rel::#final_rel(
                 input_rel.#base_type()
-                    .map(row_chop::<#arity, #key_arity, 1>())
+                    .map(aggregation_separate::<#arity, #key_arity>(idb_catalog.position()))
                     .reduce_core::<_,ValBuilder<_,_,_,_>,ValSpine<_,_,_,_>>(
                         "aggregation",
                         aggregation_reduce_logic::<#key_arity>(&aggregation)
                     )
-                    .as_collection(|k, v| aggregation_merge_kv::<#key_arity, #arity>()((k.clone(), v.clone())))
+                    .as_collection({
+                        let merge = aggregation_merge::<#key_arity, #arity>(idb_catalog.position());
+                        move |k, v| merge((k.clone(), v.clone()))
+                    })
             )
         });
     }
@@ -537,12 +549,15 @@ pub fn codegen_aggregation(_: TokenStream) -> TokenStream {
         if input_rel.is_fat() {
             Rel::CollectionFat(
                 input_rel.rel_fat()
-                    .map(aggregation_separate_kv_fat())
+                    .map(aggregation_separate_fat(idb_catalog.position()))
                     .reduce_core::<_,ValBuilder<_,_,_,_>,ValSpine<_,_,_,_>>(
                         "aggregation",
                         aggregation_reduce_logic_fat(&aggregation)
                     )
-                    .as_collection(|k, v| aggregation_merge_kv_fat()((k.clone(), v.clone()))),
+                    .as_collection({
+                        let merge = aggregation_merge_fat(idb_catalog.position());
+                        move |k, v| merge((k.clone(), v.clone()))
+                    }),
                 idb_catalog.arity()
             )
         } else {
@@ -577,13 +592,18 @@ pub fn codegen_min_optimize(_: TokenStream) -> TokenStream {
                     // Extract key columns (all but last) and value column (last)
                     // and carry the value in the Min semiring's difference
                     .inner
-                    .flat_map(move |(row, t, _)| {
-                        let mut key = reading::row::Row::<#key_arity>::new();
-                        for i in 0..#key_arity {
-                            key.push(row.column(i));
+                    .flat_map({
+                        let position = idb_catalog.position();
+                        move |(row, t, _)| {
+                            let mut key = reading::row::Row::<#key_arity>::new();
+                            for i in 0..#arity {
+                                if i != position {
+                                    key.push(row.column(i));
+                                }
+                            }
+                            let value = row.column(position);
+                            std::iter::once((key, reading::Min::new(value))).into_iter().map(move |(x, d2)| (x, t.clone(), d2))
                         }
-                        let value = row.column(#key_arity);
-                        std::iter::once((key, reading::Min::new(value))).into_iter().map(move |(x, d2)| (x, t.clone(), d2))
                     })
                     .as_collection()
                     
@@ -608,15 +628,22 @@ pub fn codegen_min_optimize(_: TokenStream) -> TokenStream {
                     // Reconstruct full tuple with key columns + minimum value
                     // Convert to Present semiring for downstream operators
                     .inner
-                    .flat_map(move |(key, t, min_val)| {
-                        let mut result = reading::row::Row::<#arity>::new();
-                        // Add key columns
-                        for i in 0..#key_arity {
-                            result.push(key.column(i));
+                    .flat_map({
+                        let position = idb_catalog.position();
+                        move |(key, t, min_val)| {
+                            let mut result = reading::row::Row::<#arity>::new();
+                            let mut next_key = 0;
+                            for i in 0..#arity {
+                                if i == position {
+                                    // the minimized value, read off the difference
+                                    result.push(min_val.value);
+                                } else {
+                                    result.push(key.column(next_key));
+                                    next_key += 1;
+                                }
+                            }
+                            std::iter::once((result, reading::semiring_one())).into_iter().map(move |(x2, d2)| (x2, t.clone(), d2))
                         }
-                        // Push minimized value into the last column (extracted from diff!)
-                        result.push(min_val.value);
-                        std::iter::once((result, reading::semiring_one())).into_iter().map(move |(x2, d2)| (x2, t.clone(), d2))
                     })
                     .as_collection()
             )
@@ -632,18 +659,19 @@ pub fn codegen_min_optimize(_: TokenStream) -> TokenStream {
                     // Extract key columns (all but last) and value column (last)
                     // and carry the value in the Min semiring's difference
                     .inner
-                    .flat_map(move |(row, t, _)| {
-                        let mut key = reading::row::FatRow::new();
-                        let arity = row.arity();
-                            
-                        // Extract all columns except the last as the group-by key
-                        for i in 0..arity - 1 {
-                            key.push(row.column(i));
+                    .flat_map({
+                        let position = idb_catalog.position();
+                        move |(row, t, _)| {
+                            let mut key = reading::row::FatRow::new();
+                            let arity = row.arity();
+                            for i in 0..arity {
+                                if i != position {
+                                    key.push(row.column(i));
+                                }
+                            }
+                            let value = row.column(position);
+                            std::iter::once((key, reading::Min::new(value))).into_iter().map(move |(x, d2)| (x, t.clone(), d2))
                         }
-                            
-                        // Extract the last column as the value to minimize
-                        let value = row.column(arity - 1);
-                        std::iter::once((key, reading::Min::new(value))).into_iter().map(move |(x, d2)| (x, t.clone(), d2))
                     })
                     .as_collection()
                         
@@ -666,18 +694,22 @@ pub fn codegen_min_optimize(_: TokenStream) -> TokenStream {
                     // Reconstruct full FatRow with key columns + minimum value
                     // Convert to standard semiring for downstream operators
                     .inner
-                    .flat_map(move |(key, t, min_val)| {
-                        let mut result = reading::row::FatRow::new();
-                            
-                        // Add all key columns
-                        for i in 0..key.arity() {
-                            result.push(key.column(i));
+                    .flat_map({
+                        let position = idb_catalog.position();
+                        move |(key, t, min_val)| {
+                            let mut result = reading::row::FatRow::new();
+                            let arity = key.arity() + 1;
+                            let mut next_key = 0;
+                            for i in 0..arity {
+                                if i == position {
+                                    result.push(min_val.value);
+                                } else {
+                                    result.push(key.column(next_key));
+                                    next_key += 1;
+                                }
+                            }
+                            std::iter::once((result, reading::semiring_one())).into_iter().map(move |(x2, d2)| (x2, t.clone(), d2))
                         }
-                            
-                        // Push minimized value as the last column
-                        result.push(min_val.value);
-                            
-                        std::iter::once((result, reading::semiring_one())).into_iter().map(move |(x2, d2)| (x2, t.clone(), d2))
                     })
                     .as_collection(),
                 idb_catalog.arity() // Preserve original arity for fat relation wrapper
@@ -734,9 +766,9 @@ mod tests {
             &iproduct!(rows(), 0..=ROW_MAX).collect::<Vec<_>>(),
         );
         assert_covers(
-            "codegen_call_row",
-            &call_row_space(),
-            &iproduct!(rows(), rows()).collect::<Vec<_>>(),
+            "codegen_row_program",
+            &row_program_space(),
+            &iproduct!(0..=ROW_MAX, 0..=ROW_MAX).collect::<Vec<_>>(),
         );
         assert_covers(
             "codegen_row_kv",

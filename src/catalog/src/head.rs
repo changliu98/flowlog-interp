@@ -23,6 +23,9 @@ pub struct AggregationHeadIDB {
     /// The arity (total number of arguments) of the head expression.
     /// This includes both regular arguments and the aggregation argument.
     arity: usize,
+
+    /// The column the aggregate occupies in the head.
+    position: usize,
 }
 
 impl AggregationHeadIDB {
@@ -43,14 +46,14 @@ impl AggregationHeadIDB {
     pub fn from_aggregation_rule(head: &Head) -> Self {
         let head_args = head.head_arguments();
 
-        // Extract the aggregation argument (must be the last argument)
-        let aggregation_argument = head_args
-            .last()
-            .and_then(|arg| match arg {
-                HeadArg::Aggregation(agg) => Some(agg.clone()),
-                _ => None,
-            })
+        // Extract the aggregation argument, wherever it sits in the head
+        let position = head
+            .aggregate_position()
             .expect("Head must contain an aggregation argument");
+        let aggregation_argument = match &head_args[position] {
+            HeadArg::Aggregation(agg) => agg.clone(),
+            _ => unreachable!("aggregate_position names an aggregation"),
+        };
 
         // Determine if this is a group-by operation:
         // - Has an aggregation argument (guaranteed by above)
@@ -62,7 +65,14 @@ impl AggregationHeadIDB {
             aggregation_argument,
             is_group_by,
             arity: head_args.len(),
+            position,
         }
+    }
+
+    /// The column the aggregate occupies; the other columns are the group-by
+    /// key, in their head order.
+    pub fn position(&self) -> usize {
+        self.position
     }
 
     /// Returns the aggregation argument.
@@ -127,11 +137,7 @@ pub fn aggregation_catalog_from_program(program: &Program) -> HashMap<String, Ag
         let predicate_name = head.name();
 
         // Check if this head contains an aggregation
-        let has_aggregation = head
-            .head_arguments()
-            .last()
-            .map(|arg| matches!(arg, HeadArg::Aggregation(_)))
-            .unwrap_or(false);
+        let has_aggregation = head.aggregate_position().is_some();
 
         // Only process rules with aggregation and only if we haven't seen this predicate before
         if has_aggregation && !aggregation_catalog.contains_key(predicate_name) {

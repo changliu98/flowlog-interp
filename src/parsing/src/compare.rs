@@ -1,6 +1,8 @@
 use std::fmt;
 use std::collections::HashSet;
-use crate::{parser::Lexeme, Rule};
+use crate::diagnostic::Result;
+use crate::rule::Const;
+use crate::{parser::Lexeme, Rule, Val};
 use crate::arithmetic::Arithmetic;
 use pest::iterators::Pair;
 
@@ -20,6 +22,11 @@ impl ComparisonOperator {
             Self::Equals => true,
             _ => false,
         }
+    }
+
+    /// Whether the operator orders its operands, which only numbers support.
+    pub fn is_ordered(&self) -> bool {
+        !matches!(self, Self::Equals | Self::NotEquals)
     }
 }
 
@@ -72,6 +79,19 @@ pub struct ComparisonExpr {
 }
 
 impl ComparisonExpr {
+    pub fn new(left: Arithmetic, operator: ComparisonOperator, right: Arithmetic) -> Self {
+        Self { left, operator, right }
+    }
+
+    /// A comparison that never holds: what `False` in a body means.
+    pub fn never() -> Self {
+        Self::new(
+            Arithmetic::constant(Const::Integer(0)),
+            ComparisonOperator::Equals,
+            Arithmetic::constant(Const::Integer(1)),
+        )
+    }
+
     pub fn left(&self) -> &Arithmetic {
         &self.left
     }
@@ -95,6 +115,11 @@ impl ComparisonExpr {
     pub fn right_vars(&self) -> Vec<&String> {
         self.right.vars()
     }
+
+    pub fn lower_symbols(&mut self, intern: &mut dyn FnMut(&str) -> Result<Val>) -> Result<()> {
+        self.left.lower_symbols(intern)?;
+        self.right.lower_symbols(intern)
+    }
 }
 
 impl fmt::Display for ComparisonExpr {
@@ -113,10 +138,3 @@ impl Lexeme for ComparisonExpr {
         ComparisonExpr { left, operator, right }
     }
 }
-
-
-
-
-
-
-

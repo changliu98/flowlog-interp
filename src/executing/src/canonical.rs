@@ -186,7 +186,7 @@ fn render_factor(factor: &Factor, namer: &mut Namer) -> String {
 fn render_const(constant: &Const) -> String {
     match constant {
         Const::Integer(value) => format!("#{value}"),
-        Const::Text(text) => format!("{text:?}"),
+        Const::Text(text) | Const::Symbol { text, .. } => format!("{text:?}"),
     }
 }
 
@@ -361,10 +361,10 @@ mod tests {
 
     #[test]
     fn negation_constants_and_comparisons_are_kept_apart() {
-        let a = rules("C(x) :- A(x, 1), !B(x, y), x < y.");
-        let b = rules("C(x) :- A(x, 2), !B(x, y), x < y.");
-        let c = rules("C(x) :- A(x, 1), B(x, y), x < y.");
-        let d = rules("C(x) :- A(x, 1), !B(x, y), y < x.");
+        let a = rules("C(x) :- A(x, 1), A(y, 2), !B(x, y), x < y.");
+        let b = rules("C(x) :- A(x, 2), A(y, 2), !B(x, y), x < y.");
+        let c = rules("C(x) :- A(x, 1), A(y, 2), B(x, y), x < y.");
+        let d = rules("C(x) :- A(x, 1), A(y, 2), !B(x, y), y < x.");
         let forms = [&a[0], &b[0], &c[0], &d[0]]
             .iter()
             .map(|rule| canonical_rule(rule))

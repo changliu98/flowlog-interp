@@ -18,7 +18,7 @@ pub struct GroupStrataQueryPlan {
     
     reverse_last_signatures_map: HashMap<Arc<CollectionSignature>, Vec<Arc<CollectionSignature>>>,      // reverse map for the last signatures 
     strata_plan: Vec<Vec<Transformation>>,
-                                                   
+    sideways_heads: HashSet<String>,                                                                     // heads of rules the sideways rewrite produced: slices, not relations
 }
 
 impl GroupStrataQueryPlan {
@@ -32,6 +32,11 @@ impl GroupStrataQueryPlan {
             .iter()
             .map(|rp| rp.rule().clone())
             .collect::<Vec<FLRule>>();
+        let sideways_heads = rules
+            .iter()
+            .filter(|rule| rule.is_sideways())
+            .map(|rule| rule.head().name().to_string())
+            .collect::<HashSet<String>>();
 
         // populate the last_signatures_map (map head to a vector of last signatures)
         let last_signatures_map = rule_plans.iter().fold(
@@ -90,7 +95,8 @@ impl GroupStrataQueryPlan {
             enter_scope,
             last_signatures_map,
             reverse_last_signatures_map,
-            strata_plan
+            strata_plan,
+            sideways_heads,
         }
     }
 
@@ -200,14 +206,20 @@ impl GroupStrataQueryPlan {
         self.strata_plan.iter().flatten().collect()
     }
 
-    // head collection signatures of the strata
+    // head collection signatures of the strata, without the sideways slices
     pub fn head_signatures_set(&self) -> HashSet<Arc<CollectionSignature>> {
         self.last_signatures_map
             .keys()
-            // (sideways) jump over sip rules
-            .filter(|signature| !signature.name().contains("_sip"))
+            .filter(|signature| !self.is_sideways_head(signature.name()))
             .cloned()
             .collect()
+    }
+
+    /// Whether `name` is the head of a rule the sideways rewrite produced: a
+    /// slice read by later rules of the group, never a relation of the
+    /// program, so it is neither an iterative variable nor an output.
+    pub fn is_sideways_head(&self, name: &str) -> bool {
+        self.sideways_heads.contains(name)
     }
 
     // heads (name and arity) of the strata

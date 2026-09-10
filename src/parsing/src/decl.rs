@@ -1,5 +1,5 @@
 /*
-    DataType: number | string
+    DataType: number | symbol
     Attribute: <name>: <DataType>
     RelDecl: <name>(<Attribute>, <Attribute>, ...)
 */
@@ -7,29 +7,47 @@
 use crate::parser::Lexeme;
 use crate::Rule;
 use pest::iterators::Pair;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Debug, Clone)]
+/// The type of one column.
+///
+/// Every cell is a `Val` at run time. The type says how the cell is read: a
+/// `number` is its own value, a `symbol` is the content-derived id of a text
+/// (see the engine's symbol table). Arithmetic and ordered comparison are
+/// defined over numbers; equality, joins and aggregation by `count` are
+/// defined over both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DataType {
+    #[serde(rename = "number")]
     Integer,
-    String,
+    Symbol,
 }
 
 impl DataType {
     fn from_str(type_str: &str) -> Self {
         match type_str {
             "number" => Self::Integer,
-            "string" => Self::String,
+            "string" | "symbol" => Self::Symbol,
             _ => unreachable!(),
         }
+    }
+
+    pub fn is_number(&self) -> bool {
+        matches!(self, Self::Integer)
+    }
+
+    pub fn is_symbol(&self) -> bool {
+        matches!(self, Self::Symbol)
     }
 }
 
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Integer => write!(f, "number"),   // f :: a formatter that can be used to write to a buffer
-            Self::String => write!(f, "string"),
+            Self::Integer => write!(f, "number"),
+            Self::Symbol => write!(f, "symbol"),
         }
     }
 }
@@ -54,6 +72,13 @@ impl Attribute {
         }
     }
 
+    pub fn new(name: &str, data_type: DataType) -> Self {
+        Self {
+            name: name.to_string(),
+            data_type,
+        }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -68,6 +93,7 @@ pub struct RelDecl {
     name: String,
     attributes: Vec<Attribute>,
     path: Option<String>,
+    line: usize,
 }
 
 impl fmt::Display for RelDecl {
@@ -78,7 +104,7 @@ impl fmt::Display for RelDecl {
             self.name,
             self.attributes
                 .iter()
-                .map(|attr| attr.to_string()) // to_string() uses the Display impl for Attribute
+                .map(|attr| attr.to_string())
                 .collect::<Vec<String>>()
                 .join(", ")
         )?;
@@ -89,14 +115,18 @@ impl fmt::Display for RelDecl {
     }
 }
 
-
 impl RelDecl {
     fn from_str(name: &str, attributes: Vec<Attribute>, path: Option<&str>) -> Self {
         Self {
             name: name.to_string(),
             attributes,
-            path: path.map(|p| p.to_string()), 
+            path: path.map(|p| p.to_string()),
+            line: 0,
         }
+    }
+
+    pub fn new(name: &str, attributes: Vec<Attribute>) -> Self {
+        Self::from_str(name, attributes, None)
     }
 
     pub fn push_attr(&mut self, attr: Attribute) {
@@ -111,6 +141,13 @@ impl RelDecl {
         &self.attributes
     }
 
+    pub fn column_types(&self) -> Vec<DataType> {
+        self.attributes
+            .iter()
+            .map(|attribute| *attribute.data_type())
+            .collect()
+    }
+
     pub fn arity(&self) -> usize {
         self.attributes.len()
     }
@@ -118,38 +155,44 @@ impl RelDecl {
     pub fn path(&self) -> Option<String> {
         self.path.clone()
     }
+
+    /// The source line of the declaration, 0 when it was not parsed from text.
+    pub fn line(&self) -> usize {
+        self.line
+    }
 }
 
 impl Lexeme for RelDecl {
     fn from_parsed_rule(parsed_rule: Pair<Rule>) -> Self {
-        let mut parsed_rule = parsed_rule.into_inner(); // into_inner() returns an iterator over the inner Pairs of a Pair
+        let line = parsed_rule.line_col().0;
+        let mut parsed_rule = parsed_rule.into_inner();
         /* parsing the relation name */
-        let name = parsed_rule.next().unwrap().as_str(); // as_str() returns the original string of the input
+        let name = parsed_rule.next().unwrap().as_str();
 
-        // debug!(".decl name = {:?}", name);
-        // debug!("RelDecl attributes = {:?}", parsed_rule);
+        let mut attributes = Vec::new();
+        let mut path = None;
+        for part in parsed_rule {
+            match part.as_rule() {
+                Rule::attributes_decl => {
+                    attributes = part
+                        .into_inner()
+                        .map(|attr| {
+                            let mut attr = attr.into_inner();
+                            let name = attr.next().unwrap().as_str();
+                            let data_type = attr.next().unwrap().as_str();
+                            Attribute::from_str(name, data_type)
+                        })
+                        .collect();
+                }
+                Rule::in_decl | Rule::out_decl => {
+                    path = Some(part.into_inner().next().unwrap().as_str().to_string());
+                }
+                _ => {}
+            }
+        }
 
-        /* parsing the relation attributes */
-        let attributes = parsed_rule
-            .next()
-            .unwrap()
-            .into_inner()
-            .map(|attr| {
-                // debug!(".decl attribute = {:?}", attr);
-                let mut attr = attr.into_inner();
-                let name = attr.next().unwrap().as_str();
-                let data_type = attr.next().unwrap().as_str();
-                Attribute::from_str(name, data_type)
-            })
-            .collect();
-
-        // if parsed_rule has next, then a path is provided    
-        let path = if let Some(path) = parsed_rule.next() {
-            Some(path.into_inner().next().unwrap().as_str())
-        } else {
-            None
-        };
-
-        Self::from_str(name, attributes, path)
+        let mut declaration = Self::from_str(name, attributes, path.as_deref());
+        declaration.line = line;
+        declaration
     }
 }

@@ -1,14 +1,15 @@
+use crate::compare::ComparisonExpr;
+use crate::arithmetic::Arithmetic;
+use crate::diagnostic::Result;
 use crate::{head::Head, parser::Lexeme, Rule, Val};
 use pest::iterators::Pair;
-use crate::compare::ComparisonExpr;
 use std::fmt;
 use tracing::error;
-
 
 /*
     Atom: NAME(AtomArg, AtomArg, ...)
     AtomArg: Var(String) | Const(Const) | Placeholder
-    Const: Integer(Val) | Text(String)
+    Const: Integer(Val) | Text(String) | Symbol { text, cell }
 */
 
 // atom_arg = var | const | placeholder
@@ -38,6 +39,13 @@ impl AtomArg {
             _ => panic!("expects var: {:?}", self),
         }
     }
+
+    fn lower_symbols(&mut self, intern: &mut dyn FnMut(&str) -> Result<Val>) -> Result<()> {
+        if let Self::Const(constant) = self {
+            constant.lower_symbols(intern)?;
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for AtomArg {
@@ -53,7 +61,7 @@ impl fmt::Display for AtomArg {
 impl Lexeme for AtomArg {
     fn from_parsed_rule(parsed_rule: Pair<Rule>) -> Self {
         match parsed_rule.as_rule() {
-            Rule::variable => Self::Var(parsed_rule.as_str().to_string()), // to_string() copies the string
+            Rule::variable => Self::Var(parsed_rule.as_str().to_string()),
             Rule::constant => Self::Const(Const::from_parsed_rule(parsed_rule)),
             Rule::placeholder => Self::Placeholder,
             _ => unreachable!(),
@@ -61,18 +69,51 @@ impl Lexeme for AtomArg {
     }
 }
 
+/// A literal of the program.
+///
+/// `Text` is a string literal as parsed; before planning, the engine lowers
+/// every text into a `Symbol`, which carries the text and the cell the symbol
+/// table assigned it, so that the planner and the operators see one `Val`
+/// while the canonical rendering of a rule keeps naming the text.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Const {
     Integer(Val),
     Text(String),
+    Symbol { text: String, cell: Val },
 }
 
 impl Const {
+    /// The cell this constant is in a row.
     pub fn integer(&self) -> Val {
         match self {
             Self::Integer(int) => *int,
-            _ => panic!("expects ints: {:?}", self),
+            Self::Symbol { cell, .. } => *cell,
+            Self::Text(text) => panic!(
+                "text constant {text:?} reached the planner before being lowered to a symbol"
+            ),
         }
+    }
+
+    pub fn is_text(&self) -> bool {
+        matches!(self, Self::Text(_) | Self::Symbol { .. })
+    }
+
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) | Self::Symbol { text, .. } => Some(text),
+            Self::Integer(_) => None,
+        }
+    }
+
+    pub fn lower_symbols(&mut self, intern: &mut dyn FnMut(&str) -> Result<Val>) -> Result<()> {
+        if let Self::Text(text) = self {
+            let cell = intern(text)?;
+            *self = Self::Symbol {
+                text: std::mem::take(text),
+                cell,
+            };
+        }
+        Ok(())
     }
 }
 
@@ -80,7 +121,7 @@ impl fmt::Display for Const {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Integer(int) => write!(f, "{}", int),
-            Self::Text(text) => write!(f, "{}", text),
+            Self::Text(text) | Self::Symbol { text, .. } => write!(f, "\"{}\"", text),
         }
     }
 }
@@ -106,7 +147,14 @@ impl Lexeme for Const {
         let inner = parsed_rule.into_inner().next().unwrap();
         match inner.as_rule() {
             Rule::integer => Self::Integer(parse_integer(inner.as_str())),
-            Rule::string => Self::Text(inner.as_str().to_string()),
+            Rule::string => {
+                let quoted = inner.as_str();
+                let text = quoted
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix('"'))
+                    .unwrap_or(quoted);
+                Self::Text(text.to_string())
+            }
             _ => { error!("constant parsing panic {:?}", inner); unreachable!() }
         }
     }
@@ -156,14 +204,32 @@ impl Atom {
     pub fn arity(&self) -> usize {
         self.arguments.len()
     }
+
+    /// The variables of the atom, in order, each once.
+    pub fn variables(&self) -> Vec<&String> {
+        let mut seen = Vec::new();
+        for argument in &self.arguments {
+            if let AtomArg::Var(variable) = argument {
+                if !seen.contains(&variable) {
+                    seen.push(variable);
+                }
+            }
+        }
+        seen
+    }
+
+    fn lower_symbols(&mut self, intern: &mut dyn FnMut(&str) -> Result<Val>) -> Result<()> {
+        for argument in &mut self.arguments {
+            argument.lower_symbols(intern)?;
+        }
+        Ok(())
+    }
 }
 
 impl Lexeme for Atom {
     fn from_parsed_rule(parsed_rule: Pair<Rule>) -> Self {
         let mut inner_rules = parsed_rule.into_inner();
-        let name = inner_rules.next().unwrap().as_str(); // name of the atom
-        // print!(".atom name = {:?}\n", name);
-        // print!(".atom args = {:?}\n", inner_rules);
+        let name = inner_rules.next().unwrap().as_str();
 
         let arguments = inner_rules
             .map(|arg| {
@@ -176,8 +242,8 @@ impl Lexeme for Atom {
     }
 }
 
-/// A pure function invocation implemented by the program's `.code rust`
-/// section.
+/// A pure function invocation implemented by one of the program's
+/// `.code rust` sections.
 #[derive(Debug, Clone)]
 pub struct CallExpr {
     function: String,
@@ -185,12 +251,26 @@ pub struct CallExpr {
 }
 
 impl CallExpr {
+    pub fn new(function: &str, arguments: Vec<AtomArg>) -> Self {
+        Self {
+            function: function.to_string(),
+            arguments,
+        }
+    }
+
     pub fn function(&self) -> &str {
         &self.function
     }
 
     pub fn arguments(&self) -> &[AtomArg] {
         &self.arguments
+    }
+
+    fn lower_symbols(&mut self, intern: &mut dyn FnMut(&str) -> Result<Val>) -> Result<()> {
+        for argument in &mut self.arguments {
+            argument.lower_symbols(intern)?;
+        }
+        Ok(())
     }
 }
 
@@ -234,7 +314,7 @@ impl Lexeme for CallExpr {
     }
 }
 
-/// A call either binds one numeric result or acts as a boolean body filter.
+/// A call either binds one result or acts as a boolean body filter.
 #[derive(Debug, Clone)]
 pub enum CallPredicate {
     Bind { output: String, call: CallExpr },
@@ -252,6 +332,12 @@ impl CallPredicate {
         match self {
             Self::Bind { output, .. } => Some(output),
             Self::Filter(_) => None,
+        }
+    }
+
+    fn lower_symbols(&mut self, intern: &mut dyn FnMut(&str) -> Result<Val>) -> Result<()> {
+        match self {
+            Self::Bind { call, .. } | Self::Filter(call) => call.lower_symbols(intern),
         }
     }
 }
@@ -282,7 +368,7 @@ impl Lexeme for CallPredicate {
 
 /*
     FLRule: <Head> :- <Predicate>, <Predicate>, ...
-    Predicate: <Atom> | !<Atom> | <Comparison>
+    Predicate: <Atom> | !<Atom> | <Comparison> | <Call>
 */
 
 #[derive(Debug, Clone)]
@@ -311,8 +397,17 @@ impl Predicate {
             Self::CallPredicate(call) => call.call().function(),
         }
     }
-}
 
+    fn lower_symbols(&mut self, intern: &mut dyn FnMut(&str) -> Result<Val>) -> Result<()> {
+        match self {
+            Self::AtomPredicate(atom) | Self::NegatedAtomPredicate(atom) => {
+                atom.lower_symbols(intern)
+            }
+            Self::ComparePredicate(comparison) => comparison.lower_symbols(intern),
+            Self::CallPredicate(call) => call.lower_symbols(intern),
+        }
+    }
+}
 
 impl fmt::Display for Predicate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -345,12 +440,13 @@ impl Lexeme for Predicate {
             Rule::call_binding | Rule::call_expr => {
                 Self::CallPredicate(CallPredicate::from_parsed_rule(parsed_rule))
             }
+            // `False` in a body is a comparison that never holds; `True` is
+            // dropped by the rule parser and never reaches here.
+            Rule::BOOLEAN => Self::ComparePredicate(ComparisonExpr::never()),
             _ => unreachable!(),
         }
     }
 }
-
-
 
 /*
     FLRule: <Head> :- <Predicate>, <Predicate>, ...
@@ -361,6 +457,8 @@ pub struct FLRule {
     rhs: Vec<Predicate>,
     is_planning: bool,
     is_sip: bool,
+    line: usize,
+    is_sideways: bool,
 }
 
 impl fmt::Display for FLRule {
@@ -380,7 +478,26 @@ impl fmt::Display for FLRule {
 
 impl FLRule {
     pub fn new(head: Head, rhs: Vec<Predicate>, is_planning: bool, is_sip: bool) -> Self {
-        Self { head, rhs, is_planning, is_sip }
+        Self { head, rhs, is_planning, is_sip, line: 0, is_sideways: false }
+    }
+
+    /// The same rule, remembering the source line it came from.
+    pub fn at_line(mut self, line: usize) -> Self {
+        self.line = line;
+        self
+    }
+
+    /// The same rule, marked as one the sideways-passing rewrite produced:
+    /// its head is a slice the rewrite reads back, not a relation of the
+    /// program.
+    pub fn sideways(mut self) -> Self {
+        self.is_sideways = true;
+        self
+    }
+
+    /// Whether the sideways-passing rewrite produced this rule.
+    pub fn is_sideways(&self) -> bool {
+        self.is_sideways
     }
 
     pub fn head(&self) -> &Head {
@@ -399,13 +516,56 @@ impl FLRule {
         self.is_sip
     }
 
+    /// The source line of the rule, 0 when it was not parsed from text.
+    pub fn line(&self) -> usize {
+        self.line
+    }
+
     pub fn get(&self, i: usize) -> &Predicate {
         &self.rhs[i]
+    }
+
+    pub fn positive_atoms(&self) -> impl Iterator<Item = &Atom> {
+        self.rhs.iter().filter_map(|predicate| match predicate {
+            Predicate::AtomPredicate(atom) => Some(atom),
+            _ => None,
+        })
+    }
+
+    pub fn negated_atoms(&self) -> impl Iterator<Item = &Atom> {
+        self.rhs.iter().filter_map(|predicate| match predicate {
+            Predicate::NegatedAtomPredicate(atom) => Some(atom),
+            _ => None,
+        })
+    }
+
+    pub fn comparisons(&self) -> impl Iterator<Item = &ComparisonExpr> {
+        self.rhs.iter().filter_map(|predicate| match predicate {
+            Predicate::ComparePredicate(comparison) => Some(comparison),
+            _ => None,
+        })
+    }
+
+    pub fn calls(&self) -> impl Iterator<Item = &CallPredicate> {
+        self.rhs.iter().filter_map(|predicate| match predicate {
+            Predicate::CallPredicate(call) => Some(call),
+            _ => None,
+        })
+    }
+
+    /// Replace every text constant by its symbol.
+    pub fn lower_symbols(&mut self, intern: &mut dyn FnMut(&str) -> Result<Val>) -> Result<()> {
+        self.head.lower_symbols(intern)?;
+        for predicate in &mut self.rhs {
+            predicate.lower_symbols(intern)?;
+        }
+        Ok(())
     }
 }
 
 impl Lexeme for FLRule {
     fn from_parsed_rule(parsed_rule: Pair<Rule>) -> Self {
+        let line = parsed_rule.line_col().0;
         let mut inner_rules = parsed_rule.into_inner();
 
         /* parsing the head */
@@ -415,15 +575,17 @@ impl Lexeme for FLRule {
             .next()
             .unwrap()
             .into_inner()
-            .map(|pred| {
+            .filter_map(|pred| {
                 let pred_inner = pred.into_inner().next().unwrap();
-                /* parsing the predicate */
-                Predicate::from_parsed_rule(pred_inner)
+                // `True` contributes nothing to a body.
+                if pred_inner.as_rule() == Rule::BOOLEAN && pred_inner.as_str() == "True" {
+                    return None;
+                }
+                Some(Predicate::from_parsed_rule(pred_inner))
             })
             .collect();
 
-        // if inner has next, print it
-        match inner_rules.next() {
+        let rule = match inner_rules.next() {
             Some(next) => match next.as_str() {
                 ".plan" => Self::new(head, rhs, true, false),
                 ".sip" => Self::new(head, rhs, false, true),
@@ -431,6 +593,14 @@ impl Lexeme for FLRule {
                 _ => unreachable!(),
             },
             None => Self::new(head, rhs, false, false),
-        }
+        };
+        rule.at_line(line)
+    }
+}
+
+impl Arithmetic {
+    /// Whether this expression mentions no variable.
+    pub fn is_constant(&self) -> bool {
+        self.vars().is_empty()
     }
 }

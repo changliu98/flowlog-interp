@@ -1,28 +1,40 @@
 //! Content-addressed cache of materialized relation states.
 //!
 //! A Differential Dataflow graph has fixed topology: arbitrary edits cannot be
-//! spliced into an already assembled recursive scope.  Instead, evaluation
+//! spliced into an already assembled recursive scope. Instead, evaluation
 //! reads along the strata and, for each *unit* -- one recursive stratum, or one
 //! relation's rules within a non-recursive stratum -- asks this cache for the
-//! state its rules derive from the states it reads.  A unit's key is content on
+//! state its rules derive from the states it reads. A unit's key is content on
 //! both sides: the canonical text of its rules (what they mean, not how they
-//! were written) and the digest of every input relation's rows.  An upstream
-//! edit that leaves a relation's rows unchanged therefore stops invalidating
-//! there, a rule rewritten to mean the same thing keeps its entries, and an
-//! unrelated declaration or clause elsewhere in the program touches nothing.
-//! On an ordinary non-recursive unit miss, individual rule contributions can
-//! be reused from this same store before assembling the head's set union.
-//! Contribution keys exclude inherited head rows and have their own domain.
+//! were written), the column types of the relations it touches, the source of
+//! every embedded block a rule of the unit calls into, and the digest of every
+//! input relation's rows. An upstream edit that leaves a relation's rows
+//! unchanged therefore stops invalidating there, a rule rewritten to mean the
+//! same thing keeps its entries, an edit to a block no rule of the unit calls
+//! touches nothing, and an unrelated declaration or clause elsewhere in the
+//! program touches nothing. On an ordinary non-recursive unit miss, individual
+//! rule contributions can be reused from this same store before assembling
+//! the head's set union. Contribution keys exclude inherited head rows and
+//! have their own domain.
 //!
-//! The cache is two layers with one key: a process-resident LRU bounded by
-//! estimated bytes, and an optional on-disk store shared by every process that
-//! points at the same directory, bounded by bytes and swept by access time.
-//! Neither is a source of truth.  A miss costs one ordinary evaluation; a hit is
-//! rows that a run with identical rules and identical inputs derived, and every
-//! entry read back from disk is checked against the digest it was written with.
+//! The cache is two tiers with one key: a process-resident tier bounded by
+//! estimated bytes and evicted least recently used, and an optional on-disk
+//! store shared by every process that points at the same directory, bounded
+//! by bytes and swept by access time. The memory tier is the default; the
+//! disk tier is a spill a caller asks for. Neither is a source of truth. A
+//! miss costs one ordinary evaluation; a hit is rows that a run with identical
+//! rules and identical inputs derived, and every entry read back from disk is
+//! checked against the digest it was written with.
+//!
+//! An entry that holds symbol cells carries their texts, so a process that
+//! never interned them can still name them: the entry is self-describing.
+//!
+//! What the memo is not: it does not retain dataflow topology, and it does
+//! not incrementally update a recursive fixed point. A missed recursive or
+//! aggregate unit is recomputed whole.
 
 use crate::canonical::canonical_rules;
-use parsing::decl::RelDecl;
+use parsing::decl::DataType;
 use parsing::parser::Program;
 use parsing::rule::{FLRule, Predicate};
 use parsing::Val;
@@ -38,8 +50,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const CACHE_ABI: &str = "flowlog-interp/state-cache/v2";
-const STATE_MAGIC: &[u8; 8] = b"FLSTATE2";
+/// The version of the key: bumped whenever the key's inputs change meaning.
+pub const CACHE_ABI: &str = "flowlog-interp/state-cache/v3";
+/// The version of the on-disk entry format.
+pub const STATE_MAGIC: &[u8; 8] = b"FLSTATE3";
 const DISK_SWEEP_EVERY: usize = 64;
 const DISK_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 const DISK_SWEEP_BATCH: usize = 4096;
@@ -72,6 +86,10 @@ impl RelationState {
         }
     }
 
+    pub fn empty(name: &str, arity: usize) -> Self {
+        Self::new(name, arity, Vec::new())
+    }
+
     /// Rows already sorted and distinct, with the digest they were stored under.
     fn from_sorted(name: String, arity: usize, rows: Vec<Vec<Val>>, digest: [u8; 32]) -> Self {
         Self {
@@ -84,6 +102,14 @@ impl RelationState {
 
     pub fn digest_hex(&self) -> String {
         hex(&self.digest)
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
     }
 
     fn estimated_bytes(&self) -> usize {
@@ -110,21 +136,38 @@ fn rows_digest(arity: usize, rows: &[Vec<Val>]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// The states one unit derives: every head of the unit after it ran.
+/// The states one unit derives: every head of the unit after it ran, plus
+/// the texts of the symbols those rows hold.
 #[derive(Debug)]
 pub struct CacheEntry {
     pub relations: BTreeMap<String, Arc<RelationState>>,
+    pub symbols: Vec<(Val, String)>,
     bytes: usize,
 }
 
 impl CacheEntry {
     pub fn new(relations: BTreeMap<String, Arc<RelationState>>) -> Self {
+        Self::with_symbols(relations, Vec::new())
+    }
+
+    pub fn with_symbols(
+        relations: BTreeMap<String, Arc<RelationState>>,
+        symbols: Vec<(Val, String)>,
+    ) -> Self {
         let bytes = std::mem::size_of::<Self>()
             + relations
                 .iter()
                 .map(|(name, relation)| name.capacity() + relation.estimated_bytes())
+                .sum::<usize>()
+            + symbols
+                .iter()
+                .map(|(_, text)| text.capacity() + 16)
                 .sum::<usize>();
-        Self { relations, bytes }
+        Self {
+            relations,
+            symbols,
+            bytes,
+        }
     }
 
     pub fn row_count(&self) -> usize {
@@ -132,6 +175,10 @@ impl CacheEntry {
             .values()
             .map(|relation| relation.rows.len())
             .sum()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
     }
 
     fn matches(&self, heads: &BTreeMap<String, usize>) -> bool {
@@ -142,6 +189,27 @@ impl CacheEntry {
                     .is_some_and(|relation| relation.arity == *arity)
             })
     }
+}
+
+/// The distinct symbol cells of a relation's rows, by its column types.
+pub fn symbol_cells(rows: &[Vec<Val>], types: &[DataType]) -> Vec<Val> {
+    let columns = types
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| column.is_symbol().then_some(index))
+        .collect::<Vec<_>>();
+    if columns.is_empty() {
+        return Vec::new();
+    }
+    let mut cells = BTreeSet::new();
+    for row in rows {
+        for &column in &columns {
+            if let Some(cell) = row.get(column) {
+                cells.insert(*cell);
+            }
+        }
+    }
+    cells.into_iter().collect()
 }
 
 // ------------------------------------------------------------------- units
@@ -156,6 +224,22 @@ pub struct Unit<'a> {
     pub heads: BTreeMap<String, usize>,
     pub rules: Vec<&'a FLRule>,
     pub recursive: bool,
+}
+
+impl Unit<'_> {
+    /// The embedded functions the unit's rules call, each once.
+    pub fn called_functions(&self) -> Vec<&str> {
+        let mut names = Vec::new();
+        for rule in &self.rules {
+            for call in rule.calls() {
+                let name = call.call().function();
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        names
+    }
 }
 
 pub fn units_of_stratum<'a>(rules: &[&'a FLRule], recursive: bool) -> Vec<Unit<'a>> {
@@ -197,12 +281,12 @@ pub fn units_of_stratum<'a>(rules: &[&'a FLRule], recursive: bool) -> Vec<Unit<'
 /// heads, plus any head that already has a state (a relation this unit adds
 /// rows to, whose earlier rows are an input of the union it derives).
 ///
-/// A declared relation nothing has defined yet is an empty state; an undeclared
-/// one is refused by name, as the dataflow would refuse it.
+/// A relation nothing has defined yet is an empty state at its arity, which
+/// validation has fixed for every relation the program mentions.
 pub fn unit_inputs(
     unit: &Unit<'_>,
     states: &HashMap<String, Arc<RelationState>>,
-    declarations: &HashMap<&str, &RelDecl>,
+    program: &Program,
 ) -> BTreeMap<String, Arc<RelationState>> {
     let mut names = BTreeSet::new();
     for rule in &unit.rules {
@@ -227,10 +311,13 @@ pub fn unit_inputs(
             let state = match states.get(&name) {
                 Some(state) => Arc::clone(state),
                 None => {
-                    let declaration = declarations.get(name.as_str()).unwrap_or_else(|| {
-                        panic!("relation {name} is read before any rule or input defines it")
-                    });
-                    Arc::new(RelationState::new(&name, declaration.arity(), Vec::new()))
+                    let arity = program
+                        .column_types(&name)
+                        .map(<[DataType]>::len)
+                        .unwrap_or_else(|| {
+                            panic!("relation {name} is read before validation typed it")
+                        });
+                    Arc::new(RelationState::empty(&name, arity))
                 }
             };
             (name, state)
@@ -242,7 +329,6 @@ pub fn unit_inputs(
 pub fn unit_key(
     unit: &Unit<'_>,
     inputs: &BTreeMap<String, Arc<RelationState>>,
-    declarations: &HashMap<&str, &RelDecl>,
     program: &Program,
 ) -> String {
     let mut hasher = KeyHasher::new();
@@ -257,21 +343,19 @@ pub fn unit_key(
         .collect::<BTreeSet<_>>();
     touched.extend(inputs.keys().map(String::as_str));
     for name in touched {
-        hasher.add(&declaration_form(name, declarations));
+        hasher.add(&declaration_form(name, program));
     }
 
-    let calls = unit.rules.iter().any(|rule| {
-        rule.rhs()
-            .iter()
-            .any(|predicate| matches!(predicate, Predicate::CallPredicate(_)))
-    });
-    if calls {
-        hasher.add("embedded-rust");
-        hasher.add(
-            program
-                .embedded_rust()
-                .map_or("", |embedded| embedded.source()),
-        );
+    // Only the blocks the unit calls into: an edit to any other block leaves
+    // the unit's meaning, and its key, where they were.
+    let called = unit.called_functions();
+    if !called.is_empty() {
+        if let Some(embedded) = program.embedded_rust() {
+            for index in embedded.blocks_defining(called.iter().copied()) {
+                hasher.add("embedded-rust-block");
+                hasher.add(embedded.block(index).source());
+            }
+        }
     }
 
     for (name, state) in inputs {
@@ -283,65 +367,76 @@ pub fn unit_key(
 
 /// One ordinary non-recursive rule's output, before union with an inherited
 /// head or any other rule. `inputs` contains only the rule's body relations.
-/// Keep this namespace separate from complete unit states, including entries
-/// written by engines that predate contribution reuse.
+/// Keep this namespace separate from complete unit states.
 pub fn contribution_key(
     unit: &Unit<'_>,
     inputs: &BTreeMap<String, Arc<RelationState>>,
-    declarations: &HashMap<&str, &RelDecl>,
     program: &Program,
 ) -> String {
     assert!(!unit.recursive && unit.rules.len() == 1);
     assert!(unit.heads.keys().all(|head| !inputs.contains_key(head)));
     let mut hasher = KeyHasher::new();
-    hasher.add("flowlog-interp/rule-contribution/v1");
-    hasher.add(&unit_key(unit, inputs, declarations, program));
+    hasher.add("flowlog-interp/rule-contribution/v2");
+    hasher.add(&unit_key(unit, inputs, program));
     hasher.finish()
 }
 
-/// A declaration as the key sees it: the name and the attribute types.  The
-/// attribute names and the input path are spelling.
-fn declaration_form(name: &str, declarations: &HashMap<&str, &RelDecl>) -> String {
-    match declarations.get(name) {
-        Some(declaration) => format!(
+/// A relation as the key sees it: its name and its column types. Attribute
+/// names and input paths are spelling.
+fn declaration_form(name: &str, program: &Program) -> String {
+    match program.column_types(name) {
+        Some(columns) => format!(
             "{name}({})",
-            declaration
-                .attributes()
+            columns
                 .iter()
-                .map(|attribute| attribute.data_type().to_string())
+                .map(|column| column.to_string())
                 .collect::<Vec<_>>()
                 .join(",")
         ),
-        None => format!("{name}(<undeclared>)"),
+        None => format!("{name}(<untyped>)"),
     }
 }
 
 // ------------------------------------------------------------------- stats
 
+/// The counters of one run through the cache. Every count is exact and is
+/// defined here:
+///
+/// - `strata`: strata the program stratified into.
+/// - `units`: units the run keyed (one recursive stratum, or one head of a
+///   non-recursive stratum).
+/// - `hits` / `misses`: units served from the cache / evaluated.
+/// - `disk_hits`: hits served from the disk tier rather than memory.
+/// - `hits_after_miss`: hits keyed after at least one earlier unit missed in
+///   this run. Reported as `cutoff_hits` for compatibility; it counts every
+///   later hit, independent units included, so it is an upper bound on early
+///   cutoff and not a causal count.
+/// - `contribution_*`: rule-level lookups inside missed ordinary units.
+/// - `rules_evaluated`: source rules assembled into dataflows (before any
+///   sideways expansion).
+/// - `rows_loaded` / `rows_cached`: rows served from entries / rows stored
+///   into entries, whole units only; contributions count separately.
+/// - `*_micros`: wall time of preparation, dataflow, cache bookkeeping,
+///   output, and the whole run.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CacheRunStats {
     pub strata: usize,
     pub units: usize,
     pub hits: usize,
     pub misses: usize,
-    /// Hits served from the on-disk store rather than process memory.
     pub disk_hits: usize,
-    /// Unit hits after any earlier unit miss in the same run. This includes
-    /// independent units, so it is not a causal count of early cutoff.
-    pub cutoff_hits: usize,
-    /// Individual rule lookups, performed only after an ordinary unit miss.
+    #[serde(rename = "cutoff_hits")]
+    pub hits_after_miss: usize,
     pub contribution_hits: usize,
     pub contribution_misses: usize,
     pub contribution_disk_hits: usize,
     pub contribution_rows_loaded: usize,
     pub contribution_rows_cached: usize,
-    /// Source rules assembled for missing computations (before SIP expansion).
     pub rules_evaluated: usize,
     pub rows_loaded: usize,
     pub rows_cached: usize,
     pub planning_micros: u64,
     pub execution_micros: u64,
-    /// Key construction, lookups, unions, storage and maintenance; not dataflow.
     pub cache_micros: u64,
     pub output_micros: u64,
     pub total_micros: u64,
@@ -351,6 +446,10 @@ pub struct CacheRunStats {
     pub resident_rows: usize,
     pub resident_bytes: usize,
     pub max_bytes: usize,
+    /// Bytes the evaluation's threads held at most, as the allocator saw it.
+    pub peak_memory_bytes: i64,
+    /// Rows materialized at unit boundaries.
+    pub materialized_rows: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -374,6 +473,7 @@ impl AddAssign for DiskSweepStats {
     }
 }
 
+/// The memory tier's occupancy, maintained on every insert and eviction.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CacheStateStats {
     pub entries: usize,
@@ -396,12 +496,15 @@ struct StoredEntry {
     last_used: u64,
 }
 
-/// The two-layer cache behind one key.
+/// The two-tier cache behind one key.
 #[derive(Debug)]
 pub struct StrataCache {
     entries: HashMap<String, StoredEntry>,
+    /// (last_used, key), oldest first: the eviction order.
+    order: BTreeSet<(u64, String)>,
     max_bytes: usize,
     resident_bytes: usize,
+    resident_rows: usize,
     clock: u64,
     disk: Option<DiskStore>,
 }
@@ -410,8 +513,10 @@ impl StrataCache {
     pub fn new(max_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            order: BTreeSet::new(),
             max_bytes,
             resident_bytes: 0,
+            resident_rows: 0,
             clock: 0,
             disk: None,
         }
@@ -422,25 +527,14 @@ impl StrataCache {
         self
     }
 
-    pub fn from_args(args: &crate::arg::Args) -> Self {
-        let cache = Self::new(args.cache_max_bytes());
-        match args.cache_dir() {
-            Some(directory) => cache.with_disk(DiskStore::new(
-                directory.to_path_buf(),
-                args.cache_disk_max_bytes(),
-            )),
-            None => cache,
-        }
+    pub fn has_disk(&self) -> bool {
+        self.disk.is_some()
     }
 
     pub fn state_stats(&self) -> CacheStateStats {
         CacheStateStats {
             entries: self.entries.len(),
-            resident_rows: self
-                .entries
-                .values()
-                .map(|stored| stored.entry.row_count())
-                .sum(),
+            resident_rows: self.resident_rows,
             resident_bytes: self.resident_bytes,
             max_bytes: self.max_bytes,
         }
@@ -455,7 +549,9 @@ impl StrataCache {
         self.clock = self.clock.wrapping_add(1);
         if let Some(stored) = self.entries.get_mut(key) {
             if stored.entry.matches(heads) {
+                self.order.remove(&(stored.last_used, key.to_string()));
                 stored.last_used = self.clock;
+                self.order.insert((self.clock, key.to_string()));
                 return Some((Arc::clone(&stored.entry), HitSource::Memory));
             }
         }
@@ -480,15 +576,23 @@ impl StrataCache {
         maintenance
     }
 
+    fn remove(&mut self, key: &str) {
+        if let Some(previous) = self.entries.remove(key) {
+            self.order.remove(&(previous.last_used, key.to_string()));
+            self.resident_bytes = self.resident_bytes.saturating_sub(previous.entry.bytes);
+            self.resident_rows = self.resident_rows.saturating_sub(previous.entry.row_count());
+        }
+    }
+
     fn retain(&mut self, key: String, entry: Arc<CacheEntry>) {
         if self.max_bytes == 0 || entry.bytes > self.max_bytes {
             return;
         }
         self.clock = self.clock.wrapping_add(1);
-        if let Some(previous) = self.entries.remove(&key) {
-            self.resident_bytes = self.resident_bytes.saturating_sub(previous.entry.bytes);
-        }
+        self.remove(&key);
         self.resident_bytes += entry.bytes;
+        self.resident_rows += entry.row_count();
+        self.order.insert((self.clock, key.clone()));
         self.entries.insert(
             key,
             StoredEntry {
@@ -497,17 +601,10 @@ impl StrataCache {
             },
         );
         while self.resident_bytes > self.max_bytes {
-            let Some(oldest_key) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, stored)| stored.last_used)
-                .map(|(key, _)| key.clone())
-            else {
+            let Some((_, oldest)) = self.order.iter().next().cloned() else {
                 break;
             };
-            if let Some(removed) = self.entries.remove(&oldest_key) {
-                self.resident_bytes = self.resident_bytes.saturating_sub(removed.entry.bytes);
-            }
+            self.remove(&oldest);
         }
     }
 }
@@ -515,7 +612,7 @@ impl StrataCache {
 // -------------------------------------------------------------------- disk
 
 /// A directory of states, one file per key, shared by every process that
-/// points at it.  Writes land whole (temporary file, then rename) and reads
+/// points at it. Writes land whole (temporary file, then rename) and reads
 /// verify the digest each relation was written with, so a peer's half-written
 /// or damaged file is a miss and never a wrong answer.
 #[derive(Debug)]
@@ -775,6 +872,12 @@ fn encode_entry(entry: &CacheEntry) -> Vec<u8> {
             }
         }
     }
+    out.extend_from_slice(&(entry.symbols.len() as u64).to_le_bytes());
+    for (id, text) in &entry.symbols {
+        out.extend_from_slice(&id.to_le_bytes());
+        out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        out.extend_from_slice(text.as_bytes());
+    }
     out
 }
 
@@ -795,6 +898,9 @@ fn decode_entry(bytes: &[u8]) -> Option<CacheEntry> {
         }
         fn u64(&mut self) -> Option<u64> {
             Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+        }
+        fn i64(&mut self) -> Option<i64> {
+            Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
         }
     }
 
@@ -834,10 +940,18 @@ fn decode_entry(bytes: &[u8]) -> Option<CacheEntry> {
             Arc::new(RelationState::from_sorted(name, arity, rows, digest)),
         );
     }
+    let symbol_count = usize::try_from(reader.u64()?).ok()?;
+    let mut symbols = Vec::with_capacity(symbol_count.min(1 << 16));
+    for _ in 0..symbol_count {
+        let id = reader.i64()?;
+        let length = reader.u32()? as usize;
+        let text = std::str::from_utf8(reader.take(length)?).ok()?.to_string();
+        symbols.push((id, text));
+    }
     if reader.at != bytes.len() {
         return None;
     }
-    Some(CacheEntry::new(relations))
+    Some(CacheEntry::with_symbols(relations, symbols))
 }
 
 // ----------------------------------------------------------------- hashing
@@ -915,7 +1029,32 @@ mod tests {
     }
 
     #[test]
-    fn a_disk_entry_round_trips_and_a_damaged_one_is_a_miss() {
+    fn eviction_is_least_recently_used_and_the_stats_follow() {
+        let entry = |name: &str| {
+            Arc::new(CacheEntry::new(BTreeMap::from([(
+                name.to_string(),
+                state(name, vec![vec![1], vec![2]]),
+            )])))
+        };
+        let one = entry("A").bytes();
+        let mut cache = StrataCache::new(one * 2 + 8);
+        cache.insert("a".to_string(), entry("A"));
+        cache.insert("b".to_string(), entry("B"));
+        assert_eq!(cache.state_stats().entries, 2);
+        assert_eq!(cache.state_stats().resident_rows, 4);
+        // touch a, so b is the oldest
+        let heads = BTreeMap::from([("A".to_string(), 1usize)]);
+        assert!(cache.lookup("a", &heads).is_some());
+        cache.insert("c".to_string(), entry("C"));
+        assert!(cache.entries.contains_key("a"));
+        assert!(!cache.entries.contains_key("b"));
+        assert!(cache.entries.contains_key("c"));
+        assert_eq!(cache.state_stats().resident_rows, 4);
+        assert_eq!(cache.order.len(), 2);
+    }
+
+    #[test]
+    fn a_disk_entry_round_trips_with_its_symbols_and_a_damaged_one_is_a_miss() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -929,13 +1068,14 @@ mod tests {
             ("H".to_string(), state("H", vec![vec![1, 2], vec![3, 4]])),
             ("K".to_string(), state("K", vec![vec![7]])),
         ]);
-        let entry = CacheEntry::new(relations);
+        let entry = CacheEntry::with_symbols(relations, vec![(7, "seven".to_string())]);
         let key = "ab".repeat(32);
         store.put(&key, &entry);
 
         let read = store.get(&key).expect("stored entry reads back");
         assert_eq!(read.relations["H"].rows, entry.relations["H"].rows);
         assert_eq!(read.relations["K"].digest, entry.relations["K"].digest);
+        assert_eq!(read.symbols, vec![(7, "seven".to_string())]);
 
         let path = store.path(&key);
         let mut bytes = fs::read(&path).unwrap();

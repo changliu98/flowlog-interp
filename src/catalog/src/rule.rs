@@ -23,8 +23,10 @@ pub struct Catalog {
 
     base_filters: BaseFilters,                                                            // (local filters) variable equality constraints, constant equality constraints, placeholder set
     
-    comparison_predicates: Vec<ComparisonExpr>,                                           // comparison predicates
+    comparison_predicates: Vec<ComparisonExpr>,                                           // comparison predicates over relational variables (fused into the relational plan)
     comparison_predicates_vars_set: Vec<HashSet<String>>,                                 // comparison predicates vars set
+
+    computed_comparisons: Vec<ComparisonExpr>,                                            // comparison predicates that read a call result (evaluated by the row program)
 
     call_predicates: Vec<CallPredicate>,                                                   // embedded pure calls, evaluated after relational predicates
 
@@ -218,6 +220,20 @@ impl Catalog {
         &self.call_predicates
     }
 
+    /// Comparisons that read a call result, which the relational plan cannot
+    /// evaluate; the row program applies them after the calls.
+    pub fn computed_comparisons(&self) -> &[ComparisonExpr] {
+        &self.computed_comparisons
+    }
+
+    /// The variables bound by call results, in call order.
+    pub fn call_outputs(&self) -> Vec<&str> {
+        self.call_predicates
+            .iter()
+            .filter_map(CallPredicate::output)
+            .collect()
+    }
+
     pub fn comparison_predicates_vars_set(&self, comp_ids: &Vec<usize>) -> Vec<&String> {
         comp_ids
             .iter()
@@ -305,9 +321,24 @@ impl Catalog {
                 negated_atom_names, 
                 negated_atom_argument_signatures,
                 base_filters,
-                comparison_predicates,
+                all_comparisons,
                 call_predicates,
             ) = Self::populate_argument_signatures(rule);
+
+        // A comparison that reads a call result cannot be fused into a join:
+        // the result exists only once the row program has run.
+        let call_outputs = call_predicates
+            .iter()
+            .filter_map(CallPredicate::output)
+            .map(str::to_string)
+            .collect::<HashSet<String>>();
+        let (computed_comparisons, comparison_predicates): (Vec<ComparisonExpr>, Vec<ComparisonExpr>) =
+            all_comparisons.into_iter().partition(|comparison| {
+                comparison
+                    .vars_set()
+                    .into_iter()
+                    .any(|variable| call_outputs.contains(variable))
+            });
 
         let argument_presence_map = Self::populate_argument_presence_map(&signature_to_argument_str_map, &atom_argument_signatures, &base_filters);
         let is_core_atom_bitmap = Self::populate_is_core_atom_bitmap(&signature_to_argument_str_map, &atom_argument_signatures);
@@ -335,6 +366,7 @@ impl Catalog {
                base_filters,
                comparison_predicates,
                comparison_predicates_vars_set,
+               computed_comparisons,
                call_predicates,
                head_arguments_map,
             }
@@ -474,6 +506,8 @@ impl Catalog {
             // construct final rule
             sideway_rules.push(
                 FLRule::new(sideway_head, sideway_rhs, base_rule.is_planning(), base_rule.is_sip())
+                    .at_line(base_rule.line())
+                    .sideways()
             );
         }
 
@@ -485,6 +519,11 @@ impl Catalog {
     pub fn sideways(&self, rule_loc: usize) -> Vec<Catalog> {
         /* basics */
         let base_rule = self.rule();
+        let call_outputs = self
+            .call_outputs()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<String>>();
         let (mut atoms, negated_atoms, cmprs, calls): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) = {
             let mut atoms = Vec::new();
             let mut negated_atoms = Vec::new();
@@ -495,6 +534,16 @@ impl Catalog {
                 match predicate {
                     Predicate::AtomPredicate(_) => atoms.push(predicate.clone()),
                     Predicate::NegatedAtomPredicate(_) => negated_atoms.push(predicate.clone()),
+                    Predicate::ComparePredicate(comparison)
+                        if comparison
+                            .vars_set()
+                            .into_iter()
+                            .any(|variable| call_outputs.contains(variable)) =>
+                    {
+                        // read by the row program after the calls, never by a
+                        // sideways rule
+                        calls.push(predicate.clone())
+                    }
                     Predicate::ComparePredicate(_) => cmprs.push(predicate.clone()),
                     Predicate::CallPredicate(_) => calls.push(predicate.clone()),
                 }
@@ -550,7 +599,8 @@ impl Catalog {
             .chain(calls)
             .collect::<Vec<Predicate>>();
 
-        let final_rule = FLRule::new(final_head, final_rhs, base_rule.is_planning(), base_rule.is_sip());
+        let final_rule = FLRule::new(final_head, final_rhs, base_rule.is_planning(), base_rule.is_sip())
+            .at_line(base_rule.line());
         debug!("\nfinal: {}", final_rule);
 
         // construct the final catalog by chaining forward, backward, and the final rule Catalog::from_strata(&final_rule)

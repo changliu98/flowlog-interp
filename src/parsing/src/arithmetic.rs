@@ -1,4 +1,5 @@
-use crate::{parser::Lexeme, rule::Const, Rule};
+use crate::diagnostic::Result;
+use crate::{parser::Lexeme, rule::Const, Rule, Val};
 use pest::iterators::Pair;
 use std::collections::HashSet;
 use std::fmt;
@@ -80,6 +81,13 @@ impl Factor {
             _ => vec![],
         }
     }
+
+    fn lower_symbols(&mut self, intern: &mut dyn FnMut(&str) -> Result<Val>) -> Result<()> {
+        if let Self::Const(constant) = self {
+            constant.lower_symbols(intern)?;
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for Factor {
@@ -95,7 +103,7 @@ impl Lexeme for Factor {
     fn from_parsed_rule(parsed_rule: Pair<Rule>) -> Self {
         let inner = parsed_rule.into_inner().next().unwrap();
         match inner.as_rule() {
-            Rule::variable => Self::Var(inner.as_str().to_string()), // to_string() copies the string
+            Rule::variable => Self::Var(inner.as_str().to_string()),
             Rule::constant => Self::Const(Const::from_parsed_rule(inner)),
             _ => unreachable!(),
         }
@@ -109,6 +117,20 @@ pub struct Arithmetic {
 }
 
 impl Arithmetic {
+    pub fn new(init: Factor, rest: Vec<(ArithmeticOperator, Factor)>) -> Self {
+        Self { init, rest }
+    }
+
+    /// The expression that is one constant.
+    pub fn constant(constant: Const) -> Self {
+        Self::new(Factor::Const(constant), Vec::new())
+    }
+
+    /// The expression that is one variable.
+    pub fn variable(name: &str) -> Self {
+        Self::new(Factor::Var(name.to_string()), Vec::new())
+    }
+
     pub fn init(&self) -> &Factor {
         &self.init
     }
@@ -132,6 +154,33 @@ impl Arithmetic {
     // if it is a simple variable
     pub fn is_var(&self) -> bool {
         self.init.is_var() && self.rest.is_empty()
+    }
+
+    /// Whether the expression is one factor, variable or constant, with no
+    /// operator applied.
+    pub fn is_single(&self) -> bool {
+        self.rest.is_empty()
+    }
+
+    /// The constant this expression is, when it is exactly one constant.
+    pub fn as_constant(&self) -> Option<&Const> {
+        match (&self.init, self.rest.is_empty()) {
+            (Factor::Const(constant), true) => Some(constant),
+            _ => None,
+        }
+    }
+
+    /// Every factor of the expression, in order.
+    pub fn factors(&self) -> impl Iterator<Item = &Factor> {
+        std::iter::once(&self.init).chain(self.rest.iter().map(|(_, factor)| factor))
+    }
+
+    pub fn lower_symbols(&mut self, intern: &mut dyn FnMut(&str) -> Result<Val>) -> Result<()> {
+        self.init.lower_symbols(intern)?;
+        for (_, factor) in &mut self.rest {
+            factor.lower_symbols(intern)?;
+        }
+        Ok(())
     }
 }
 

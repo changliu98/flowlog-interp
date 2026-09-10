@@ -10,7 +10,7 @@ use parsing::embedded::EmbeddedRust;
 use parsing::rule::FLRule;
 
 use optimizing::optimizer::PlanTree;
-use crate::calls::CallProjection;
+use crate::calls::RowProgram;
 use crate::collections::{CollectionSignature, Collection};
 use crate::transformations::Transformation;
 
@@ -48,10 +48,9 @@ impl RuleQueryPlan {
         is_optimized: bool,
         embedded_rust: Option<&EmbeddedRust>,
     ) -> Self {
-        // Validate the typed extension before asking the relational optimizer
-        // to build a tree, so malformed call-only rules get a call-specific
-        // diagnostic rather than an unrelated empty-plan failure.
-        let call_projection = CallProjection::from_catalog(catalog, embedded_rust);
+        // The row-local part of the rule, if it has one: the relational plan
+        // then projects the program's inputs instead of the head.
+        let row_program = RowProgram::from_catalog(catalog, embedded_rust);
         let plan = PlanTree::from_catalog(catalog, is_optimized);   
         // debug!("join spanning tree: {:?}", plan);
         let mut is_active_negation_bitmap = vec![true; catalog.negated_atom_names().len()];
@@ -68,12 +67,12 @@ impl RuleQueryPlan {
         // all comparison predicates are active initially
         let active_comparison_predicates: Vec<usize> = (0..catalog.comparison_predicates().len()).collect(); 
 
-        // A call rule first retains exactly the relational variables consumed by
-        // the row-local call program. The call projection then constructs the
-        // actual rule head. Ordinary rules continue to project their head here.
-        let head_value_arguments: Vec<String> = call_projection
+        // A rule with a row program first retains exactly the relational
+        // variables the program reads; the program then constructs the actual
+        // rule head. Ordinary rules project their head here.
+        let head_value_arguments: Vec<String> = row_program
             .as_ref()
-            .map(|projection| projection.input_variables().to_vec())
+            .map(|program| program.input_variables().to_vec())
             .unwrap_or_else(|| {
                 catalog
                     .head_arguments()
@@ -99,13 +98,11 @@ impl RuleQueryPlan {
         assert!(is_active_negation_bitmap.iter().all(|&x| !x));
         assert!(is_active_non_core_atom_bitmap.iter().all(|&x| !x));
 
-        let last_transformation = if let Some(projection) = call_projection {
-            let call_root = Transformation::call_projection(
-                Arc::clone(relational_root.output()),
-                projection,
-            );
-            transformation_tree.insert(call_root.clone(), vec![relational_root]);
-            call_root
+        let last_transformation = if let Some(program) = row_program {
+            let compute_root =
+                Transformation::compute(Arc::clone(relational_root.output()), program);
+            transformation_tree.insert(compute_root.clone(), vec![relational_root]);
+            compute_root
         } else {
             relational_root
         };

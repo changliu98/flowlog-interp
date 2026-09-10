@@ -9,6 +9,7 @@ use reading::row::Array;
 use reading::row::FatRow;
 use reading::row::Row;
 
+use crate::accounting::Budget;
 use crate::compare::jn_compare;
 
 /* -------------------------------------------------------------------------------------------------------------------- */
@@ -54,6 +55,7 @@ fn jn_extractor<const K: usize, const V: usize, const W: usize, const N: usize>(
 /*                  → (∅, v) */
 pub fn jn_logic<const K: usize, const V: usize, const W: usize, const N: usize>(
     flow: &TransformationFlow,
+    budget: &Arc<Budget>,
 ) -> impl FnMut(&Row<K>, &Row<V>, &Row<W>) -> Option<Row<N>> {
     let rids = if let TransformationFlow::JnToKV { key, value, .. } = flow {
         jn_deconstructor::<N>(&Arc::new(key.iter().chain(value.iter()).cloned().collect()))
@@ -61,11 +63,13 @@ pub fn jn_logic<const K: usize, const V: usize, const W: usize, const N: usize>(
         panic!("jn row: must be a jn flow");
     };
     let compares = flow.compares().clone();
+    let budget = Arc::clone(budget);
 
     move |k, v1, v2| {
-        if compares
-            .iter()
-            .all(|compare| jn_compare(Some(k), Some(v1), Some(v2), compare))
+        if !budget.stopped()
+            && compares
+                .iter()
+                .all(|compare| jn_compare(Some(k), Some(v1), Some(v2), compare, &budget))
         {
             Some(jn_extractor(k, v1, v2, &rids))
         } else {
@@ -108,6 +112,7 @@ fn cartesian_extractor<const V: usize, const W: usize, const N: usize>(
 
 pub fn cartesian_logic<const V: usize, const W: usize, const N: usize>(
     flow: &TransformationFlow,
+    budget: &Arc<Budget>,
 ) -> impl FnMut(&(), &Row<V>, &Row<W>) -> Option<Row<N>> {
     let rids = if let TransformationFlow::JnToKV { key, value, .. } = flow {
         cartesian_deconstructor::<N>(&Arc::new(key.iter().chain(value.iter()).cloned().collect()))
@@ -115,11 +120,13 @@ pub fn cartesian_logic<const V: usize, const W: usize, const N: usize>(
         panic!("cartesian: must be a jn flow");
     };
     let compares = flow.compares().clone();
+    let budget = Arc::clone(budget);
 
     move |_, v1, v2| {
-        if compares
-            .iter()
-            .all(|compare| jn_compare(None, Some(v1), Some(v2), compare))
+        if !budget.stopped()
+            && compares
+                .iter()
+                .all(|compare| jn_compare(None, Some(v1), Some(v2), compare, &budget))
         {
             Some(cartesian_extractor(v1, v2, &rids))
         } else {
@@ -168,6 +175,7 @@ fn v1_jn_extractor<const K: usize, const V: usize, const N: usize>(
 /*                  → (∅, v) */
 pub fn v1_jn_logic<const K: usize, const V: usize, const N: usize>(
     flow: &TransformationFlow,
+    budget: &Arc<Budget>,
 ) -> impl FnMut(&Row<K>, &Row<V>, &()) -> Option<Row<N>> {
     let rids = if let TransformationFlow::JnToKV { key, value, .. } = flow {
         v1_jn_deconstructor::<N>(&Arc::new(key.iter().chain(value.iter()).cloned().collect()))
@@ -175,11 +183,13 @@ pub fn v1_jn_logic<const K: usize, const V: usize, const N: usize>(
         panic!("jn_logic: must be a jn flow");
     };
     let compares = flow.compares().clone();
+    let budget = Arc::clone(budget);
 
     move |k, v1, _| {
-        if compares
-            .iter()
-            .all(|compare| jn_compare(Some(k), Some(v1), None, compare))
+        if !budget.stopped()
+            && compares
+                .iter()
+                .all(|compare| jn_compare(Some(k), Some(v1), None, compare, &budget))
         {
             Some(v1_jn_extractor(k, v1, &rids))
         } else {
@@ -216,6 +226,7 @@ fn v2_jn_extractor<const K: usize, const N: usize>(k: &Row<K>, extracts: &[usize
 /*                  → (∅, v) */
 pub fn v2_jn_logic<const K: usize, const N: usize>(
     flow: &TransformationFlow,
+    budget: &Arc<Budget>,
 ) -> impl FnMut(&Row<K>, &(), &()) -> Option<Row<N>> {
     let rids = if let TransformationFlow::JnToKV { key, value, .. } = flow {
         v2_jn_deconstructor::<N>(&Arc::new(key.iter().chain(value.iter()).cloned().collect()))
@@ -223,11 +234,13 @@ pub fn v2_jn_logic<const K: usize, const N: usize>(
         panic!("jn_logic: must be a jn flow");
     };
     let compares = flow.compares().clone();
+    let budget = Arc::clone(budget);
 
     move |k, _, _| {
-        if compares
-            .iter()
-            .all(|compare| jn_compare(Some(k), None, None, compare))
+        if !budget.stopped()
+            && compares
+                .iter()
+                .all(|compare| jn_compare(Some(k), None, None, compare, &budget))
         {
             Some(v2_jn_extractor(k, &rids))
         } else {
@@ -339,6 +352,7 @@ fn jn_extractor_fat(
 
 pub fn jn_logic_fat(
     flow: &TransformationFlow,
+    budget: &Arc<Budget>,
 ) -> impl FnMut(&FatRow, &FatRow, &FatRow) -> Option<FatRow> {
     let rids = if let TransformationFlow::JnToKV { key, value, .. } = flow {
         jn_deconstructor_fat(&Arc::new(key.iter().chain(value.iter()).cloned().collect()))
@@ -346,11 +360,13 @@ pub fn jn_logic_fat(
         panic!("jn_logic_fat: must be a jn flow");
     };
     let compares = flow.compares().clone();
+    let budget = Arc::clone(budget);
 
     move |k, v1, v2| {
-        if compares
-            .iter()
-            .all(|compare| jn_compare(Some(k), Some(v1), Some(v2), compare))
+        if !budget.stopped()
+            && compares
+                .iter()
+                .all(|compare| jn_compare(Some(k), Some(v1), Some(v2), compare, &budget))
         {
             Some(jn_extractor_fat(k, v1, v2, &rids))
         } else {
@@ -385,6 +401,7 @@ fn cartesian_extractor_fat(v1: &FatRow, v2: &FatRow, extracts: &[(bool, usize)])
 
 pub fn cartesian_logic_fat(
     flow: &TransformationFlow,
+    budget: &Arc<Budget>,
 ) -> impl FnMut(&(), &FatRow, &FatRow) -> Option<FatRow> {
     let rids = if let TransformationFlow::JnToKV { key, value, .. } = flow {
         cartesian_deconstructor_fat(&Arc::new(key.iter().chain(value.iter()).cloned().collect()))
@@ -392,11 +409,13 @@ pub fn cartesian_logic_fat(
         panic!("cartesian_logic_fat: must be a jn flow");
     };
     let compares = flow.compares().clone();
+    let budget = Arc::clone(budget);
 
     move |_, v1, v2| {
-        if compares
-            .iter()
-            .all(|compare| jn_compare(None, Some(v1), Some(v2), compare))
+        if !budget.stopped()
+            && compares
+                .iter()
+                .all(|compare| jn_compare(None, Some(v1), Some(v2), compare, &budget))
         {
             Some(cartesian_extractor_fat(v1, v2, &rids))
         } else {
@@ -433,6 +452,7 @@ fn v1_jn_extractor_fat(k: &FatRow, v1: &FatRow, extracts: &[(bool, usize)]) -> F
 
 pub fn v1_jn_logic_fat(
     flow: &TransformationFlow,
+    budget: &Arc<Budget>,
 ) -> impl FnMut(&FatRow, &FatRow, &()) -> Option<FatRow> {
     let rids = if let TransformationFlow::JnToKV { key, value, .. } = flow {
         v1_jn_deconstructor_fat(&Arc::new(key.iter().chain(value.iter()).cloned().collect()))
@@ -440,11 +460,13 @@ pub fn v1_jn_logic_fat(
         panic!("v1_jn_logic_fat: must be a jn flow");
     };
     let compares = flow.compares().clone();
+    let budget = Arc::clone(budget);
 
     move |k, v1, _| {
-        if compares
-            .iter()
-            .all(|compare| jn_compare(Some(k), Some(v1), None, compare))
+        if !budget.stopped()
+            && compares
+                .iter()
+                .all(|compare| jn_compare(Some(k), Some(v1), None, compare, &budget))
         {
             Some(v1_jn_extractor_fat(k, v1, &rids))
         } else {
@@ -474,6 +496,7 @@ fn v2_jn_extractor_fat(k: &FatRow, extracts: &[usize]) -> FatRow {
 
 pub fn v2_jn_logic_fat(
     flow: &TransformationFlow,
+    budget: &Arc<Budget>,
 ) -> impl FnMut(&FatRow, &(), &()) -> Option<FatRow> {
     let rids = if let TransformationFlow::JnToKV { key, value, .. } = flow {
         v2_jn_deconstructor_fat(&Arc::new(key.iter().chain(value.iter()).cloned().collect()))
@@ -481,11 +504,13 @@ pub fn v2_jn_logic_fat(
         panic!("v2_jn_logic_fat: must be a jn flow");
     };
     let compares = flow.compares().clone();
+    let budget = Arc::clone(budget);
 
     move |k, _, _| {
-        if compares
-            .iter()
-            .all(|compare| jn_compare(Some(k), None, None, compare))
+        if !budget.stopped()
+            && compares
+                .iter()
+                .all(|compare| jn_compare(Some(k), None, None, compare, &budget))
         {
             Some(v2_jn_extractor_fat(k, &rids))
         } else {

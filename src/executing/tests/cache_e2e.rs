@@ -1,15 +1,17 @@
 //! End-to-end behaviour of the content-addressed state cache: what a rule edit
 //! invalidates, what it does not, and that cached and clean runs agree.
 
-use clap::Parser;
-use executing::arg::Args;
-use executing::cache::{DiskStore, StrataCache};
-use executing::daemon::{request, serve, DaemonRequest};
-use executing::runner::run_cached;
+use flowlog::cache::CacheRunStats;
+use flowlog::daemon::{request, serve, DaemonRequest, ServiceDefaults};
+use flowlog::engine::{
+    Engine, EngineConfig, EvaluationOptions, EvaluationRequest, Inputs, ProgramSource, Schedule,
+};
+use flowlog::files;
+use parsing::parser::Program;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct TempTree(PathBuf);
@@ -64,30 +66,55 @@ fn program_with(base: &str, step: &str, mark_rule: &str, extra_declarations: &st
     )
 }
 
-fn args(program: &Path, facts: &Path, output: &Path) -> Args {
-    args_with(program, facts, output, &[])
+/// An engine with a 64 MiB memory tier and no disk tier.
+fn memory_engine() -> Arc<Engine> {
+    memory_engine_with(|_| {})
 }
 
-fn args_with(program: &Path, facts: &Path, output: &Path, extra: &[&str]) -> Args {
-    let mut arguments = vec![
-        "executing".to_string(),
-        "--program".to_string(),
-        program.to_str().unwrap().to_string(),
-        "--facts".to_string(),
-        facts.to_str().unwrap().to_string(),
-        "--csvs".to_string(),
-        output.to_str().unwrap().to_string(),
-        "--workers".to_string(),
-        "2".to_string(),
-        "--cache-max-mib".to_string(),
-        "64".to_string(),
-    ];
-    arguments.extend(extra.iter().map(|argument| (*argument).to_string()));
-    Args::parse_from(arguments)
+fn memory_engine_with(adjust: impl FnOnce(&mut EngineConfig)) -> Arc<Engine> {
+    let mut config = EngineConfig {
+        workers: 2,
+        cache_memory_bytes: 64 * 1024 * 1024,
+        ..EngineConfig::default()
+    };
+    adjust(&mut config);
+    Engine::new(config)
 }
 
-fn memory_cache() -> Mutex<StrataCache> {
-    Mutex::new(StrataCache::new(64 * 1024 * 1024))
+/// Evaluate `program` over `facts` through the cache, writing outputs to `output`.
+fn cached(engine: &Engine, program: &Path, facts: &Path, output: &Path) -> CacheRunStats {
+    evaluate(engine, program, facts, output, Some(Schedule::PerStratum), true)
+}
+
+fn evaluate(
+    engine: &Engine,
+    program: &Path,
+    facts: &Path,
+    output: &Path,
+    schedule: Option<Schedule>,
+    cache: bool,
+) -> CacheRunStats {
+    let source = fs::read_to_string(program).unwrap();
+    let name = program.to_string_lossy().to_string();
+    let parsed = Program::parse(&source, &name).unwrap();
+    let result = engine
+        .evaluate(EvaluationRequest {
+            program: ProgramSource::Text { name, source },
+            inputs: Inputs::Directory(facts.to_path_buf()),
+            options: EvaluationOptions {
+                cache: Some(cache),
+                schedule,
+                ..EvaluationOptions::default()
+            },
+        })
+        .unwrap_or_else(|diagnostic| panic!("{diagnostic}"));
+    let states = result
+        .outputs
+        .iter()
+        .map(|(name, state)| (name.clone(), Arc::clone(state)))
+        .collect();
+    files::write_outputs(&parsed, &states, output, b',', engine.symbols()).unwrap();
+    result.stats
 }
 
 fn sorted_rows(path: &Path) -> Vec<String> {
@@ -111,9 +138,9 @@ fn fixture(temp: &TempTree, mark_rule: &str) -> (PathBuf, PathBuf, PathBuf) {
 
 /// Compare every declared output with the uncached, whole-program dataflow,
 /// rather than using another execution of the cache path as the oracle.
-fn assert_clean_outputs(program: &Path, facts: &Path, output: &Path, extra: &[&str]) {
+fn assert_clean_outputs(engine: &Engine, program: &Path, facts: &Path, output: &Path) {
     let clean = output.with_extension("clean");
-    executing::runner::run_once(args_with(program, facts, &clean, extra));
+    evaluate(engine, program, facts, &clean, Some(Schedule::WholeProgram), false);
     let snapshot = |directory: &Path| -> BTreeMap<String, Vec<String>> {
         fs::read_dir(directory.join("csvs"))
             .unwrap()
@@ -155,10 +182,10 @@ fn contribution_fixture(temp: &TempTree) -> (PathBuf, PathBuf) {
 
 #[test]
 fn clause_edits_reuse_contributions_and_deletions_preserve_other_support() {
-    for extra in [vec![], vec!["--fat-mode"]] {
+    for fat_mode in [false, true] {
         let temp = TempTree::new("contribution-edits");
         let (program_path, facts) = contribution_fixture(&temp);
-        let cache = memory_cache();
+        let engine = memory_engine_with(|config| config.fat_mode = fat_mode);
         // Start with two overlapping rules, then add, delete, replace, and
         // respell clauses. Later heads have not previously been cached whole.
         let edits = [
@@ -187,7 +214,7 @@ fn clause_edits_reuse_contributions_and_deletions_preserve_other_support() {
         for (index, (rules, hits, misses, expected)) in edits.into_iter().enumerate() {
             fs::write(&program_path, contribution_program(rules)).unwrap();
             let output = temp.path(&format!("edit-{index}"));
-            let stats = run_cached(args_with(&program_path, &facts, &output, &extra), &cache);
+            let stats = cached(&engine, &program_path, &facts, &output);
             assert_eq!(
                 (stats.contribution_hits, stats.contribution_misses),
                 (hits, misses),
@@ -201,7 +228,7 @@ fn clause_edits_reuse_contributions_and_deletions_preserve_other_support() {
                 );
             }
             assert_eq!(sorted_rows(&output.join("csvs/H.csv")), expected);
-            assert_clean_outputs(&program_path, &facts, &output, &extra);
+            assert_clean_outputs(&engine, &program_path, &facts, &output);
         }
     }
 }
@@ -215,10 +242,10 @@ fn changed_positive_and_negative_inputs_invalidate_only_their_contributions() {
         contribution_program("H(x) :- A(x).\nH(x) :- B(x), !C(x)."),
     )
     .unwrap();
-    let cache = memory_cache();
+    let engine = memory_engine();
     let output = temp.path("initial");
-    run_cached(args(&program_path, &facts, &output), &cache);
-    assert_clean_outputs(&program_path, &facts, &output, &[]);
+    cached(&engine, &program_path, &facts, &output);
+    assert_clean_outputs(&engine, &program_path, &facts, &output);
 
     for (index, (name, rows, expected)) in [
         ("C", "4\n", vec!["1", "2", "3"]), // a negated tuple disappears
@@ -230,7 +257,7 @@ fn changed_positive_and_negative_inputs_invalidate_only_their_contributions() {
     {
         fs::write(facts.join(format!("{name}.facts")), rows).unwrap();
         let output = temp.path(&format!("input-{index}"));
-        let stats = run_cached(args(&program_path, &facts, &output), &cache);
+        let stats = cached(&engine, &program_path, &facts, &output);
         assert_eq!(
             (
                 stats.contribution_hits,
@@ -241,7 +268,7 @@ fn changed_positive_and_negative_inputs_invalidate_only_their_contributions() {
             "{stats:?}"
         );
         assert_eq!(sorted_rows(&output.join("csvs/H.csv")), expected);
-        assert_clean_outputs(&program_path, &facts, &output, &[]);
+        assert_clean_outputs(&engine, &program_path, &facts, &output);
     }
 }
 
@@ -254,29 +281,29 @@ fn a_contribution_does_not_capture_inherited_head_rows() {
         ".decl H(x: number)\n.decl G(x: number)",
     );
     fs::write(&program_path, &source).unwrap();
-    let cache = memory_cache();
-    run_cached(args(&program_path, &facts, &temp.path("initial")), &cache);
+    let engine = memory_engine();
+    cached(&engine, &program_path, &facts, &temp.path("initial"));
 
     // H's earlier state changes, while H <- G's body does not. If that
     // contribution captured the earlier H, the removed 1 would survive.
     fs::write(facts.join("A.facts"), "5\n").unwrap();
     let output = temp.path("replaced-input");
-    let stats = run_cached(args(&program_path, &facts, &output), &cache);
+    let stats = cached(&engine, &program_path, &facts, &output);
     assert_eq!(
         (stats.contribution_hits, stats.contribution_misses),
         (1, 1),
         "{stats:?}"
     );
     assert_eq!(sorted_rows(&output.join("csvs/H.csv")), vec!["2", "3", "5"]);
-    assert_clean_outputs(&program_path, &facts, &output, &[]);
+    assert_clean_outputs(&engine, &program_path, &facts, &output);
 
     // Removing the earlier producer changes the layout, not the contribution.
     fs::write(&program_path, source.replace("H(x) :- A(x).", "")).unwrap();
     let output = temp.path("deleted-producer");
-    let stats = run_cached(args(&program_path, &facts, &output), &cache);
+    let stats = cached(&engine, &program_path, &facts, &output);
     assert_eq!(stats.rules_evaluated, 0, "{stats:?}");
     assert_eq!(sorted_rows(&output.join("csvs/H.csv")), vec!["2", "3"]);
-    assert_clean_outputs(&program_path, &facts, &output, &[]);
+    assert_clean_outputs(&engine, &program_path, &facts, &output);
 }
 
 #[test]
@@ -290,24 +317,24 @@ fn recursive_support_and_aggregate_changes_use_whole_unit_evaluation() {
                 ".decl H(x: number)\n.decl Q(x: number)\n.decl M(x: number)",
             );
     fs::write(&program_path, &source).unwrap();
-    let cache = memory_cache();
+    let engine = memory_engine();
     let output = temp.path("initial");
-    let initial = run_cached(args(&program_path, &facts, &output), &cache);
+    let initial = cached(&engine, &program_path, &facts, &output);
     assert_eq!(
         initial.contribution_misses, 1,
         "only the nonrecursive base clause is split: {initial:?}"
     );
-    assert_clean_outputs(&program_path, &facts, &output, &[]);
+    assert_clean_outputs(&engine, &program_path, &facts, &output);
 
     fs::write(facts.join("A.facts"), "2\n").unwrap();
     let output = temp.path("minimum-removed");
-    run_cached(args(&program_path, &facts, &output), &cache);
+    cached(&engine, &program_path, &facts, &output);
     assert_eq!(sorted_rows(&output.join("csvs/M.csv")), vec!["2"]);
-    assert_clean_outputs(&program_path, &facts, &output, &[]);
+    assert_clean_outputs(&engine, &program_path, &facts, &output);
 
     fs::write(&program_path, source.replace("H(x) :- A(x).", "")).unwrap();
     let output = temp.path("support-removed");
-    let removed = run_cached(args(&program_path, &facts, &output), &cache);
+    let removed = cached(&engine, &program_path, &facts, &output);
     assert_eq!(
         removed.contribution_hits + removed.contribution_misses,
         0,
@@ -320,7 +347,7 @@ fn recursive_support_and_aggregate_changes_use_whole_unit_evaluation() {
     for name in ["H", "Q", "M"] {
         assert!(sorted_rows(&output.join(format!("csvs/{name}.csv"))).is_empty());
     }
-    assert_clean_outputs(&program_path, &facts, &output, &[]);
+    assert_clean_outputs(&engine, &program_path, &facts, &output);
 }
 
 #[test]
@@ -343,19 +370,15 @@ fn sideways_plans_keep_same_head_contributions_separate() {
     let forward = "H(x, z) :- A(x, y), B(y, w), C(w, z).\n";
     let reverse = "H(z, x) :- A(x, y), B(y, w), C(w, z).\n";
     let program_path = temp.path("program.dl");
-    let cache = memory_cache();
-    let extra = ["-O", "3"];
+    let engine = memory_engine_with(|config| config.opt_level = Some(3));
     fs::write(&program_path, format!("{header}{forward}{reverse}")).unwrap();
     let initial_output = temp.path("initial");
-    run_cached(
-        args_with(&program_path, &facts, &initial_output, &extra),
-        &cache,
-    );
-    assert_clean_outputs(&program_path, &facts, &initial_output, &extra);
+    cached(&engine, &program_path, &facts, &initial_output);
+    assert_clean_outputs(&engine, &program_path, &facts, &initial_output);
 
     fs::write(&program_path, format!("{header}{reverse}")).unwrap();
     let output = temp.path("deleted");
-    let stats = run_cached(args_with(&program_path, &facts, &output, &extra), &cache);
+    let stats = cached(&engine, &program_path, &facts, &output);
     assert_eq!(
         (stats.contribution_hits, stats.rules_evaluated),
         (1, 0),
@@ -365,7 +388,7 @@ fn sideways_plans_keep_same_head_contributions_separate() {
         sorted_rows(&output.join("csvs/H.csv")),
         vec!["5,1", "6,1", "6,2"]
     );
-    assert_clean_outputs(&program_path, &facts, &output, &extra);
+    assert_clean_outputs(&engine, &program_path, &facts, &output);
 }
 
 #[test]
@@ -373,8 +396,7 @@ fn native_source_changes_invalidate_only_calling_contributions() {
     let temp = TempTree::new("contribution-native");
     let (program_path, facts) = contribution_fixture(&temp);
     let calls = temp.path("calls");
-    let extra = ["--call-cache", calls.to_str().unwrap()];
-    let cache = memory_cache();
+    let engine = memory_engine_with(|config| config.call_cache = Some(calls.clone()));
     for increment in [1, 2] {
         let source = format!(
             ".code rust\npub fn shift(x: i64) -> i64 {{ x + {increment} }}\n.endcode\n{}",
@@ -382,7 +404,7 @@ fn native_source_changes_invalidate_only_calling_contributions() {
         );
         fs::write(&program_path, source).unwrap();
         let output = temp.path(&format!("native-{increment}"));
-        let stats = run_cached(args_with(&program_path, &facts, &output, &extra), &cache);
+        let stats = cached(&engine, &program_path, &facts, &output);
         if increment == 2 {
             assert_eq!(
                 (stats.contribution_hits, stats.contribution_misses),
@@ -394,7 +416,31 @@ fn native_source_changes_invalidate_only_calling_contributions() {
                 vec!["1", "2", "4", "5"]
             );
         }
-        assert_clean_outputs(&program_path, &facts, &output, &extra);
+        assert_clean_outputs(&engine, &program_path, &facts, &output);
+    }
+}
+
+/// A block no rule of a unit calls into is not part of that unit's key: an
+/// edit to it leaves the unit served.
+#[test]
+fn an_edit_to_an_uncalled_block_invalidates_nothing() {
+    let temp = TempTree::new("uncalled-block");
+    let (program_path, facts) = contribution_fixture(&temp);
+    let calls = temp.path("calls");
+    let engine = memory_engine_with(|config| config.call_cache = Some(calls.clone()));
+    for constant in [10, 20] {
+        let source = format!(
+            ".code rust\npub fn shift(x: i64) -> i64 {{ x + 1 }}\n.endcode\n\
+             .code rust\npub fn other(x: i64) -> i64 {{ x + {constant} }}\n.endcode\n{}",
+            contribution_program("H(x) :- A(x).\nH(y) :- B(x), y = @call(shift, x).")
+        );
+        fs::write(&program_path, source).unwrap();
+        let output = temp.path(&format!("block-{constant}"));
+        let stats = cached(&engine, &program_path, &facts, &output);
+        if constant == 20 {
+            assert_eq!((stats.hits, stats.misses), (1, 0), "{stats:?}");
+        }
+        assert_eq!(sorted_rows(&output.join("csvs/H.csv")), vec!["1", "2", "3", "4"]);
     }
 }
 
@@ -436,7 +482,8 @@ fn one_shot_processes_share_contributions_for_a_new_rule_revision() {
             assert_eq!(stats["rules_evaluated"], 0);
             assert_eq!(sorted_rows(&output.join("csvs/H.csv")), vec!["2", "3"]);
         }
-        assert_clean_outputs(&program_path, &facts, &output, &[]);
+        let engine = memory_engine();
+        assert_clean_outputs(&engine, &program_path, &facts, &output);
     }
 }
 
@@ -445,22 +492,22 @@ fn a_downstream_rule_edit_reuses_the_recursive_upstream_stratum() {
     let temp = TempTree::new("downstream-edit");
     let (program_path, facts, output) = fixture(&temp, "Mark(x) :- Reach(1, x).");
 
-    let cache = memory_cache();
-    let cold = run_cached(args(&program_path, &facts, &output), &cache);
+    let engine = memory_engine();
+    let cold = cached(&engine, &program_path, &facts, &output);
     assert_eq!((cold.hits, cold.misses), (0, 3), "{cold:?}");
     assert_eq!(cold.strata, 3);
 
-    let warm = run_cached(args(&program_path, &facts, &output), &cache);
+    let warm = cached(&engine, &program_path, &facts, &output);
     assert_eq!((warm.hits, warm.misses), (3, 0));
     assert!(warm.rows_loaded > 0);
 
     fs::write(&program_path, program("Mark(x) :- Reach(2, x).")).unwrap();
-    let edited = run_cached(args(&program_path, &facts, &output), &cache);
+    let edited = cached(&engine, &program_path, &facts, &output);
     assert_eq!((edited.hits, edited.misses), (2, 1));
 
     let clean_output = temp.path("clean-output");
-    let clean_cache = memory_cache();
-    let clean = run_cached(args(&program_path, &facts, &clean_output), &clean_cache);
+    let clean_engine = memory_engine();
+    let clean = cached(&clean_engine, &program_path, &facts, &clean_output);
     assert_eq!((clean.hits, clean.misses), (0, 3));
 
     for relation in ["Reach", "Mark"] {
@@ -476,7 +523,7 @@ fn a_downstream_rule_edit_reuses_the_recursive_upstream_stratum() {
     );
 
     fs::write(facts.join("Edge.csv"), "1,2\n2,3\n3,4\n4,5\n").unwrap();
-    let changed_input = run_cached(args(&program_path, &facts, &output), &cache);
+    let changed_input = cached(&engine, &program_path, &facts, &output);
     assert_eq!((changed_input.hits, changed_input.misses), (0, 3));
 }
 
@@ -484,8 +531,8 @@ fn a_downstream_rule_edit_reuses_the_recursive_upstream_stratum() {
 fn a_rule_rewritten_to_mean_the_same_thing_keeps_every_entry() {
     let temp = TempTree::new("respelled");
     let (program_path, facts, output) = fixture(&temp, "Mark(x) :- Reach(1, x).");
-    let cache = memory_cache();
-    let cold = run_cached(args(&program_path, &facts, &output), &cache);
+    let engine = memory_engine();
+    let cold = cached(&engine, &program_path, &facts, &output);
     assert_eq!((cold.hits, cold.misses), (0, 3));
 
     // Renamed variables and a reordered body: the same rules.
@@ -499,7 +546,7 @@ fn a_rule_rewritten_to_mean_the_same_thing_keeps_every_entry() {
         ),
     )
     .unwrap();
-    let respelled = run_cached(args(&program_path, &facts, &output), &cache);
+    let respelled = cached(&engine, &program_path, &facts, &output);
     assert_eq!((respelled.hits, respelled.misses), (3, 0), "{respelled:?}");
 
     // A declaration nothing derives: no unit touches it.
@@ -513,7 +560,7 @@ fn a_rule_rewritten_to_mean_the_same_thing_keeps_every_entry() {
         ),
     )
     .unwrap();
-    let declared = run_cached(args(&program_path, &facts, &output), &cache);
+    let declared = cached(&engine, &program_path, &facts, &output);
     assert_eq!((declared.hits, declared.misses), (3, 0), "{declared:?}");
 }
 
@@ -521,8 +568,8 @@ fn a_rule_rewritten_to_mean_the_same_thing_keeps_every_entry() {
 fn an_upstream_edit_that_leaves_the_rows_unchanged_stops_invalidating_there() {
     let temp = TempTree::new("cutoff");
     let (program_path, facts, output) = fixture(&temp, "Mark(x) :- Reach(1, x).");
-    let cache = memory_cache();
-    run_cached(args(&program_path, &facts, &output), &cache);
+    let engine = memory_engine();
+    cached(&engine, &program_path, &facts, &output);
 
     // A second base rule that derives nothing new: the base unit's rules
     // changed, its rows did not, so the recursion and Mark are served.
@@ -534,9 +581,9 @@ fn an_upstream_edit_that_leaves_the_rows_unchanged_stops_invalidating_there() {
         ),
     )
     .unwrap();
-    let edited = run_cached(args(&program_path, &facts, &output), &cache);
+    let edited = cached(&engine, &program_path, &facts, &output);
     assert_eq!((edited.hits, edited.misses), (2, 1), "{edited:?}");
-    assert_eq!(edited.cutoff_hits, 2, "{edited:?}");
+    assert_eq!(edited.hits_after_miss, 2, "{edited:?}");
     assert_eq!(
         sorted_rows(&output.join("csvs/Mark.csv")),
         vec!["2".to_string(), "3".to_string(), "4".to_string()]
@@ -551,7 +598,7 @@ fn an_upstream_edit_that_leaves_the_rows_unchanged_stops_invalidating_there() {
         ),
     )
     .unwrap();
-    let changed = run_cached(args(&program_path, &facts, &output), &cache);
+    let changed = cached(&engine, &program_path, &facts, &output);
     assert_eq!((changed.hits, changed.misses), (0, 3), "{changed:?}");
     assert!(sorted_rows(&output.join("csvs/Reach.csv")).contains(&"2,1".to_string()));
 }
@@ -562,16 +609,13 @@ fn the_disk_store_serves_a_process_that_never_computed() {
     let (program_path, facts, output) = fixture(&temp, "Mark(x) :- Reach(1, x).");
     let store = temp.path("state-store");
 
-    let first = Mutex::new(
-        StrataCache::new(64 * 1024 * 1024).with_disk(DiskStore::new(store.clone(), 1 << 30)),
-    );
-    let cold = run_cached(args(&program_path, &facts, &output), &first);
+    let first = memory_engine_with(|config| config.cache_dir = Some(store.clone()));
+    let cold = cached(&first, &program_path, &facts, &output);
     assert_eq!((cold.hits, cold.misses, cold.disk_hits), (0, 3, 0));
 
-    let second =
-        Mutex::new(StrataCache::new(64 * 1024 * 1024).with_disk(DiskStore::new(store, 1 << 30)));
+    let second = memory_engine_with(|config| config.cache_dir = Some(store.clone()));
     let other_output = temp.path("other-output");
-    let warm = run_cached(args(&program_path, &facts, &other_output), &second);
+    let warm = cached(&second, &program_path, &facts, &other_output);
     assert_eq!(
         (warm.hits, warm.misses, warm.disk_hits),
         (3, 0, 3),
@@ -588,13 +632,18 @@ fn the_disk_store_serves_a_process_that_never_computed() {
 
     // A one-shot process pointed at the store reads along it too.
     let one_shot_output = temp.path("one-shot-output");
-    let one_shot = args_with(
-        &program_path,
-        &facts,
-        &one_shot_output,
-        &["--cache-dir", temp.path("state-store").to_str().unwrap()],
-    );
-    executing::runner::run_once(one_shot);
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_executing"))
+        .arg("--program")
+        .arg(&program_path)
+        .arg("--facts")
+        .arg(&facts)
+        .arg("--csvs")
+        .arg(&one_shot_output)
+        .arg("--cache-dir")
+        .arg(&store)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     let stats: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(one_shot_output.join("csvs/cache-stats.json")).unwrap(),
     )
@@ -605,14 +654,19 @@ fn the_disk_store_serves_a_process_that_never_computed() {
 }
 
 #[test]
-fn the_daemon_serves_named_paths_concurrently_and_removes_its_socket() {
+fn the_service_serves_named_paths_concurrently_and_removes_its_socket() {
     let temp = TempTree::new("daemon");
     let (program_path, facts, output) = fixture(&temp, "Mark(x) :- Reach(1, x).");
     let socket = temp.path("flowlog.sock");
 
-    let daemon_args = args(&program_path, &facts, &output);
+    let engine = memory_engine();
+    let defaults = ServiceDefaults {
+        program: Some(program_path.clone()),
+        facts: Some(facts.clone()),
+        csvs: Some(output.clone()),
+    };
     let daemon_socket = socket.clone();
-    let daemon = std::thread::spawn(move || serve(daemon_args, daemon_socket));
+    let daemon = std::thread::spawn(move || serve(engine, defaults, daemon_socket));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !socket.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -622,6 +676,7 @@ fn the_daemon_serves_named_paths_concurrently_and_removes_its_socket() {
     let cold = request(&socket, DaemonRequest::reload()).unwrap();
     let cold: serde_json::Value = serde_json::from_str(&cold).unwrap();
     assert_eq!(cold["ok"], true, "{cold}");
+    assert_eq!(cold["version"], 2);
     assert_eq!(cold["run"]["hits"], 0);
     assert_eq!(cold["run"]["misses"], 3);
 
@@ -629,6 +684,7 @@ fn the_daemon_serves_named_paths_concurrently_and_removes_its_socket() {
     let invalid = request(&socket, DaemonRequest::reload()).unwrap();
     let invalid: serde_json::Value = serde_json::from_str(&invalid).unwrap();
     assert_eq!(invalid["ok"], false);
+    assert_eq!(invalid["diagnostic"]["kind"], "parse", "{invalid}");
     assert_eq!(invalid["cache"]["entries"], cold["cache"]["entries"]);
 
     fs::write(&program_path, program("Mark(x) :- Reach(2, x).")).unwrap();
@@ -723,17 +779,11 @@ fn cached_sideways_information_passing_keeps_private_boundaries() {
     )
     .unwrap();
     let output = temp.path("output");
-    let cache = memory_cache();
+    let engine = memory_engine_with(|config| config.opt_level = Some(1));
 
-    let cold = run_cached(
-        args_with(&program_path, &facts, &output, &["-O", "1"]),
-        &cache,
-    );
+    let cold = cached(&engine, &program_path, &facts, &output);
     assert!(cold.misses > 0);
-    let warm = run_cached(
-        args_with(&program_path, &facts, &output, &["-O", "1"]),
-        &cache,
-    );
+    let warm = cached(&engine, &program_path, &facts, &output);
     assert_eq!(warm.misses, 0);
     assert_eq!(warm.hits, cold.misses);
     assert_eq!(
@@ -774,8 +824,8 @@ fn a_head_with_rules_in_two_strata_accumulates_across_them() {
     )
     .unwrap();
     let output = temp.path("output");
-    let cache = memory_cache();
-    let cold = run_cached(args(&program_path, &facts, &output), &cache);
+    let engine = memory_engine();
+    let cold = cached(&engine, &program_path, &facts, &output);
     assert_eq!(cold.misses, cold.units, "{cold:?}");
     assert_eq!(
         sorted_rows(&output.join("csvs/H.csv")),
@@ -785,16 +835,43 @@ fn a_head_with_rules_in_two_strata_accumulates_across_them() {
         sorted_rows(&output.join("csvs/K.csv")),
         vec!["1".to_string(), "2".to_string(), "3".to_string()]
     );
-    let warm = run_cached(args(&program_path, &facts, &output), &cache);
+    let warm = cached(&engine, &program_path, &facts, &output);
     assert_eq!((warm.hits, warm.misses), (cold.units, 0), "{warm:?}");
+    assert_clean_outputs(&engine, &program_path, &facts, &output);
+}
 
-    let clean_output = temp.path("clean-output");
-    executing::runner::run_once(args(&program_path, &facts, &clean_output));
-    for relation in ["G", "H", "K"] {
-        assert_eq!(
-            sorted_rows(&output.join(format!("csvs/{relation}.csv"))),
-            sorted_rows(&clean_output.join(format!("csvs/{relation}.csv"))),
-            "cached and one-shot {relation} outputs differ"
-        );
-    }
+/// A cached state carries the texts of its symbols, so an engine that never
+/// interned them reads them back by name.
+#[test]
+fn a_cached_state_carries_its_symbols_across_engines() {
+    let temp = TempTree::new("symbols-cached");
+    let facts = temp.path("facts");
+    fs::create_dir_all(&facts).unwrap();
+    fs::write(facts.join("Named.facts"), "main,1\nhelper,2\n").unwrap();
+    let program_path = temp.path("program.dl");
+    fs::write(
+        &program_path,
+        ".in\n\
+         .decl Named(name: symbol, k: number)\n\
+         .input Named.facts\n\
+         .printsize\n\
+         .decl Out(name: symbol)\n\
+         .rule\n\
+         Out(n) :- Named(n, k), k > 1.\n",
+    )
+    .unwrap();
+    let store = temp.path("state-store");
+    let first = memory_engine_with(|config| config.cache_dir = Some(store.clone()));
+    let output = temp.path("first");
+    let cold = cached(&first, &program_path, &facts, &output);
+    assert_eq!(cold.misses, 1);
+    assert_eq!(sorted_rows(&output.join("csvs/Out.csv")), vec!["helper"]);
+
+    // The second engine's inputs intern the same texts; the cached Out is
+    // served and written by name.
+    let second = memory_engine_with(|config| config.cache_dir = Some(store.clone()));
+    let other = temp.path("second");
+    let warm = cached(&second, &program_path, &facts, &other);
+    assert_eq!((warm.hits, warm.disk_hits), (1, 1), "{warm:?}");
+    assert_eq!(sorted_rows(&other.join("csvs/Out.csv")), vec!["helper"]);
 }

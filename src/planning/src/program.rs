@@ -231,7 +231,6 @@ pub fn plan_rules(
         .iter()
         .flat_map(|&rule| {
             let catalog = Catalog::from_strata(rule);
-            let has_calls = !catalog.call_predicates().is_empty();
             let (requested_sip, is_planning) = if catalog
                 .is_core_atom_bitmap()
                 .into_iter()
@@ -246,10 +245,10 @@ pub fn plan_rules(
             } else {
                 (false, false)
             };
-            // SIP rewrites rule bodies and heads. Keep embedded calls
-            // attached to their original rule until SIP has a typed
-            // representation for them.
-            let is_sip = requested_sip && !has_calls;
+            // Sideways passing rewrites the relational body; the row program
+            // (calls, computed comparisons, head expressions) stays attached to
+            // the final rule the rewrite produces.
+            let is_sip = requested_sip;
 
             if is_sip { any_sip = true; } // mark if any rule uses sip in a stratum
 

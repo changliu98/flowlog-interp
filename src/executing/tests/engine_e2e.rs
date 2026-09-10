@@ -168,7 +168,7 @@ X(a, i) :- W(a, b, c, d, e, f, g, h, i).
     let execution = run(&temp, &program, &[]);
     assert_success(&execution);
     assert!(
-        String::from_utf8_lossy(&execution.stdout).contains("Fat mode automatically enabled"),
+        String::from_utf8_lossy(&execution.stderr).contains("Fat mode automatically enabled"),
         "the wide relation should have switched the program to fat rows",
     );
 
@@ -369,7 +369,7 @@ Out(k, a1, a2, a3, a4, a5, b1) :- A(k, a1, a2, a3, a4, a5), B(k, b1).
     let execution = run(&temp, &program, &[]);
     assert_success(&execution);
     assert!(
-        String::from_utf8_lossy(&execution.stdout).contains("Fat mode automatically enabled"),
+        String::from_utf8_lossy(&execution.stderr).contains("Fat mode automatically enabled"),
         "a (1, 5) key/value split has no fixed-size arm and must be planned onto fat rows",
     );
     assert_eq!(
@@ -768,10 +768,10 @@ H(x, y, z) :- H(x, w, q), A(w, v), B(v, y), C(z).
     }
 }
 
-/// The head checks are unit-tested in `parsing::validate`; this asserts that
-/// the binary reaches them, before it reads a fact or assembles a dataflow.
+/// Head constants and head arithmetic are row programs: the relational plan
+/// projects what they read and the program writes the head.
 #[test]
-fn a_head_the_engine_cannot_evaluate_refuses_the_run() {
+fn a_head_constant_and_head_arithmetic_are_evaluated() {
     let temp = TempTree::new("head-constant");
     let program = temp.program(
         ".in
@@ -779,20 +779,46 @@ fn a_head_the_engine_cannot_evaluate_refuses_the_run() {
 .input E.facts
 .printsize
 .decl R(k: number, v: number)
+.decl S(s: number, k: number)
 .rule
 R(k, 7) :- E(k, v).
+S(k + v * 2, k) :- E(k, v).
 ",
     );
     temp.facts("E", "1,2\n3,4\n");
 
-    assert_refused(
-        &run(&temp, &program, &[]),
-        "head constants and head arithmetic are not supported",
+    assert_success(&run(&temp, &program, &[]));
+    assert_eq!(rows(&temp.output("R")), vec![vec![1, 7], vec![3, 7]]);
+    // left-to-right arithmetic: (k + v) * 2
+    assert_eq!(rows(&temp.output("S")), vec![vec![6, 1], vec![14, 3]]);
+}
+
+/// The validation checks are unit-tested in `parsing::validate`; this asserts
+/// that the binary reaches them, before it reads a fact or assembles a
+/// dataflow, and reports them as a located diagnostic.
+#[test]
+fn a_rule_the_engine_cannot_evaluate_refuses_the_run_with_a_location() {
+    let temp = TempTree::new("unbound-head");
+    let program = temp.program(
+        ".in
+.decl E(k: number, v: number)
+.input E.facts
+.printsize
+.decl R(k: number, v: number)
+.rule
+R(k, j) :- E(k, v).
+",
     );
+    temp.facts("E", "1,2\n3,4\n");
+
+    let execution = run(&temp, &program, &[]);
+    assert_refused(&execution, "emits unbound head variable");
+    assert_refused(&execution, "validation error");
+    assert_refused(&execution, "program.dl:7");
 }
 
 #[test]
-fn a_string_column_refuses_the_run() {
+fn a_string_column_is_a_symbol_column() {
     let temp = TempTree::new("string-column");
     let program = temp.program(
         ".in
@@ -800,16 +826,23 @@ fn a_string_column_refuses_the_run() {
 .input E.facts
 .printsize
 .decl R(k: number)
+.decl N(v: symbol, k: number)
 .rule
-R(k) :- E(k, v).
+R(k) :- E(k, v), v = \"hello\".
+N(v, k) :- E(k, v).
 ",
     );
     temp.facts("E", "1,hello\n2,world\n");
 
-    assert_refused(
-        &run(&temp, &program, &[]),
-        "string columns are not implemented",
-    );
+    assert_success(&run(&temp, &program, &[]));
+    assert_eq!(rows(&temp.output("R")), vec![vec![1]]);
+    let mut written = fs::read_to_string(temp.output("N"))
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    written.sort();
+    assert_eq!(written, vec!["hello,1", "world,2"]);
 }
 
 #[test]

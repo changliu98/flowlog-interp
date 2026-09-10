@@ -6,8 +6,9 @@ use macros::codegen_min_optimize;
 #[cfg(not(feature = "isize-type"))]
 use parsing::aggregation::AggregationOperator;
 use planning::collections::CollectionSignature;
+use planning::strata::GroupStrataQueryPlan;
 use reading::inspect::printsize_generic;
-use reading::rel::{row_chop, Rel};
+use reading::rel::Rel;
 #[cfg(not(feature = "isize-type"))]
 use reading::row::*;
 
@@ -119,7 +120,7 @@ pub fn non_recursive_collector<G>(
 }
 
 pub fn recursive_collector<G>(
-    last_signatures_map: &HashMap<Arc<CollectionSignature>, Vec<Arc<CollectionSignature>>>,
+    group_plan: &GroupStrataQueryPlan,
     nest_row_map: &HashMap<Arc<CollectionSignature>, Arc<Rel<G>>>,
     variables_next_map: &mut HashMap<Arc<CollectionSignature>, Arc<Rel<G>>>,
     idb_catalogs: &HashMap<String, AggregationHeadIDB>,
@@ -127,15 +128,14 @@ pub fn recursive_collector<G>(
     G: timely::dataflow::scopes::Scope,
     G::Timestamp: Lattice + TotalOrder,
 {
-    for (head_signature, last_signatures) in last_signatures_map
+    for (head_signature, last_signatures) in group_plan
+        .last_signatures_map()
         .iter()
         .sorted_by_key(|(signature, _)| signature.name())
     {
-        // (sideways) jump over sip rules
-        // We do not collect sip rules in the collector, we store them in the next row map
-        // TODO: temporarily way to avoid sip rule, need carefully refactor
-        // to avoid this in the future
-        if head_signature.name().contains("_sip") {
+        // A sideways slice is read by later rules of the group through the
+        // nested row map; it is not an iterative variable of the scope.
+        if group_plan.is_sideways_head(head_signature.name()) {
             continue;
         }
 

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use parsing::diagnostic::{Diagnostic, Location, Result};
 use parsing::parser::Program;
 use parsing::rule::FLRule;
 use crate::dependencies::DependencyGraph;
@@ -105,8 +106,14 @@ impl Strata {
         }
     }
     
-    /* main entry */
+    /* main entry, refusing by panic */
     pub fn from_parser(program: Program) -> Self {
+        Self::try_from_parser(program).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Stratify a program, or refuse it: negation through recursion has no
+    /// stratum order to evaluate.
+    pub fn try_from_parser(program: Program) -> Result<Self> {
         // Kosaraju's: find sccs (https://www.youtube.com/watch?v=QlGuaHT1lzA)
         let dependency_graph = DependencyGraph::from_parser(&program);
         let rule_dependency_map = &dependency_graph.rule_dependency_map(); // e.g. rule_dependency_map: {0: {}, 1: {1, 0}, 2: {1, 0}}
@@ -163,13 +170,17 @@ impl Strata {
                 if stratum_index == scc_index_by_rule[dependency_id]
                     && is_recursive_strata_bitmap[stratum_index]
                 {
-                    panic!(
+                    let rule = &program.rules()[rule_id];
+                    let dependency = &program.rules()[dependency_id];
+                    return Err(Diagnostic::stratification(format!(
                         "program is not stratifiable: rule {rule_id} negates rule \
                          {dependency_id} in the same recursive stratum\nrule {rule_id}: \
-                         {}\nrule {dependency_id}: {}",
-                        program.rules()[rule_id],
-                        program.rules()[dependency_id],
-                    );
+                         {rule}\nrule {dependency_id}: {dependency}"
+                    ))
+                    .with_rule(rule)
+                    .with_location(Location::new(program.name(), rule.line(), 0))
+                    .with_relation(rule.head().name().clone())
+                    .with_relation(dependency.head().name().clone()));
                 }
             }
         }
@@ -233,14 +244,14 @@ impl Strata {
         // debug!("merged strata: {:?}", mergers);
         // --------------------------------------------------------------------------- //
             
-        Self {
+        Ok(Self {
             fl_program: program,
             dependency_graph,
             // sccs: rule_sccs,
             // sccs_order,
             strata: mergers, // strata,
             is_recursive_strata_bitmap: is_recursive_merger_bitmap, // is_recursive_strata_bitmap,
-        }
+        })
     }
     
     /* fetch the strata */

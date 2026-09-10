@@ -16,6 +16,7 @@ use timely::dataflow::Scope;
 use timely::order::TotalOrder;
 use differential_dataflow::Data;
 use macros::*;
+use crate::accounting::Budget;
 use crate::jn::*;
 
 /// The Cartesian product of two relations, over fat rows.
@@ -27,6 +28,7 @@ fn cartesian_fat_rows<G>(
     rel_0: &VecCollection<G, FatRow, Semiring>,
     rel_1: &VecCollection<G, FatRow, Semiring>,
     flow: &TransformationFlow,
+    budget: &Arc<Budget>,
 ) -> VecCollection<G, FatRow, Semiring>
 where
     G: Scope,
@@ -35,7 +37,7 @@ where
     use differential_dataflow::operators::arrange::ArrangeByKey;
     rel_0.map(|row| ((), row)).arrange_by_key().join_core(
         &rel_1.map(|row| ((), row)).arrange_by_key(),
-        cartesian_logic_fat(flow),
+        cartesian_logic_fat(flow, budget),
     )
 }
 
@@ -46,7 +48,8 @@ pub fn cartesian<G>(
     iv0: usize,
     iv1: usize,
     target: usize,
-    flow: &TransformationFlow
+    flow: &TransformationFlow,
+    budget: &Arc<Budget>,
 ) -> Arc<Rel<G>> 
 where 
     G: timely::dataflow::scopes::Scope,
@@ -67,7 +70,8 @@ pub fn kv_jn_kv<G>(
     iv0: usize,
     iv1: usize,
     target: usize,
-    flow: &TransformationFlow
+    flow: &TransformationFlow,
+    budget: &Arc<Budget>,
 ) -> Arc<Rel<G>> 
 where 
     G: timely::dataflow::scopes::Scope,
@@ -88,7 +92,8 @@ pub fn kv_jn_k<G>(
     iv0: usize,
     iv1: usize,
     target: usize,
-    flow: &TransformationFlow
+    flow: &TransformationFlow,
+    budget: &Arc<Budget>,
 ) -> Arc<Rel<G>> 
 where 
     G: timely::dataflow::scopes::Scope,
@@ -109,7 +114,8 @@ pub fn k_jn_k<G>(
     iv0: usize,
     iv1: usize,
     target: usize,
-    flow: &TransformationFlow
+    flow: &TransformationFlow,
+    budget: &Arc<Budget>,
 ) -> Arc<Rel<G>> 
 where 
     G: timely::dataflow::scopes::Scope,
@@ -131,7 +137,8 @@ pub fn kv_aj_k<G>(
     iv0: usize,
     iv1: usize,
     target: usize,
-    flow: &TransformationFlow
+    flow: &TransformationFlow,
+    budget: &Arc<Budget>,
 ) -> Arc<Rel<G>> 
 where 
     G: timely::dataflow::scopes::Scope,
@@ -146,6 +153,7 @@ where
     }
     let (_, dict_0) = kv_map.get(large).expect("dict for kv aj k");
     let (_, set_1) = k_map.get(small).expect("set for kv aj k");
+    let _ = budget;
 
     Arc::new(codegen_kv_antijoin!())
 }
@@ -159,7 +167,8 @@ pub fn k_aj_k<G>(
     iv0: usize,
     iv1: usize,
     target: usize,
-    flow: &TransformationFlow
+    flow: &TransformationFlow,
+    budget: &Arc<Budget>,
 ) -> Arc<Rel<G>> 
 where 
     G: timely::dataflow::scopes::Scope,
@@ -174,6 +183,7 @@ where
     }
     let (_, set_0) = k_map.get(large).expect("0 for k aj k");
     let (_, set_1) = k_map.get(small).expect("1 for k aj k");
+    let _ = budget;
 
     Arc::new(codegen_k_antijoin!())
 }

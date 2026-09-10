@@ -4,7 +4,7 @@ use catalog::compare::ComparisonExprPos;
 use parsing::rule::Const;
 use catalog::atoms::{AtomArgumentSignature, AtomSignature};
 use crate::collections::{Collection, CollectionSignature};
-use crate::calls::CallProjection;
+use crate::calls::RowProgram;
 // use crate::compare::ComparisonExprArgument;
 use crate::flow::TransformationFlow;
 
@@ -19,11 +19,13 @@ use crate::flow::TransformationFlow;
 */
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub enum Transformation {
-    /// Pure embedded Rust calls and the final head projection for one rule.
-    CallRowToRow {
+    /// The row program of one rule: calls, computed comparisons, head
+    /// arithmetic and constants, and the head projection, over the row the
+    /// relational plan produced.
+    Compute {
         input: Arc<Collection>,
         output: Arc<Collection>,
-        projection: CallProjection,
+        program: RowProgram,
     },
 
     /* direct truncate or filtering, e.g. tc(x, y) :- arc(x, y, _) */
@@ -113,7 +115,7 @@ pub enum Transformation {
 impl Transformation {
     pub fn unary(&self) -> &Arc<Collection> {
         match self {
-            Self::CallRowToRow { input, .. } => input,
+            Self::Compute { input, .. } => input,
             Self::RowToRow { input, .. } => input,
             Self::RowToKv { input, .. } => input,
             Self::RowToK { input, .. } => input,
@@ -124,7 +126,7 @@ impl Transformation {
 
     pub fn is_unary(&self) -> bool {
         match self {
-            Self::CallRowToRow { .. } => true,
+            Self::Compute { .. } => true,
             Self::RowToRow { .. } => true,
             Self::RowToKv { .. } => true,
             Self::RowToK { .. } => true,
@@ -147,7 +149,7 @@ impl Transformation {
 
     pub fn output(&self) -> &Arc<Collection> {
         match self {
-            Self::CallRowToRow { output, .. } => output,
+            Self::Compute { output, .. } => output,
             Self::RowToRow { output, .. } => output,
             Self::RowToKv { output, .. } => output,
             Self::RowToK { output, .. } => output,
@@ -169,8 +171,8 @@ impl Transformation {
 
     pub fn flow(&self) -> &TransformationFlow {
         match self {
-            Self::CallRowToRow { .. } => {
-                panic!("Transformation::flow() called on an embedded call projection")
+            Self::Compute { .. } => {
+                panic!("Transformation::flow() called on a row program")
             }
             Self::RowToRow { flow, .. } => flow,
             Self::RowToKv { flow, .. } => flow,
@@ -259,33 +261,29 @@ impl Transformation {
         }
     }
 
-    pub fn call_projection(input: Arc<Collection>, projection: CallProjection) -> Self {
+    pub fn compute(input: Arc<Collection>, program: RowProgram) -> Self {
         assert!(
             input.key_argument_signatures().is_empty(),
-            "embedded calls must run over a row collection"
-        );
-        assert!(
-            !projection.head().is_empty(),
-            "embedded call projection must emit a non-empty head"
+            "a row program runs over a row collection"
         );
 
-        let output_value_signatures = (0..projection.head().len())
+        let output_value_signatures = (0..program.head().len())
             .map(|argument_id| {
                 AtomArgumentSignature::new(AtomSignature::new(true, usize::MAX), argument_id)
             })
             .collect::<Vec<_>>();
         let output = Arc::new(Collection::new(
             CollectionSignature::UnaryTransformationOutput {
-                name: format!("Call({}){}", input.signature().name(), projection),
+                name: format!("Compute({}){}", input.signature().name(), program),
             },
             &vec![],
             &output_value_signatures,
         ));
 
-        Self::CallRowToRow {
+        Self::Compute {
             input,
             output,
-            projection,
+            program,
         }
     }
 
@@ -390,11 +388,11 @@ impl Transformation {
 impl fmt::Display for Transformation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CallRowToRow {
+            Self::Compute {
                 output,
-                projection,
+                program,
                 ..
-            } => write!(f, "@ {} {}", projection, output.pprint()),
+            } => write!(f, "@ {} {}", program, output.pprint()),
             Self::RowToRow { output, is_no_op, .. } => {
                 write!(
                     f,

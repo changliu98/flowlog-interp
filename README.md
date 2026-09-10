@@ -182,18 +182,49 @@ states, captured at their heads, and stored.  An upstream edit that leaves a
 relation's rows unchanged therefore stops invalidating there, and an
 unrelated declaration or clause elsewhere in the program touches nothing.
 
-Each command returns one JSON object with hits, misses, disk hits, hits that
-followed a miss (`cutoff_hits`, the reuse an identity-keyed cache would have
-lost), loaded and captured row counts, and resident memory; a cached one-shot
-run writes the same object to `<csvs>/csvs/cache-stats.json`.
+An exact unit miss for a non-recursive, nonaggregate head first looks up each
+distinct canonical rule's contribution in the same store. Each contribution
+contains only that rule's output, keyed by its body inputs and a separate
+contribution tag. The head is the set union of its active contributions and
+any rows inherited from earlier strata. Adding or replacing a clause therefore
+reuses unchanged clauses; deleting one preserves tuples still supported by
+another clause or by inherited rows. Missing contributions use isolated
+relation maps in the stratum's dataflow, so same-head rules cannot contaminate
+one another. A union whose contributions all hit needs no dataflow.
 
-This is a materialized-state cache, not mutable dataflow topology.  A missed
-unit is recomputed whole, every reload re-parses the program and re-reads the
-fact files, and correctness never depends on a hit.  The in-memory layer is
-process-local and LRU-bounded by estimated bytes; the on-disk store is one
-file per unit version, written whole (temporary file, then rename), verified
-against its digest on every read, and swept by access time when it exceeds
-its budget.  Cache-mode planning avoids cross-stratum intermediate sharing so
+Each command returns one JSON object with unit hits, misses, disk hits, hits
+after any earlier unit miss (`cutoff_hits`, which includes independent units),
+loaded and captured row counts, and resident memory. `contribution_hits`,
+`contribution_misses`, and `contribution_disk_hits` count rule lookups inside
+missed ordinary units; `contribution_rows_loaded` and
+`contribution_rows_cached` count their rows separately from whole-unit rows.
+`rules_evaluated` counts source rules assembled for missing computations,
+before SIP expansion. A cached one-shot run writes the same object to
+`<csvs>/csvs/cache-stats.json`.
+
+`total_micros` measures the complete native run. `planning_micros`,
+`execution_micros`, `cache_micros`, and `output_micros` separate preparation,
+dataflow computation, cache bookkeeping, and output. `disk_sweep_micros` is
+the cleanup portion of cache time; `disk_sweeps`, `disk_sweep_skips`,
+`disk_files_examined`, `disk_files_removed`, and `disk_bytes_removed` describe
+the cleanup work. These are per-run counters, including in daemon mode.
+
+This reuses materialized rule contributions, without retaining dataflow
+topology or incrementally updating recursive fixed points. A missed recursive
+or aggregate unit is recomputed whole. Every reload re-parses and re-stratifies
+the program and re-reads the fact files; correctness never depends on a hit.
+The in-memory layer is process-local and LRU-bounded by estimated bytes;
+complete units and contributions share the same store and budget. Each entry
+is written whole (temporary file, then rename), verified
+against its digest on every read. Cleanup uses a nonblocking file lock shared
+by all processes using the directory. At most one cleanup slice starts each
+second: it lists one of the 256 existing hash shards and examines metadata
+for at most 4,096 entries. A persisted cursor advances across entries and
+shards; other processes skip maintenance without waiting. Per-shard byte
+estimates enforce the disk budget incrementally, evicting by access time
+within the current slice. The budget is approximate between visits, and
+existing state files remain readable without migration or a cache reset.
+Cache-mode planning avoids cross-stratum intermediate sharing so
 that relation states form complete reuse boundaries.
 
 ---

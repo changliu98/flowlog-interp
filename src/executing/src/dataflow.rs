@@ -647,27 +647,38 @@ pub fn program_execution(
     }
 }
 
-/// The missed units of one stratum, in one dataflow.
-///
-/// Every relation the units read is injected from its state, each unit's
-/// groups are assembled in turn, and each head is captured right after its
-/// unit -- so a head that several units of the stratum add rows to is captured
-/// as each unit leaves it, not as the stratum leaves it.  Units of one stratum
-/// are independent, so assembling them together changes nothing but the count
-/// of dataflows.
-pub fn stratum_execution(
+/// A missing whole unit or individual rule contribution. Its input map is the
+/// complete boundary: a contribution does not inherit its head's earlier rows.
+pub(crate) struct StratumComputation {
+    pub groups: Vec<GroupStrataQueryPlan>,
+    pub inputs: BTreeMap<String, Arc<RelationState>>,
+    pub captures: BTreeMap<String, MaterializedUpdates>,
+}
+
+/// The missing computations of one stratum, in one dataflow. Input collections
+/// are shared, but each computation has its own relation and arrangement maps:
+/// two rules contributing to the same head must not capture each other's rows.
+pub(crate) fn stratum_execution(
     args: &Args,
-    units: Vec<Vec<GroupStrataQueryPlan>>,
-    inputs: BTreeMap<String, Arc<RelationState>>,
-    captures: Vec<BTreeMap<String, MaterializedUpdates>>,
+    computations: Vec<StratumComputation>,
     fat_mode: bool,
     idb_map: Arc<HashMap<String, AggregationHeadIDB>>,
     native_calls: Option<Arc<NativeCallModule>>,
 ) {
     let timely_args = args.timely_args();
-    let units = Arc::new(units);
+    let mut inputs = BTreeMap::new();
+    for computation in &computations {
+        for (name, state) in &computation.inputs {
+            if let Some(previous) = inputs.insert(name.clone(), Arc::clone(state)) {
+                assert_eq!(
+                    previous.digest, state.digest,
+                    "inconsistent stratum input {name}"
+                );
+            }
+        }
+    }
+    let computations = Arc::new(computations);
     let inputs = Arc::new(inputs);
-    let captures = Arc::new(captures);
 
     let guards = timely::execute_from_args(timely_args.into_iter(), move |worker| {
         let peers = worker.peers();
@@ -675,21 +686,31 @@ pub fn stratum_execution(
 
         let mut sessions = worker.dataflow::<Time, _, _>(|scope| {
             let mut sessions = Vec::new();
-            let mut row_map: RowMap<_> = HashMap::new();
-            let mut kv_map: KvMap<_> = HashMap::new();
-            let mut k_map: KMap<_> = HashMap::new();
+            let mut input_map: RowMap<_> = HashMap::new();
 
             for (name, state) in inputs.iter() {
-                let (session, input_rel) = construct_session_and_table(scope, state.arity, fat_mode);
-                row_map.insert(
+                let (session, input_rel) =
+                    construct_session_and_table(scope, state.arity, fat_mode);
+                input_map.insert(
                     Arc::new(CollectionSignature::new_atom(name)),
                     Arc::new(input_rel),
                 );
                 sessions.push((session, Arc::clone(&state.rows)));
             }
 
-            for (unit, unit_captures) in units.iter().zip(captures.iter()) {
-                for group_plan in unit {
+            for computation in computations.iter() {
+                let mut row_map: RowMap<_> = computation
+                    .inputs
+                    .keys()
+                    .map(|name| {
+                        let signature = Arc::new(CollectionSignature::new_atom(name));
+                        let relation = Arc::clone(&input_map[&signature]);
+                        (signature, relation)
+                    })
+                    .collect();
+                let mut kv_map: KvMap<_> = HashMap::new();
+                let mut k_map: KMap<_> = HashMap::new();
+                for group_plan in &computation.groups {
                     assemble_group(
                         scope,
                         group_plan,
@@ -701,7 +722,7 @@ pub fn stratum_execution(
                         &idb_map,
                     );
                 }
-                for (name, updates) in unit_captures {
+                for (name, updates) in &computation.captures {
                     let signature = Arc::new(CollectionSignature::new_atom(name));
                     let relation = row_map.get(&signature).unwrap_or_else(|| {
                         panic!("state boundary relation {name} is absent after its unit")
@@ -725,7 +746,8 @@ pub fn stratum_execution(
         while worker.step() {
             // spinning
         }
-    }).expect("execute_from_args dies");
+    })
+    .expect("execute_from_args dies");
 
     for result in guards.join() {
         result.expect("timely worker panicked");

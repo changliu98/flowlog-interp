@@ -55,7 +55,7 @@ pub struct Args {
     #[arg(long)]
     cache_dir: Option<PathBuf>,
 
-    /// maximum disk retained under --cache-dir, swept by access time
+    /// approximate disk budget under --cache-dir, enforced by shared incremental cleanup
     #[arg(long, default_value_t = 32768)]
     cache_disk_max_mib: usize,
 }
@@ -75,7 +75,7 @@ impl Args {
 
     pub fn fact_name(&self) -> String {
         std::path::Path::new(&self.facts)
-            .file_name()                    
+            .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown_fact")
             .to_string()

@@ -10,6 +10,9 @@
 //! edit that leaves a relation's rows unchanged therefore stops invalidating
 //! there, a rule rewritten to mean the same thing keeps its entries, and an
 //! unrelated declaration or clause elsewhere in the program touches nothing.
+//! On an ordinary non-recursive unit miss, individual rule contributions can
+//! be reused from this same store before assembling the head's set union.
+//! Contribution keys exclude inherited head rows and have their own domain.
 //!
 //! The cache is two layers with one key: a process-resident LRU bounded by
 //! estimated bytes, and an optional on-disk store shared by every process that
@@ -24,19 +27,23 @@ use parsing::parser::Program;
 use parsing::rule::{FLRule, Predicate};
 use parsing::Val;
 use reading::SEMIRING_TYPE;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
+use std::ops::AddAssign;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CACHE_ABI: &str = "flowlog-interp/state-cache/v2";
 const STATE_MAGIC: &[u8; 8] = b"FLSTATE2";
 const DISK_SWEEP_EVERY: usize = 64;
+const DISK_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+const DISK_SWEEP_BATCH: usize = 4096;
+const DISK_SHARDS: usize = 256;
 
 // ------------------------------------------------------------------ states
 
@@ -243,7 +250,11 @@ pub fn unit_key(
     hasher.add(SEMIRING_TYPE);
     hasher.add(&canonical_rules(&unit.rules));
 
-    let mut touched = unit.heads.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut touched = unit
+        .heads
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
     touched.extend(inputs.keys().map(String::as_str));
     for name in touched {
         hasher.add(&declaration_form(name, declarations));
@@ -256,13 +267,35 @@ pub fn unit_key(
     });
     if calls {
         hasher.add("embedded-rust");
-        hasher.add(program.embedded_rust().map_or("", |embedded| embedded.source()));
+        hasher.add(
+            program
+                .embedded_rust()
+                .map_or("", |embedded| embedded.source()),
+        );
     }
 
     for (name, state) in inputs {
         hasher.add(name);
         hasher.add_bytes(&state.digest);
     }
+    hasher.finish()
+}
+
+/// One ordinary non-recursive rule's output, before union with an inherited
+/// head or any other rule. `inputs` contains only the rule's body relations.
+/// Keep this namespace separate from complete unit states, including entries
+/// written by engines that predate contribution reuse.
+pub fn contribution_key(
+    unit: &Unit<'_>,
+    inputs: &BTreeMap<String, Arc<RelationState>>,
+    declarations: &HashMap<&str, &RelDecl>,
+    program: &Program,
+) -> String {
+    assert!(!unit.recursive && unit.rules.len() == 1);
+    assert!(unit.heads.keys().all(|head| !inputs.contains_key(head)));
+    let mut hasher = KeyHasher::new();
+    hasher.add("flowlog-interp/rule-contribution/v1");
+    hasher.add(&unit_key(unit, inputs, declarations, program));
     hasher.finish()
 }
 
@@ -293,19 +326,52 @@ pub struct CacheRunStats {
     pub misses: usize,
     /// Hits served from the on-disk store rather than process memory.
     pub disk_hits: usize,
-    /// Hits that followed a miss in the same run: units whose inputs an
-    /// upstream recomputation left unchanged.  Identity-keyed caching loses
-    /// exactly these.
+    /// Unit hits after any earlier unit miss in the same run. This includes
+    /// independent units, so it is not a causal count of early cutoff.
     pub cutoff_hits: usize,
+    /// Individual rule lookups, performed only after an ordinary unit miss.
+    pub contribution_hits: usize,
+    pub contribution_misses: usize,
+    pub contribution_disk_hits: usize,
+    pub contribution_rows_loaded: usize,
+    pub contribution_rows_cached: usize,
+    /// Source rules assembled for missing computations (before SIP expansion).
+    pub rules_evaluated: usize,
     pub rows_loaded: usize,
     pub rows_cached: usize,
     pub planning_micros: u64,
     pub execution_micros: u64,
+    /// Key construction, lookups, unions, storage and maintenance; not dataflow.
+    pub cache_micros: u64,
+    pub output_micros: u64,
     pub total_micros: u64,
+    #[serde(flatten)]
+    pub disk: DiskSweepStats,
     pub entries: usize,
     pub resident_rows: usize,
     pub resident_bytes: usize,
     pub max_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct DiskSweepStats {
+    pub disk_sweep_micros: u64,
+    pub disk_sweeps: usize,
+    pub disk_sweep_skips: usize,
+    pub disk_files_examined: usize,
+    pub disk_files_removed: usize,
+    pub disk_bytes_removed: u64,
+}
+
+impl AddAssign for DiskSweepStats {
+    fn add_assign(&mut self, other: Self) {
+        self.disk_sweep_micros += other.disk_sweep_micros;
+        self.disk_sweeps += other.disk_sweeps;
+        self.disk_sweep_skips += other.disk_sweep_skips;
+        self.disk_files_examined += other.disk_files_examined;
+        self.disk_files_removed += other.disk_files_removed;
+        self.disk_bytes_removed += other.disk_bytes_removed;
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -359,9 +425,10 @@ impl StrataCache {
     pub fn from_args(args: &crate::arg::Args) -> Self {
         let cache = Self::new(args.cache_max_bytes());
         match args.cache_dir() {
-            Some(directory) => {
-                cache.with_disk(DiskStore::new(directory.to_path_buf(), args.cache_disk_max_bytes()))
-            }
+            Some(directory) => cache.with_disk(DiskStore::new(
+                directory.to_path_buf(),
+                args.cache_disk_max_bytes(),
+            )),
             None => cache,
         }
     }
@@ -403,11 +470,14 @@ impl StrataCache {
 
     /// Record a unit's states: on disk when a store is configured, and in
     /// memory when the entry fits the budget.
-    pub fn insert(&mut self, key: String, entry: Arc<CacheEntry>) {
-        if let Some(disk) = self.disk.as_mut() {
-            disk.put(&key, &entry);
-        }
+    pub fn insert(&mut self, key: String, entry: Arc<CacheEntry>) -> DiskSweepStats {
+        let maintenance = self
+            .disk
+            .as_mut()
+            .map(|disk| disk.put(&key, &entry))
+            .unwrap_or_default();
         self.retain(key, entry);
+        maintenance
     }
 
     fn retain(&mut self, key: String, entry: Arc<CacheEntry>) {
@@ -453,6 +523,33 @@ pub struct DiskStore {
     root: PathBuf,
     max_bytes: u64,
     writes_since_sweep: usize,
+    next_sweep_check: Instant,
+}
+
+/// Approximate accounting and a resumable cursor, under one stable lock inode.
+/// A partial/corrupt record only loses cache accounting: entry validity and
+/// query results never depend on it, and later slices rebuild the estimates.
+#[derive(Debug, Serialize, Deserialize)]
+struct DiskSweepState {
+    version: u32,
+    last_started_millis: u64,
+    shard: usize,
+    after: String,
+    scanned_bytes: u64,
+    shard_bytes: Vec<u64>,
+}
+
+impl Default for DiskSweepState {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            last_started_millis: 0,
+            shard: 0,
+            after: String::new(),
+            scanned_bytes: 0,
+            shard_bytes: vec![0; DISK_SHARDS],
+        }
+    }
 }
 
 impl DiskStore {
@@ -461,6 +558,7 @@ impl DiskStore {
             root,
             max_bytes,
             writes_since_sweep: 0,
+            next_sweep_check: Instant::now(),
         }
     }
 
@@ -484,23 +582,35 @@ impl DiskStore {
         }
     }
 
-    fn put(&mut self, key: &str, entry: &CacheEntry) {
+    fn put(&mut self, key: &str, entry: &CacheEntry) -> DiskSweepStats {
         let path = self.path(key);
         if let Err(error) = self.write(&path, entry) {
             tracing::warn!("state store could not write {}: {error}", path.display());
-            return;
+            return DiskSweepStats::default();
         }
-        self.writes_since_sweep += 1;
-        if self.writes_since_sweep >= DISK_SWEEP_EVERY {
+        self.writes_since_sweep = self.writes_since_sweep.saturating_add(1);
+        if self.writes_since_sweep >= DISK_SWEEP_EVERY && Instant::now() >= self.next_sweep_check {
             self.writes_since_sweep = 0;
-            self.sweep();
+            self.next_sweep_check = Instant::now() + DISK_SWEEP_INTERVAL;
+            let started = Instant::now();
+            let mut stats = DiskSweepStats::default();
+            if let Err(error) = self.sweep(&mut stats) {
+                tracing::warn!(
+                    "state store maintenance at {}: {error}",
+                    self.root.display()
+                );
+            }
+            stats.disk_sweep_micros =
+                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            return stats;
         }
+        DiskSweepStats::default()
     }
 
     fn write(&self, path: &Path, entry: &CacheEntry) -> io::Result<()> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "state path has no parent"))?;
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "state path has no parent")
+        })?;
         fs::create_dir_all(parent)?;
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -519,45 +629,133 @@ impl DiskStore {
         result
     }
 
-    /// Drop the least recently read states until the store fits its budget.
-    fn sweep(&self) {
+    /// One coordinated slice, never a walk of the whole store. Directory
+    /// names are read from one shard; at most DISK_SWEEP_BATCH files are
+    /// statted or evicted. Progress survives short-lived engine processes.
+    fn sweep(&self, stats: &mut DiskSweepStats) -> io::Result<()> {
+        let mut lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.root.join(".sweep.lock"))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                stats.disk_sweep_skips += 1;
+                return Ok(());
+            }
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+        }
+        let mut bytes = Vec::new();
+        (&mut lock).take(16 * 1024).read_to_end(&mut bytes)?;
+        let mut state = serde_json::from_slice::<DiskSweepState>(&bytes)
+            .ok()
+            .filter(|state| {
+                state.version == 1
+                    && state.shard < DISK_SHARDS
+                    && state.shard_bytes.len() == DISK_SHARDS
+                    && state.after.len() <= 70
+            })
+            .unwrap_or_default();
+        let now = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        if now >= state.last_started_millis
+            && now - state.last_started_millis < DISK_SWEEP_INTERVAL.as_millis() as u64
+        {
+            stats.disk_sweep_skips += 1;
+            return Ok(());
+        }
+        state.last_started_millis = now;
+        let prefix = format!("{:02x}", state.shard);
+        let shard = self.root.join(&prefix);
+        let mut names = Vec::new();
+        match fs::read_dir(&shard) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                        continue;
+                    };
+                    // Only our own SHA-256 state filenames, never temporary
+                    // writes, coordination files or unrelated directory data.
+                    if name.len() == 70
+                        && name.is_ascii()
+                        && name.starts_with(&prefix)
+                        && name.ends_with(".state")
+                        && name[..64].bytes().all(|byte| byte.is_ascii_hexdigit())
+                        && name > state.after
+                    {
+                        names.push(name);
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        names.sort_unstable();
+        let finished = names.len() <= DISK_SWEEP_BATCH;
         let mut files = Vec::new();
-        let mut total = 0u64;
-        let Ok(shards) = fs::read_dir(&self.root) else {
-            return;
-        };
-        for shard in shards.flatten() {
-            let Ok(entries) = fs::read_dir(shard.path()) else {
+        for name in names.into_iter().take(DISK_SWEEP_BATCH) {
+            state.after = name.clone();
+            stats.disk_files_examined += 1;
+            let path = shard.join(name);
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
                 continue;
             };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|extension| extension.to_str()) != Some("state") {
-                    continue;
-                }
-                let Ok(metadata) = entry.metadata() else {
-                    continue;
-                };
-                let used = metadata
-                    .accessed()
-                    .or_else(|_| metadata.modified())
-                    .unwrap_or(UNIX_EPOCH);
-                total += metadata.len();
-                files.push((used, metadata.len(), path));
+            if !metadata.is_file() {
+                continue;
             }
+            let used = metadata
+                .accessed()
+                .or_else(|_| metadata.modified())
+                .unwrap_or(UNIX_EPOCH);
+            state.scanned_bytes = state.scanned_bytes.saturating_add(metadata.len());
+            files.push((used, metadata.len(), path));
         }
-        if total <= self.max_bytes {
-            return;
-        }
-        files.sort();
+        // Partial scans are lower bounds. Completed scans replace old
+        // estimates; concurrent writes are accounted on the next visit.
+        state.shard_bytes[state.shard] = if finished {
+            state.scanned_bytes
+        } else {
+            state.shard_bytes[state.shard].max(state.scanned_bytes)
+        };
+        let mut total = state
+            .shard_bytes
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        files.sort_unstable();
         for (_, size, path) in files {
             if total <= self.max_bytes {
                 break;
             }
-            if fs::remove_file(&path).is_ok() {
+            if fs::remove_file(path).is_ok() {
                 total = total.saturating_sub(size);
+                state.shard_bytes[state.shard] =
+                    state.shard_bytes[state.shard].saturating_sub(size);
+                state.scanned_bytes = state.scanned_bytes.saturating_sub(size);
+                stats.disk_files_removed += 1;
+                stats.disk_bytes_removed += size;
             }
         }
+        if finished {
+            state.shard = (state.shard + 1) % DISK_SHARDS;
+            state.after.clear();
+            state.scanned_bytes = 0;
+        }
+        let bytes = serde_json::to_vec(&state).map_err(io::Error::other)?;
+        lock.rewind()?;
+        lock.write_all(&bytes)?;
+        lock.set_len(bytes.len() as u64)?;
+        stats.disk_sweeps += 1;
+        // Dropping the File releases the OS lock, including on errors/panic.
+        Ok(())
     }
 }
 
@@ -608,7 +806,9 @@ fn decode_entry(bytes: &[u8]) -> Option<CacheEntry> {
     let mut relations = BTreeMap::new();
     for _ in 0..count {
         let name_len = reader.u32()? as usize;
-        let name = std::str::from_utf8(reader.take(name_len)?).ok()?.to_string();
+        let name = std::str::from_utf8(reader.take(name_len)?)
+            .ok()?
+            .to_string();
         let arity = reader.u32()? as usize;
         let row_count = usize::try_from(reader.u64()?).ok()?;
         let mut digest = [0u8; 32];
@@ -676,7 +876,11 @@ mod tests {
     use super::*;
 
     fn state(name: &str, rows: Vec<Vec<Val>>) -> Arc<RelationState> {
-        Arc::new(RelationState::new(name, rows.first().map_or(1, Vec::len), rows))
+        Arc::new(RelationState::new(
+            name,
+            rows.first().map_or(1, Vec::len),
+            rows,
+        ))
     }
 
     #[test]
@@ -703,7 +907,10 @@ mod tests {
     #[test]
     fn an_oversized_entry_is_not_retained() {
         let mut cache = StrataCache::new(1);
-        cache.insert("key".to_string(), Arc::new(CacheEntry::new(BTreeMap::new())));
+        cache.insert(
+            "key".to_string(),
+            Arc::new(CacheEntry::new(BTreeMap::new())),
+        );
         assert_eq!(cache.state_stats().entries, 0);
     }
 

@@ -2,10 +2,11 @@
 
 use crate::arg::Args;
 use crate::cache::{
-    unit_inputs, unit_key, units_of_stratum, CacheEntry, CacheRunStats, HitSource,
-    RelationState, StrataCache,
+    contribution_key, unit_inputs, unit_key, units_of_stratum, CacheEntry, CacheRunStats,
+    HitSource, RelationState, StrataCache, Unit,
 };
-use crate::dataflow::{program_execution, stratum_execution};
+use crate::canonical::canonical_rule;
+use crate::dataflow::{program_execution, stratum_execution, StratumComputation};
 use crate::native_calls::NativeCallModule;
 use catalog::head::aggregation_catalog_from_program;
 use parsing::decl::RelDecl;
@@ -58,16 +59,36 @@ pub fn run_once(args: Args) {
 /// The cache behind its lock, poisoned or not: a reload that panicked mid-way
 /// wrote nothing partial, so the entries are as good as they were.
 pub fn lock(cache: &Mutex<StrataCache>) -> MutexGuard<'_, StrataCache> {
-    cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// One cache miss to evaluate. A contribution belongs to a pending head union;
+/// a whole-unit result can be published directly at the stratum boundary.
+struct PendingComputation<'a> {
+    unit: Unit<'a>,
+    key: String,
+    inputs: BTreeMap<String, Arc<RelationState>>,
+    contribution_to: Option<usize>,
+}
+
+struct PendingUnion {
+    head: String,
+    arity: usize,
+    key: String,
+    inherited: Option<Arc<RelationState>>,
+    contributions: Vec<Arc<RelationState>>,
 }
 
 /// Evaluate by reading along the cache, stratum by stratum.
 ///
 /// Every unit of a stratum reads only states settled by earlier strata, so all
 /// of a stratum's keys are computed before any of it runs; the units the cache
-/// does not hold are then assembled into one dataflow over the injected input
-/// states, captured at their heads, and stored.  Outputs are written from the
-/// final states, hit or computed alike.
+/// does not hold request either individual rule contributions or a whole-unit
+/// computation. All missing computations share one dataflow, with isolated
+/// relation maps. Ordinary heads are then assembled from their active
+/// contributions and inherited rows. Outputs use the final states either way.
 pub fn run_cached(args: Args, cache: &Mutex<StrataCache>) -> CacheRunStats {
     let total_started = Instant::now();
     // Cross-stratum common-subexpression sharing can leave a later plan referring
@@ -98,23 +119,31 @@ pub fn run_cached(args: Args, cache: &Mutex<StrataCache>) -> CacheRunStats {
         let rows = read_relation_rows(declaration, &path, &delimiter);
         states.insert(
             declaration.name().to_string(),
-            Arc::new(RelationState::new(declaration.name(), declaration.arity(), rows)),
+            Arc::new(RelationState::new(
+                declaration.name(),
+                declaration.arity(),
+                rows,
+            )),
         );
     }
     let planning_elapsed = total_started.elapsed();
 
     let mut stats = CacheRunStats::default();
     let mut execution = Duration::ZERO;
+    let mut cache_time = Duration::ZERO;
     let mut seen_set = HashSet::new();
     let strata_rules = strata.strata();
     let recursive = strata.is_recursive_strata_bitmap();
     stats.strata = strata_rules.len();
 
     for (stratum, &is_recursive) in strata_rules.iter().zip(recursive.iter()) {
+        let cache_started = Instant::now();
+        let execution_before = execution;
         let units = units_of_stratum(stratum, is_recursive);
         stats.units += units.len();
-        let mut hit_entries = Vec::new();
+        let mut settled = Vec::new();
         let mut missed = Vec::new();
+        let mut unions: Vec<PendingUnion> = Vec::new();
         for unit in units {
             let inputs = unit_inputs(&unit, &states, &declarations);
             let key = unit_key(&unit, &inputs, &declarations, program);
@@ -129,29 +158,83 @@ pub fn run_cached(args: Args, cache: &Mutex<StrataCache>) -> CacheRunStats {
                         stats.cutoff_hits += 1;
                     }
                     stats.rows_loaded += entry.row_count();
-                    hit_entries.push(entry);
+                    settled.push(entry);
                 }
                 None => {
                     stats.misses += 1;
-                    missed.push((unit, key, inputs));
+                    if unit.recursive || unit.heads.keys().any(|head| idb_map.contains_key(head)) {
+                        missed.push(PendingComputation {
+                            unit,
+                            key,
+                            inputs,
+                            contribution_to: None,
+                        });
+                        continue;
+                    }
+
+                    // Every ordinary non-recursive unit has one head. Its
+                    // inherited state supports the final union, but must not
+                    // enter a rule contribution or that contribution's key.
+                    let (head, &arity) = unit.heads.first_key_value().expect("unit has a head");
+                    let mut pending = PendingUnion {
+                        head: head.clone(),
+                        arity,
+                        key,
+                        inherited: inputs.get(head).cloned(),
+                        contributions: Vec::new(),
+                    };
+                    let mut distinct_rules = HashSet::new();
+                    for rule in unit.rules {
+                        if !distinct_rules.insert(canonical_rule(rule)) {
+                            continue;
+                        }
+                        let contribution = Unit {
+                            heads: unit.heads.clone(),
+                            rules: vec![rule],
+                            recursive: false,
+                        };
+                        let mut body_inputs = unit_inputs(&contribution, &states, &declarations);
+                        body_inputs.remove(head);
+                        let contribution_key =
+                            contribution_key(&contribution, &body_inputs, &declarations, program);
+                        match lock(cache).lookup(&contribution_key, &contribution.heads) {
+                            Some((entry, source)) => {
+                                stats.contribution_hits += 1;
+                                if source == HitSource::Disk {
+                                    stats.contribution_disk_hits += 1;
+                                }
+                                stats.contribution_rows_loaded += entry.row_count();
+                                pending
+                                    .contributions
+                                    .push(Arc::clone(&entry.relations[head]));
+                            }
+                            None => {
+                                stats.contribution_misses += 1;
+                                missed.push(PendingComputation {
+                                    unit: contribution,
+                                    key: contribution_key,
+                                    inputs: body_inputs,
+                                    contribution_to: Some(unions.len()),
+                                });
+                            }
+                        }
+                    }
+                    unions.push(pending);
                 }
             }
         }
 
         if !missed.is_empty() {
             let started = Instant::now();
-            let mut injected: BTreeMap<String, Arc<RelationState>> = BTreeMap::new();
-            let mut unit_groups = Vec::with_capacity(missed.len());
+            let mut computations = Vec::with_capacity(missed.len());
             let mut unit_captures: Vec<BTreeMap<String, MaterializedUpdates>> =
                 Vec::with_capacity(missed.len());
             // Sideways slices are named by rule identifier; units assembled
             // into one dataflow must not reuse each other's.
             let mut next_rule_identifier = 0usize;
-            for (unit, _, inputs) in &missed {
-                for (name, state) in inputs {
-                    injected.insert(name.clone(), Arc::clone(state));
-                }
-                unit_groups.push(plan_rules(
+            for pending in &missed {
+                let unit = &pending.unit;
+                let groups = plan_rules(
                     &unit.rules,
                     unit.recursive,
                     args.opt_level(),
@@ -159,52 +242,87 @@ pub fn run_cached(args: Args, cache: &Mutex<StrataCache>) -> CacheRunStats {
                     next_rule_identifier,
                     &mut seen_set,
                     true,
-                ));
-                next_rule_identifier += unit.rules.len();
-                unit_captures.push(
-                    unit.heads
-                        .keys()
-                        .map(|head| (head.clone(), Arc::new(Mutex::new(Vec::new()))))
-                        .collect(),
                 );
+                next_rule_identifier += unit.rules.len();
+                stats.rules_evaluated += unit.rules.len();
+                let captures: BTreeMap<String, MaterializedUpdates> = unit
+                    .heads
+                    .keys()
+                    .map(|head| (head.clone(), Arc::new(Mutex::new(Vec::new()))))
+                    .collect();
+                unit_captures.push(captures.clone());
+                computations.push(StratumComputation {
+                    groups,
+                    inputs: pending.inputs.clone(),
+                    captures,
+                });
             }
             stratum_execution(
                 &args,
-                unit_groups,
-                injected,
-                unit_captures.clone(),
+                computations,
                 fat_mode,
                 Arc::clone(&idb_map),
                 native_calls.clone(),
             );
             execution += started.elapsed();
 
-            for ((unit, key, _), captures) in missed.into_iter().zip(unit_captures) {
+            for (pending, captures) in missed.into_iter().zip(unit_captures) {
                 let mut relations = BTreeMap::new();
                 for (name, updates) in captures {
                     let rows = consolidate(&updates);
-                    stats.rows_cached += rows.len();
-                    let arity = unit.heads[&name];
-                    relations.insert(name.clone(), Arc::new(RelationState::new(&name, arity, rows)));
+                    let arity = pending.unit.heads[&name];
+                    relations.insert(
+                        name.clone(),
+                        Arc::new(RelationState::new(&name, arity, rows)),
+                    );
                 }
                 let entry = Arc::new(CacheEntry::new(relations));
-                for (name, state) in &entry.relations {
-                    states.insert(name.clone(), Arc::clone(state));
+                if let Some(index) = pending.contribution_to {
+                    stats.contribution_rows_cached += entry.row_count();
+                    let union = &mut unions[index];
+                    union
+                        .contributions
+                        .push(Arc::clone(&entry.relations[&union.head]));
+                } else {
+                    stats.rows_cached += entry.row_count();
+                    settled.push(Arc::clone(&entry));
                 }
-                lock(cache).insert(key, entry);
+                stats.disk += lock(cache).insert(pending.key, entry);
             }
         }
 
-        for entry in hit_entries {
+        for union in unions {
+            // Reconstruct from active contributions. A deletion omits one
+            // support, never subtracts a tuple still supported by another rule
+            // or by the head's state entering this stratum.
+            let rows = union
+                .inherited
+                .iter()
+                .chain(union.contributions.iter())
+                .flat_map(|state| state.rows.iter().cloned())
+                .collect();
+            let state = Arc::new(RelationState::new(&union.head, union.arity, rows));
+            stats.rows_cached += state.rows.len();
+            let entry = Arc::new(CacheEntry::new(BTreeMap::from([(union.head, state)])));
+            stats.disk += lock(cache).insert(union.key, Arc::clone(&entry));
+            settled.push(entry);
+        }
+
+        for entry in settled {
             for (name, state) in &entry.relations {
                 states.insert(name.clone(), Arc::clone(state));
             }
         }
+        cache_time += cache_started
+            .elapsed()
+            .saturating_sub(execution.saturating_sub(execution_before));
     }
 
+    let output_started = Instant::now();
     if let Some(csv_dir) = args.csvs() {
         write_states(program, &states, &csv_dir, delimiter);
     }
+    let output_time = output_started.elapsed();
 
     let state = lock(cache).state_stats();
     stats.entries = state.entries;
@@ -213,10 +331,14 @@ pub fn run_cached(args: Args, cache: &Mutex<StrataCache>) -> CacheRunStats {
     stats.max_bytes = state.max_bytes;
     stats.planning_micros = duration_micros(planning_elapsed);
     stats.execution_micros = duration_micros(execution);
+    stats.cache_micros = duration_micros(cache_time);
+    stats.output_micros = duration_micros(output_time);
     stats.total_micros = duration_micros(total_started.elapsed());
     info!(
-        "state cache: {} strata, {} units, {} hits ({} from disk, {} after a miss), {} misses",
-        stats.strata, stats.units, stats.hits, stats.disk_hits, stats.cutoff_hits, stats.misses
+        "state cache: {} strata, {} units, {} hits ({} from disk, {} after a miss), {} misses; contributions: {} hits ({} from disk), {} misses; {} rules evaluated",
+        stats.strata, stats.units, stats.hits, stats.disk_hits, stats.cutoff_hits, stats.misses,
+        stats.contribution_hits, stats.contribution_disk_hits, stats.contribution_misses,
+        stats.rules_evaluated
     );
     stats
 }
@@ -267,7 +389,8 @@ fn write_states(
                     out.write_all(std::slice::from_ref(&delimiter))
                         .unwrap_or_else(|error| panic!("Can not write to {path}: {error}"));
                 }
-                write!(out, "{value}").unwrap_or_else(|error| panic!("Can not write to {path}: {error}"));
+                write!(out, "{value}")
+                    .unwrap_or_else(|error| panic!("Can not write to {path}: {error}"));
             }
             out.write_all(b"\n")
                 .unwrap_or_else(|error| panic!("Can not write to {path}: {error}"));

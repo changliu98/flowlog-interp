@@ -487,8 +487,8 @@ fn run_per_stratum(
 /// positive once the worker frontier has closed.
 pub(crate) fn consolidate(updates: &MaterializedUpdates) -> Vec<Vec<Val>> {
     let mut consolidated = BTreeMap::<Vec<Val>, isize>::new();
-    let mut updates = updates.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    for (row, difference) in updates.drain(..) {
+    let batches = std::mem::take(&mut *updates.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    for (row, difference) in batches.into_iter().flatten() {
         *consolidated.entry(row).or_default() += difference;
     }
     consolidated

@@ -1,3 +1,4 @@
+use timely::progress::Timestamp;
 use std::sync::Arc;
 use std::collections::HashMap;
 use planning::flow::TransformationFlow;
@@ -12,7 +13,6 @@ use reading::Semiring;
 
 use differential_dataflow::collection::VecCollection;
 use differential_dataflow::lattice::Lattice;
-use timely::dataflow::Scope;
 use timely::order::TotalOrder;
 use differential_dataflow::Data;
 use macros::*;
@@ -24,58 +24,53 @@ use crate::jn::*;
 /// This is the general implementation: fat rows carry any arity, so it is
 /// written once and serves both the globally fat mode and the fallback taken by
 /// `codegen_cartesian` for the shapes its fixed-size table does not generate.
-fn cartesian_fat_rows<G>(
-    rel_0: &VecCollection<G, FatRow, Semiring>,
-    rel_1: &VecCollection<G, FatRow, Semiring>,
+fn cartesian_fat_rows<'scope, T: Timestamp>(
+    rel_0: VecCollection<'scope, T, FatRow, Semiring>,
+    rel_1: VecCollection<'scope, T, FatRow, Semiring>,
     flow: &TransformationFlow,
     budget: &Arc<Budget>,
-) -> VecCollection<G, FatRow, Semiring>
+) -> VecCollection<'scope, T, FatRow, Semiring>
 where
-    G: Scope,
-    G::Timestamp: Data + Lattice + TotalOrder,
+    T: Data + Lattice + TotalOrder,
 {
-    use differential_dataflow::operators::arrange::ArrangeByKey;
     rel_0.map(|row| ((), row)).arrange_by_key().join_core(
-        &rel_1.map(|row| ((), row)).arrange_by_key(),
+        rel_1.map(|row| ((), row)).arrange_by_key(),
         cartesian_logic_fat(flow, budget),
     )
 }
 
-pub fn cartesian<G>(
+pub fn cartesian<'scope, T: Timestamp>(
     large: &Arc<CollectionSignature>,
     small: &Arc<CollectionSignature>,
-    row_map: &HashMap<Arc<CollectionSignature>, Arc<Rel<G>>>,
+    row_map: &HashMap<Arc<CollectionSignature>, Arc<Rel<'scope, T>>>,
     iv0: usize,
     iv1: usize,
     target: usize,
     flow: &TransformationFlow,
     budget: &Arc<Budget>,
-) -> Arc<Rel<G>> 
-where 
-    G: timely::dataflow::scopes::Scope,
-    G::Timestamp: Data+Lattice+TotalOrder,
+) -> Arc<Rel<'scope, T>>
+where
+    T: Data+Lattice+TotalOrder,
 {
-    use differential_dataflow::operators::arrange::ArrangeByKey;
     let rel_0 = row_map.get(large).expect("0 for cartesian");
     let rel_1 = row_map.get(small).expect("1 for cartesian");
     Arc::new(codegen_cartesian!())
 }
 
 
-pub fn kv_jn_kv<G>(
+pub fn kv_jn_kv<'scope, T: Timestamp>(
     large: &Arc<CollectionSignature>, 
     small: &Arc<CollectionSignature>, 
-    kv_map: &HashMap<Arc<CollectionSignature>, (Arc<DoubleRel<G>>, Arc<ArrangedDict<G>>)>,
+    kv_map: &HashMap<Arc<CollectionSignature>, (Arc<DoubleRel<'scope, T>>, Arc<ArrangedDict<'scope, T>>)>,
     ik0: usize,
     iv0: usize,
     iv1: usize,
     target: usize,
     flow: &TransformationFlow,
     budget: &Arc<Budget>,
-) -> Arc<Rel<G>> 
-where 
-    G: timely::dataflow::scopes::Scope,
-    G::Timestamp: Data+Lattice+TotalOrder,
+) -> Arc<Rel<'scope, T>>
+where
+    T: Data+Lattice+TotalOrder,
 {
     let (_, dict_0) = kv_map.get(large).expect("0 for kv jn kv");
     let (_, dict_1) = kv_map.get(small).expect("1 for kv jn kv");
@@ -83,21 +78,20 @@ where
 }    
 
 
-pub fn kv_jn_k<G>(
+pub fn kv_jn_k<'scope, T: Timestamp>(
     large: &Arc<CollectionSignature>, 
     small: &Arc<CollectionSignature>, 
-    kv_map: &HashMap<Arc<CollectionSignature>, (Arc<DoubleRel<G>>, Arc<ArrangedDict<G>>)>,
-    k_map: &HashMap<Arc<CollectionSignature>, (Arc<Rel<G>>, Arc<ArrangedSet<G>>)>,
+    kv_map: &HashMap<Arc<CollectionSignature>, (Arc<DoubleRel<'scope, T>>, Arc<ArrangedDict<'scope, T>>)>,
+    k_map: &HashMap<Arc<CollectionSignature>, (Arc<Rel<'scope, T>>, Arc<ArrangedSet<'scope, T>>)>,
     ik0: usize,
     iv0: usize,
     iv1: usize,
     target: usize,
     flow: &TransformationFlow,
     budget: &Arc<Budget>,
-) -> Arc<Rel<G>> 
-where 
-    G: timely::dataflow::scopes::Scope,
-    G::Timestamp: Data+Lattice+TotalOrder,
+) -> Arc<Rel<'scope, T>>
+where
+    T: Data+Lattice+TotalOrder,
 {
     assert!(iv1 == 0);
     let (_, dict_0) = kv_map.get(large).expect("dict for kv jn k");
@@ -106,20 +100,19 @@ where
 }
 
 
-pub fn k_jn_k<G>(
+pub fn k_jn_k<'scope, T: Timestamp>(
     large: &Arc<CollectionSignature>, 
     small: &Arc<CollectionSignature>, 
-    k_map: &HashMap<Arc<CollectionSignature>, (Arc<Rel<G>>, Arc<ArrangedSet<G>>)>,
+    k_map: &HashMap<Arc<CollectionSignature>, (Arc<Rel<'scope, T>>, Arc<ArrangedSet<'scope, T>>)>,
     ik0: usize,
     iv0: usize,
     iv1: usize,
     target: usize,
     flow: &TransformationFlow,
     budget: &Arc<Budget>,
-) -> Arc<Rel<G>> 
-where 
-    G: timely::dataflow::scopes::Scope,
-    G::Timestamp: Data+Lattice+TotalOrder,
+) -> Arc<Rel<'scope, T>>
+where
+    T: Data+Lattice+TotalOrder,
 {
     assert!(iv0 == 0 && iv1 == 0);
     let (_, set_0) = k_map.get(large).expect("0 for k jn k");
@@ -128,21 +121,20 @@ where
 }
 
 
-pub fn kv_aj_k<G>(
+pub fn kv_aj_k<'scope, T: Timestamp>(
     large: &Arc<CollectionSignature>, 
     small: &Arc<CollectionSignature>, 
-    kv_map: &HashMap<Arc<CollectionSignature>, (Arc<DoubleRel<G>>, Arc<ArrangedDict<G>>)>,
-    k_map: &mut HashMap<Arc<CollectionSignature>, (Arc<Rel<G>>, Arc<ArrangedSet<G>>)>,
+    kv_map: &HashMap<Arc<CollectionSignature>, (Arc<DoubleRel<'scope, T>>, Arc<ArrangedDict<'scope, T>>)>,
+    k_map: &mut HashMap<Arc<CollectionSignature>, (Arc<Rel<'scope, T>>, Arc<ArrangedSet<'scope, T>>)>,
     ik0: usize,
     iv0: usize,
     iv1: usize,
     target: usize,
     flow: &TransformationFlow,
     budget: &Arc<Budget>,
-) -> Arc<Rel<G>> 
-where 
-    G: timely::dataflow::scopes::Scope,
-    G::Timestamp: Data+Lattice+TotalOrder,
+) -> Arc<Rel<'scope, T>>
+where
+    T: Data+Lattice+TotalOrder,
 {
     assert!(iv1 == 0);
     if let Some((rel_1, set_1)) = k_map.get_mut(small) {
@@ -159,20 +151,19 @@ where
 }
 
 
-pub fn k_aj_k<G>(
+pub fn k_aj_k<'scope, T: Timestamp>(
     large: &Arc<CollectionSignature>, 
     small: &Arc<CollectionSignature>, 
-    k_map: &mut HashMap<Arc<CollectionSignature>, (Arc<Rel<G>>, Arc<ArrangedSet<G>>)>,
+    k_map: &mut HashMap<Arc<CollectionSignature>, (Arc<Rel<'scope, T>>, Arc<ArrangedSet<'scope, T>>)>,
     ik0: usize,
     iv0: usize,
     iv1: usize,
     target: usize,
     flow: &TransformationFlow,
     budget: &Arc<Budget>,
-) -> Arc<Rel<G>> 
-where 
-    G: timely::dataflow::scopes::Scope,
-    G::Timestamp: Data+Lattice+TotalOrder,
+) -> Arc<Rel<'scope, T>>
+where
+    T: Data+Lattice+TotalOrder,
 {
     assert!(iv0 == 0 && iv1 == 0);
     if let Some((rel_1, set_1)) = k_map.get_mut(small) {
@@ -187,4 +178,4 @@ where
 
     Arc::new(codegen_k_antijoin!())
 }
-                                        
+

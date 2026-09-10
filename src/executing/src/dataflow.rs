@@ -41,13 +41,12 @@ use reading::arrangements::{ArrangedDict, ArrangedSet};
 use reading::reader::*;
 use reading::inspect::*;
 use catalog::head::AggregationHeadIDB;
-use timely::communication::Allocate;
 use timely::dataflow::operators::probe::Handle as ProbeHandle;
 use timely::worker::Worker;
 
-type RowMap<G> = HashMap<Arc<CollectionSignature>, Arc<Rel<G>>>;
-type KvMap<G> = HashMap<Arc<CollectionSignature>, (Arc<DoubleRel<G>>, Arc<ArrangedDict<G>>)>;
-type KMap<G> = HashMap<Arc<CollectionSignature>, (Arc<Rel<G>>, Arc<ArrangedSet<G>>)>;
+type RowMap<'scope, T> = HashMap<Arc<CollectionSignature>, Arc<Rel<'scope, T>>>;
+type KvMap<'scope, T> = HashMap<Arc<CollectionSignature>, (Arc<DoubleRel<'scope, T>>, Arc<ArrangedDict<'scope, T>>)>;
+type KMap<'scope, T> = HashMap<Arc<CollectionSignature>, (Arc<Rel<'scope, T>>, Arc<ArrangedSet<'scope, T>>)>;
 
 /// What `assemble_group` needs beside the plan.
 pub(crate) struct AssemblyContext<'a> {
@@ -62,16 +61,14 @@ pub(crate) struct AssemblyContext<'a> {
 ///
 /// Inputs are read from the maps and the group's heads are left in `row_map`
 /// when it returns.
-pub(crate) fn assemble_group<G>(
-    scope: &mut G,
+pub(crate) fn assemble_group<'scope>(
+    scope: Scope<'scope, Time>,
     group_plan: &GroupStrataQueryPlan,
-    row_map: &mut RowMap<G>,
-    kv_map: &mut KvMap<G>,
-    k_map: &mut KMap<G>,
+    row_map: &mut RowMap<'scope, Time>,
+    kv_map: &mut KvMap<'scope, Time>,
+    k_map: &mut KMap<'scope, Time>,
     context: &AssemblyContext<'_>,
 ) -> Result<()>
-where
-    G: Scope<Timestamp = Time>,
 {
     let fat_mode = context.fat_mode;
     let native_calls = context.native_calls;
@@ -218,6 +215,7 @@ where
         }
 
     } else {
+        let outer = scope;
         let recursive_out_map = scope.iterative::<Iter, _, _>(|scope| {
             /* (1) construct iterative variables for strata idbs */
             let head_signatures_set = group_plan.head_signatures_set().clone();
@@ -461,7 +459,7 @@ where
 
                 variables_leave_map.insert(
                     Arc::clone(head_signature),
-                    variable_next.leave()
+                    variable_next.leave(outer)
                 );
             }
 
@@ -502,6 +500,12 @@ pub struct Assembly {
     pub program_name: String,
 }
 
+/// Completion and the buffers that must be published before reporting it.
+pub struct BuiltDataflow {
+    pub probe: ProbeHandle<Time>,
+    pub captures: Vec<WorkerCapture>,
+}
+
 impl Assembly {
     /// The union of every computation's inputs. Two computations naming one
     /// relation name one state: the stratum boundary is one boundary.
@@ -525,17 +529,18 @@ impl Assembly {
     /// worker's share of the input rows, and hand back the probe that says
     /// when the dataflow is complete. Every worker of a set calls this with
     /// the same assembly, in the same order, which is what timely requires.
-    pub fn build<A: Allocate>(&self, worker: &mut Worker<A>) -> Result<ProbeHandle<Time>> {
+    pub fn build(&self, worker: &mut Worker) -> Result<BuiltDataflow> {
         let peers = worker.peers();
         let index = worker.index();
         let inputs = self.shared_inputs();
         let context_native = self.native_calls.clone();
 
         let mut failure: Option<parsing::diagnostic::Diagnostic> = None;
-        let (mut sessions, probe) = worker.dataflow::<Time, _, _>(|scope| {
+        let (mut sessions, built) = worker.dataflow::<Time, _, _>(|scope| {
             let probe = ProbeHandle::new();
+            let mut captures = Vec::new();
             let mut sessions = Vec::new();
-            let mut input_map: RowMap<_> = HashMap::new();
+            let mut input_map: RowMap<'_, _> = HashMap::new();
 
             for (name, state) in inputs.iter() {
                 let (session, input_rel) =
@@ -556,7 +561,7 @@ impl Assembly {
             };
 
             for computation in self.computations.iter() {
-                let mut row_map: RowMap<_> = computation
+                let mut row_map: RowMap<'_, _> = computation
                     .inputs
                     .keys()
                     .map(|name| {
@@ -565,8 +570,8 @@ impl Assembly {
                         (signature, relation)
                     })
                     .collect();
-                let mut kv_map: KvMap<_> = HashMap::new();
-                let mut k_map: KMap<_> = HashMap::new();
+                let mut kv_map: KvMap<'_, _> = HashMap::new();
+                let mut k_map: KMap<'_, _> = HashMap::new();
                 for group_plan in &computation.groups {
                     if failure.is_some() {
                         break;
@@ -590,11 +595,11 @@ impl Assembly {
                     let relation = row_map.get(&signature).unwrap_or_else(|| {
                         panic!("state boundary relation {name} is absent after its unit")
                     });
-                    capture_generic(relation, Arc::clone(updates), &probe);
+                    captures.push(capture_generic(relation, Arc::clone(updates), &probe));
                 }
             }
 
-            (sessions, probe)
+            (sessions, BuiltDataflow { probe, captures })
         });
 
         // Whatever happened while assembling, the sessions must be closed:
@@ -613,7 +618,7 @@ impl Assembly {
 
         match failure {
             Some(diagnostic) => Err(diagnostic),
-            None => Ok(probe),
+            None => Ok(built),
         }
     }
 }

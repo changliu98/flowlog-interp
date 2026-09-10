@@ -284,7 +284,7 @@ pub fn codegen_cartesian(_: TokenStream) -> TokenStream {
                          .map(|x| ((), x))
                          .arrange_by_key()
                          .join_core(
-                            &rel_1.#type_1()
+                            rel_1.#type_1()
                                   .map(|x| ((), x))
                                   .arrange_by_key(),
                                 cartesian_logic::<#iv0_, #iv1_, #target_>(flow, budget)
@@ -309,7 +309,7 @@ pub fn codegen_cartesian(_: TokenStream) -> TokenStream {
                 // back, making the operator total over every arity the engine
                 // supports rather than over `PROD_MAX` alone.
                 _ => Rel::from_fat_rows(
-                    cartesian_fat_rows(&rel_0.to_fat_rows(), &rel_1.to_fat_rows(), flow, budget),
+                    cartesian_fat_rows(rel_0.to_fat_rows(), rel_1.to_fat_rows(), flow, budget),
                     target,
                 ),
             }
@@ -438,8 +438,8 @@ pub fn codegen_kv_antijoin(_: TokenStream) -> TokenStream {
             (#ik0_, #iv0_, #target_) => {
                 let candidates = dict_0.#dict_type();
                 let survivors = reading::rel::subtract_collection(
-                    &candidates.as_collection(|key, value| (key.clone(), value.clone())),
-                    &candidates.join_core(
+                    candidates.clone().as_collection(|key, value| (key.clone(), value.clone())),
+                    candidates.join_core(
                         set_1.#set_type(),
                         |key, value, _| Some((key.clone(), value.clone())),
                     ),
@@ -453,8 +453,8 @@ pub fn codegen_kv_antijoin(_: TokenStream) -> TokenStream {
         if dict_0.is_fat() && set_1.is_fat() {
             let candidates = dict_0.dict_fat();
             let survivors = reading::rel::subtract_collection(
-                &candidates.as_collection(|key, value| (key.clone(), value.clone())),
-                &candidates.join_core(
+                candidates.clone().as_collection(|key, value| (key.clone(), value.clone())),
+                candidates.join_core(
                     set_1.set_fat(),
                     |key, value, _| Some((key.clone(), value.clone())),
                 ),
@@ -483,8 +483,8 @@ pub fn codegen_k_antijoin(_: TokenStream) -> TokenStream {
             (#ik0_, #target_) => {
                 let candidates = set_0.#set_type();
                 let survivors = reading::rel::subtract_collection(
-                    &candidates.as_collection(|key, _| key.clone()),
-                    &candidates.join_core(
+                    candidates.clone().as_collection(|key, _| key.clone()),
+                    candidates.join_core(
                         set_1.#set_type(),
                         |key, _, _| Some(key.clone()),
                     ),
@@ -498,8 +498,8 @@ pub fn codegen_k_antijoin(_: TokenStream) -> TokenStream {
         if set_0.is_fat() && set_1.is_fat() {
             let candidates = set_0.set_fat();
             let survivors = reading::rel::subtract_collection(
-                &candidates.as_collection(|key, _| key.clone()),
-                &candidates.join_core(
+                candidates.clone().as_collection(|key, _| key.clone()),
+                candidates.join_core(
                     set_1.set_fat(),
                     |key, _, _| Some(key.clone()),
                 ),

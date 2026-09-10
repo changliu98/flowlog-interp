@@ -1,20 +1,17 @@
+use timely::progress::Timestamp;
 use paste::paste;
 use std::sync::Arc;
 
 use timely::dataflow::operators::Concatenate;
 #[cfg(all(feature = "present-type", not(feature = "isize-type")))]
-use timely::dataflow::operators::Map;
-use timely::dataflow::scopes::Child;
+use timely::dataflow::operators::vec::Map;
 use timely::dataflow::Scope;
-use timely::dataflow::ScopeParent;
 use timely::order::TotalOrder;
 use timely::progress::timestamp::Refines;
 
 use differential_dataflow::collection::VecCollection;
 use differential_dataflow::lattice::Lattice;
-use differential_dataflow::operators::arrange::ArrangeByKey;
-use differential_dataflow::operators::arrange::ArrangeBySelf;
-use differential_dataflow::operators::iterate::SemigroupVariable;
+use differential_dataflow::operators::iterate::Variable;
 use differential_dataflow::operators::ThresholdTotal;
 use differential_dataflow::AsCollection;
 use differential_dataflow::Data;
@@ -39,48 +36,44 @@ use crate::row::Array;
 use crate::row::Row;
 
 #[cfg(all(feature = "present-type", not(feature = "isize-type")))]
-pub(crate) fn dedup_collection<G, D>(
-    collection: &VecCollection<G, D, Semiring>,
-) -> VecCollection<G, D, Semiring>
+pub(crate) fn dedup_collection<'scope, T: Timestamp, D>(
+    collection: VecCollection<'scope, T, D, Semiring>,
+) -> VecCollection<'scope, T, D, Semiring>
 where
-    G: Scope,
-    G::Timestamp: Data + Lattice + TotalOrder,
+    T: Data + Lattice + TotalOrder,
     D: ExchangeData + Hashable,
 {
     collection.consolidate()
 }
 
 #[cfg(all(feature = "isize-type", not(feature = "present-type")))]
-pub(crate) fn dedup_collection<G, D>(
-    collection: &VecCollection<G, D, Semiring>,
-) -> VecCollection<G, D, Semiring>
+pub(crate) fn dedup_collection<'scope, T: Timestamp, D>(
+    collection: VecCollection<'scope, T, D, Semiring>,
+) -> VecCollection<'scope, T, D, Semiring>
 where
-    G: Scope,
-    G::Timestamp: Data + Lattice + TotalOrder,
+    T: Data + Lattice + TotalOrder,
     D: ExchangeData + Hashable,
 {
     collection.threshold_total(|_, count| if *count > 0 { 1 } else { 0 })
 }
 
 #[cfg(all(feature = "present-type", not(feature = "isize-type")))]
-pub(crate) fn dedup_retained_collection<G, D>(
-    collection: &VecCollection<G, D, Semiring>,
-) -> VecCollection<G, D, Semiring>
+pub(crate) fn dedup_retained_collection<'scope, T: Timestamp, D>(
+    collection: VecCollection<'scope, T, D, Semiring>,
+) -> VecCollection<'scope, T, D, Semiring>
 where
-    G: Scope,
-    G::Timestamp: Data + Lattice + TotalOrder,
+    T: Data + Lattice + TotalOrder,
     D: ExchangeData + Hashable,
 {
     collection.threshold_semigroup(move |_, _, old| old.is_none().then_some(semiring_one()))
 }
 
 #[cfg(all(feature = "isize-type", not(feature = "present-type")))]
-pub(crate) fn dedup_retained_collection<G, D>(
-    collection: &VecCollection<G, D, Semiring>,
-) -> VecCollection<G, D, Semiring>
+pub(crate) fn dedup_retained_collection<'scope, T: Timestamp, D>(
+    collection: VecCollection<'scope, T, D, Semiring>,
+) -> VecCollection<'scope, T, D, Semiring>
 where
-    G: Scope,
-    G::Timestamp: Data + Lattice + TotalOrder,
+    T: Data + Lattice + TotalOrder,
     D: ExchangeData + Hashable,
 {
     collection.threshold_total(|_, count| if *count > 0 { 1 } else { 0 })
@@ -96,13 +89,12 @@ where
 /// by construction (the entries of an arrangement), and the projection that
 /// could merge them is applied afterwards.
 #[cfg(all(feature = "present-type", not(feature = "isize-type")))]
-pub fn subtract_collection<G, D>(
-    collection: &VecCollection<G, D, Semiring>,
-    other: &VecCollection<G, D, Semiring>,
-) -> VecCollection<G, D, Semiring>
+pub fn subtract_collection<'scope, T: Timestamp, D>(
+    collection: VecCollection<'scope, T, D, Semiring>,
+    other: VecCollection<'scope, T, D, Semiring>,
+) -> VecCollection<'scope, T, D, Semiring>
 where
-    G: Scope,
-    G::Timestamp: Data + Lattice + TotalOrder,
+    T: Data + Lattice + TotalOrder,
     D: ExchangeData + Hashable,
 {
     collection
@@ -110,7 +102,7 @@ where
         .flat_map(move |(data, time, _)| std::iter::once((data, time, 1i32)))
         .as_collection()
         .concat(
-            &other
+            other
                 .inner
                 .flat_map(move |(data, time, _)| std::iter::once((data, time, -1i32)))
                 .as_collection(),
@@ -129,17 +121,16 @@ where
 /// See the `present-type` variant above for the contract; this one deduplicates
 /// its operands first, because the incremental mode carries real multiplicities.
 #[cfg(all(feature = "isize-type", not(feature = "present-type")))]
-pub fn subtract_collection<G, D>(
-    collection: &VecCollection<G, D, Semiring>,
-    other: &VecCollection<G, D, Semiring>,
-) -> VecCollection<G, D, Semiring>
+pub fn subtract_collection<'scope, T: Timestamp, D>(
+    collection: VecCollection<'scope, T, D, Semiring>,
+    other: VecCollection<'scope, T, D, Semiring>,
+) -> VecCollection<'scope, T, D, Semiring>
 where
-    G: Scope,
-    G::Timestamp: Data + Lattice + TotalOrder,
+    T: Data + Lattice + TotalOrder,
     D: ExchangeData + Hashable,
 {
     dedup_collection(collection)
-        .concat(&dedup_collection(other).negate())
+        .concat(dedup_collection(other).negate())
         .threshold_total(|_, count| if *count > 0 { 1 } else { 0 })
 }
 
@@ -177,27 +168,31 @@ fn fat_row_chop(k_arity: usize, total_arity: usize) -> impl FnMut(FatRow) -> (Fa
     }
 }
 
+// DD returns the feedback handle and its readable collection separately.
+pub type FeedbackRelation<'scope, T, D> = (
+    Variable<'scope, T, Vec<(D, T, Semiring)>>,
+    VecCollection<'scope, T, D, Semiring>,
+);
+
 macro_rules! impl_rels {
     ($($arity:literal),*) => {
         paste! {
-            pub enum Rel<G: Scope>
+            pub enum Rel<'scope, T: Timestamp>
             where
-                G: timely::dataflow::scopes::Scope,
-                G::Timestamp: Data+Lattice+TotalOrder,
+                T: Data+Lattice+TotalOrder,
             {
                 $(
-                    [<Collection $arity>](VecCollection<G, Row<$arity>, Semiring>),
-                    [<Variable $arity>](SemigroupVariable<G, Vec<(Row<$arity>, <G as ScopeParent>::Timestamp, Semiring)>>),
+                    [<Collection $arity>](VecCollection<'scope, T, Row<$arity>, Semiring>),
+                    [<Variable $arity>](FeedbackRelation<'scope, T, Row<$arity>>),
                 )*
                 // fallback for large arities that store true arity
-                CollectionFat(VecCollection<G, FatRow, Semiring>, usize),
-                VariableFat(SemigroupVariable<G, Vec<(FatRow, <G as ScopeParent>::Timestamp, Semiring)>>, usize),
+                CollectionFat(VecCollection<'scope, T, FatRow, Semiring>, usize),
+                VariableFat(FeedbackRelation<'scope, T, FatRow>, usize),
             }
 
-            impl<G: Scope> Rel<G>
+            impl<'scope, T: Timestamp> Rel<'scope, T>
             where
-                G: timely::dataflow::scopes::Scope,
-                G::Timestamp: Data + Lattice + TotalOrder,
+                T: Data + Lattice + TotalOrder,
             {
                 pub fn arity(&self) -> usize {
                     match self {
@@ -218,20 +213,20 @@ macro_rules! impl_rels {
 
                 $(
                     // deref for rel_1, rel_2, ...,
-                    pub fn [<rel_ $arity>](&self) -> &VecCollection<G, Row<$arity>, Semiring> {
+                    pub fn [<rel_ $arity>](&self) -> VecCollection<'scope, T, Row<$arity>, Semiring> {
                         match self {
-                            Rel::[<Collection $arity>](rel) => rel,
-                            Rel::[<Variable $arity>](var) => &*var,
+                            Rel::[<Collection $arity>](rel) => rel.clone(),
+                            Rel::[<Variable $arity>](var) => var.1.clone(),
                             _ => panic!("panic access to rel of arity {}", $arity),
                         }
                     }
                 )*
 
                 // deref for Fat rel
-                pub fn rel_fat(&self) -> &VecCollection<G, FatRow, Semiring> {
+                pub fn rel_fat(&self) -> VecCollection<'scope, T, FatRow, Semiring> {
                     match self {
-                        Rel::CollectionFat(rel, _) => rel,
-                        Rel::VariableFat(var, _) => &*var,
+                        Rel::CollectionFat(rel, _) => rel.clone(),
+                        Rel::VariableFat(var, _) => var.1.clone(),
                         _ => panic!("cannot access fat rel on fixed-arity collection"),
                     }
                 }
@@ -244,7 +239,7 @@ macro_rules! impl_rels {
                 /// general implementation once, and narrow the result back with
                 /// `from_fat_rows`. The cost is one row copy per tuple, and no
                 /// allocation for arities within `FALLBACK_ARITY`.
-                pub fn to_fat_rows(&self) -> VecCollection<G, FatRow, Semiring> {
+                pub fn to_fat_rows(&self) -> VecCollection<'scope, T, FatRow, Semiring> {
                     if self.is_fat() {
                         return self.rel_fat().clone();
                     }
@@ -267,7 +262,7 @@ macro_rules! impl_rels {
                 /// The inverse of `to_fat_rows`. An arity the fixed-size rows do
                 /// not reach stays fat, which is the representation such a
                 /// relation would have had anyway.
-                pub fn from_fat_rows(rows: VecCollection<G, FatRow, Semiring>, arity: usize) -> Rel<G> {
+                pub fn from_fat_rows(rows: VecCollection<'scope, T, FatRow, Semiring>, arity: usize) -> Rel<'scope, T> {
                     match arity {
                         $(
                             $arity => Rel::[<Collection $arity>](rows.map(|row| {
@@ -282,7 +277,7 @@ macro_rules! impl_rels {
                     }
                 }
 
-                pub fn arrange_set(&self) -> ArrangedSet<G> {
+                pub fn arrange_set(&self) -> ArrangedSet<'scope, T> {
                     if self.is_fat() {
                         // fat case
                         ArrangedSet::ArrangedSetFat(
@@ -300,7 +295,7 @@ macro_rules! impl_rels {
                     }
                 }
 
-                pub fn concat(&self, other: &Rel<G>) -> Rel<G> {
+                pub fn concat(&self, other: &Rel<'scope, T>) -> Rel<'scope, T> {
                     assert_eq!(
                         self.arity(),
                         other.arity(),
@@ -333,7 +328,7 @@ macro_rules! impl_rels {
                 }
 
                 /*
-                    pub fn negate(&self) -> Rel<G> {
+                    pub fn negate(&self) -> Rel<'scope, T> {
                         match self.arity() {
                             $(
                                 $arity => Rel::[<Collection $arity>](self.[<rel_ $arity>]().negate()),
@@ -343,7 +338,7 @@ macro_rules! impl_rels {
                     }
                 */
 
-                pub fn subtract(&self, other: &Rel<G>) -> Rel<G> {
+                pub fn subtract(&self, other: &Rel<'scope, T>) -> Rel<'scope, T> {
                     assert_eq!(
                         self.arity(),
                         other.arity(),
@@ -378,7 +373,7 @@ macro_rules! impl_rels {
                     }
                 }
 
-                pub fn dedup(&self) -> Rel<G> {
+                pub fn dedup(&self) -> Rel<'scope, T> {
                     if self.is_fat() {
                         Rel::CollectionFat(
                             dedup_collection(self.rel_fat()),
@@ -396,19 +391,19 @@ macro_rules! impl_rels {
                     }
                 }
 
-                pub fn concatenate<I>(&self, others: I) -> Rel<G>
+                pub fn concatenate<I>(&self, others: I) -> Rel<'scope, T>
                 where
-                    I: Iterator<Item = Arc<Rel<G>>>,
+                    I: Iterator<Item = Arc<Rel<'scope, T>>>,
                 {
                     if self.is_fat() {
                         let streams = others.into_iter().map(|other| match &*other {
                             Rel::CollectionFat(rel, _) => rel.inner.clone(),
-                            Rel::VariableFat(var, _) => var.inner.clone(),
+                            Rel::VariableFat(var, _) => var.1.inner.clone(),
                             _ => panic!("`others` must have the identical row type as `self` when concatenate"),
                         });
 
                         Rel::CollectionFat(
-                            self.rel_fat().inner.concatenate(streams).as_collection(),
+                            self.rel_fat().inner.scope().concatenate(streams.chain([self.rel_fat().inner])).as_collection(),
                             self.arity()
                         )
                     } else {
@@ -417,11 +412,11 @@ macro_rules! impl_rels {
                                 $arity => {
                                     let streams = others.into_iter().map(|other| match &*other {
                                         Rel::[<Collection $arity>](rel) => rel.inner.clone(),
-                                        Rel::[<Variable $arity>](var) => var.inner.clone(),
+                                        Rel::[<Variable $arity>](var) => var.1.inner.clone(),
                                         _ => panic!("`others` must have the identical arity as `self` when concatenate"),
                                     });
 
-                                    Rel::[<Collection $arity>](self.[<rel_ $arity>]().inner.concatenate(streams).as_collection())
+                                    Rel::[<Collection $arity>](self.[<rel_ $arity>]().inner.scope().concatenate(streams.chain([self.[<rel_ $arity>]().inner])).as_collection())
                                 },
                             )*
                             _ => unreachable!("concatenate: arity {} overflows", self.arity()),
@@ -429,7 +424,7 @@ macro_rules! impl_rels {
                     }
                 }
 
-                pub fn threshold(&self) -> Rel<G> {
+                pub fn threshold(&self) -> Rel<'scope, T> {
                     if self.is_fat() {
                         Rel::CollectionFat(
                             dedup_retained_collection(self.rel_fat()),
@@ -447,9 +442,9 @@ macro_rules! impl_rels {
                     }
                 }
 
-                pub fn enter<'a, T>(&self, child: &Child<'a, G, T>) -> Rel<Child<'a, G, T>>
+                pub fn enter<'inner, U>(&self, child: Scope<'inner, U>) -> Rel<'inner, U>
                 where
-                    T: Refines<<G as ScopeParent>::Timestamp>+Lattice+TotalOrder,
+                    U: Refines<T>+Lattice+TotalOrder,
                 {
                     if self.is_fat() {
                         Rel::CollectionFat(
@@ -468,7 +463,7 @@ macro_rules! impl_rels {
                     }
                 }
 
-                pub fn set(self, result: &Rel<G>) -> Rel<G> {
+                pub fn set(self, result: &Rel<'scope, T>) {
                     assert_eq!(
                         self.arity(),
                         result.arity(),
@@ -485,22 +480,13 @@ macro_rules! impl_rels {
 
                     if self.is_fat() {
                         match self {
-                            Rel::VariableFat(var, arity) => {
-                                Rel::CollectionFat(
-                                    var.set(result.rel_fat()),
-                                    arity
-                                )
-                            },
+                            Rel::VariableFat(var, _) => var.0.set(result.rel_fat()),
                             _ => panic!("set: self must be a Variable for fat case"),
                         }
                     } else {
                         match self {
                             $(
-                                Rel::[<Variable $arity>](var) => {
-                                    Rel::[<Collection $arity>](
-                                        var.set(result.[<rel_ $arity>]()),
-                                    )
-                                },
+                                Rel::[<Variable $arity>](var) => var.0.set(result.[<rel_ $arity>]()),
                             )*
                             _ => panic!("set: self must be a Variable for thin case"),
                         }
@@ -514,24 +500,21 @@ macro_rules! impl_rels {
 macro_rules! impl_leave {
     ($($arity:literal),*) => {
         paste! {
-            impl<'a, G: Scope, T> Rel<Child<'a, G, T>>
-            where
-                G: timely::dataflow::scopes::Scope,
-                G::Timestamp: Data+Lattice+TotalOrder,
-                T: Refines<<G as ScopeParent>::Timestamp>+Lattice+TotalOrder,
+            impl<'scope, T: Timestamp+Lattice+TotalOrder> Rel<'scope, T>
             {
-                pub fn leave(&self) -> Rel<G> {
+                pub fn leave<'outer, U>(&self, outer: Scope<'outer, U>) -> Rel<'outer, U>
+                where U: Timestamp+Lattice+TotalOrder, T: Refines<U> {
                     if self.is_fat() {
                         let arity = self.arity();
                         Rel::CollectionFat(
-                            self.rel_fat().leave(),
+                            self.rel_fat().leave(outer),
                             arity
                         )
                     } else {
                         match self.arity() {
                             $(
                                 $arity => Rel::[<Collection $arity>](
-                                    self.[<rel_ $arity>]().leave()
+                                    self.[<rel_ $arity>]().leave(outer)
                                 ),
                             )*
                             _ => unreachable!("leave: arity {} overflows", self.arity()),
@@ -549,13 +532,12 @@ impl_rels!(0, 1, 2, 3, 4, 5, 6, 7, 8);
 macro_rules! impl_arranged_double {
     ($(($K:literal, $V:literal, $M:literal)),*) => {
         paste! {
-            impl<G: Scope> Rel<G>
+            impl<'scope, T: Timestamp> Rel<'scope, T>
             where
-                G: timely::dataflow::scopes::Scope,
-                G::Timestamp: Data+Lattice+TotalOrder,
+                T: Data+Lattice+TotalOrder,
             {
                 // chop a row rel to a (k, v) rel
-                pub fn arrange_double(&self, at: usize) -> DoubleRel<G> {
+                pub fn arrange_double(&self, at: usize) -> DoubleRel<'scope, T> {
                     if self.is_fat() {
                         DoubleRel::DoubleRelFat(
                             self.rel_fat().map(fat_row_chop(at, self.arity())),
@@ -618,21 +600,19 @@ impl_arranged_double!(
 macro_rules! impl_double_rels {
     ($(($K:literal, $V:literal)),*) => {
         paste! {
-            pub enum DoubleRel<G: Scope>
+            pub enum DoubleRel<'scope, T: Timestamp>
             where
-                G: timely::dataflow::scopes::Scope,
-                G::Timestamp: Data+Lattice+TotalOrder,
+                T: Data+Lattice+TotalOrder,
             {
                 $(
-                    [<DoubleRel $K _ $V>](VecCollection<G, (Row<$K>, Row<$V>), Semiring>),
+                    [<DoubleRel $K _ $V>](VecCollection<'scope, T, (Row<$K>, Row<$V>), Semiring>),
                 )*
-                DoubleRelFat(VecCollection<G, (FatRow, FatRow), Semiring>, usize, usize), // (collection, key_arity, value_arity)
+                DoubleRelFat(VecCollection<'scope, T, (FatRow, FatRow), Semiring>, usize, usize), // (collection, key_arity, value_arity)
             }
 
-            impl<G: Scope> DoubleRel<G>
+            impl<'scope, T: Timestamp> DoubleRel<'scope, T>
             where
-                G: timely::dataflow::scopes::Scope,
-                G::Timestamp: Data+Lattice+TotalOrder,
+                T: Data+Lattice+TotalOrder,
             {
                 pub fn arity(&self) -> (usize, usize) {
                     match self {
@@ -644,9 +624,9 @@ macro_rules! impl_double_rels {
                 }
 
                 /// Concatenate two DoubleRels with the same arity
-                pub fn concatenate<I>(&self, others: I) -> DoubleRel<G>
+                pub fn concatenate<I>(&self, others: I) -> DoubleRel<'scope, T>
                 where
-                    I: Iterator<Item = Arc<DoubleRel<G>>>,
+                    I: Iterator<Item = Arc<DoubleRel<'scope, T>>>,
                 {
                     match self.arity() {
                         $(
@@ -656,7 +636,7 @@ macro_rules! impl_double_rels {
                                     _ => panic!("`others` must have the identical arity as `self` when concatenate"),
                                 });
 
-                                DoubleRel::[<DoubleRel $K _ $V>](self.[<rel_ $K _ $V>]().inner.concatenate(streams).as_collection())
+                                DoubleRel::[<DoubleRel $K _ $V>](self.[<rel_ $K _ $V>]().inner.scope().concatenate(streams.chain([self.[<rel_ $K _ $V>]().inner])).as_collection())
                             },
                         )*
                         _ => panic!("concatenate must have identical arity"),
@@ -672,14 +652,14 @@ macro_rules! impl_double_rels {
                     !self.is_fat()
                 }
 
-                pub fn arrange_dict(&self) -> ArrangedDict<G> {
+                pub fn arrange_dict(&self) -> ArrangedDict<'scope, T> {
                     if self.is_fat() {
                         let (k_arity, v_arity) = self.arity();
                         ArrangedDict::ArrangedDictFat(self.rel_fat().arrange_by_key(), k_arity, v_arity)
                     } else {
                         match self {
                             $(
-                                DoubleRel::[<DoubleRel $K _ $V>](rel) => ArrangedDict::[<ArrangedDict $K _ $V>](rel.arrange_by_key()),
+                                DoubleRel::[<DoubleRel $K _ $V>](rel) => ArrangedDict::[<ArrangedDict $K _ $V>](rel.clone().arrange_by_key()),
                             )*
                             DoubleRel::DoubleRelFat(_, _, _) => unreachable!("arrange_dict: fat case should be handled elsewhere"),
                         }
@@ -688,25 +668,25 @@ macro_rules! impl_double_rels {
 
                 $(
                     // rel_1_1, rel_1_2, ...,
-                    pub fn [<rel_ $K _ $V>](&self) -> &VecCollection<G, (Row<$K>, Row<$V>), Semiring> {
+                    pub fn [<rel_ $K _ $V>](&self) -> VecCollection<'scope, T, (Row<$K>, Row<$V>), Semiring> {
                         match self {
-                            DoubleRel::[<DoubleRel $K _ $V>](rel) => rel,
+                            DoubleRel::[<DoubleRel $K _ $V>](rel) => rel.clone(),
                             _ => panic!("panic access to rel of arity ({}, {})", $K, $V),
                         }
                     }
                 )*
 
                 // fat accessor
-                pub fn rel_fat(&self) -> &VecCollection<G, (FatRow, FatRow), Semiring> {
+                pub fn rel_fat(&self) -> VecCollection<'scope, T, (FatRow, FatRow), Semiring> {
                     match self {
-                        DoubleRel::DoubleRelFat(rel, _, _) => rel,
+                        DoubleRel::DoubleRelFat(rel, _, _) => rel.clone(),
                         _ => panic!("panic access to fat rel from non-fat DoubleRel"),
                     }
                 }
 
-                pub fn enter<'a, T>(&self, child: &Child<'a, G, T>) -> DoubleRel<Child<'a, G, T>>
+                pub fn enter<'inner, U>(&self, child: Scope<'inner, U>) -> DoubleRel<'inner, U>
                 where
-                    T: Refines<<G as ScopeParent>::Timestamp>+Lattice+TotalOrder,
+                    U: Refines<T>+Lattice+TotalOrder,
                 {
                     if self.is_fat() {
                         let (k_arity, v_arity) = self.arity();
@@ -714,7 +694,7 @@ macro_rules! impl_double_rels {
                     } else {
                         match self {
                             $(
-                                DoubleRel::[<DoubleRel $K _ $V>](rel) => DoubleRel::[<DoubleRel $K _ $V>](rel.enter(child)),
+                                DoubleRel::[<DoubleRel $K _ $V>](rel) => DoubleRel::[<DoubleRel $K _ $V>](rel.clone().enter(child)),
                             )*
                             DoubleRel::DoubleRelFat(_, _, _) => unreachable!("Fat case should be handled above"),
                         }
@@ -798,7 +778,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use differential_dataflow::AsCollection;
-    use timely::dataflow::operators::ToStream;
+    use timely::dataflow::operators::vec::ToStream;
 
     use super::*;
 
@@ -819,7 +799,7 @@ mod tests {
                     .to_stream(scope)
                     .as_collection();
 
-                subtract_collection(&collection, &other).inspect(move |(data, _, diff)| {
+                subtract_collection(collection, other).inspect(move |(data, _, diff)| {
                     captured.lock().expect("capture lock").push((*data, *diff));
                 });
             });

@@ -336,6 +336,31 @@ set is not shared between evaluations, which is what lets one evaluation be
 cancelled, charged for its memory, and fail on its own. Concurrency across
 evaluations is the engine's admission limit (`max_concurrent`, 0 for none).
 
+The runtime uses Differential Dataflow 0.25 and Timely 0.31. Directory inputs
+use the configured worker count to read and parse disjoint byte ranges,
+aligned to complete lines. Each worker captures results into a local buffer
+and publishes the whole buffer after its capture frontier completes. These
+paths serve both schedules, including service reloads.
+
+For a reproducible release-build comparison, build the `runtime_bench`
+example in each checkout and retain each binary under a separate name. Use a
+separate Cargo target directory for each checkout:
+
+```sh
+CARGO_TARGET_DIR=target/perf-after cargo build --release --locked -p executing --example runtime_bench
+python3 scripts/benchmark_runtime.py --output target/runtime-comparison \
+  --engine before /path/to/before-runtime_bench \
+  --engine after target/perf-after/release/examples/runtime_bench
+```
+
+The benchmark uses a million-row scan and disconnected-chain reachability,
+with three repetitions at 1, 4, and 8 workers. It measures whole-program,
+cold-cache, and resident-cache evaluations separately and verifies every
+result's row count and digest against independently computed expected rows.
+Its manifest records input and binary hashes, run order, and timing scope;
+the output directory also retains raw measurements and median timings. See
+[the recorded comparison](docs/runtime-performance-2026-09-10.md).
+
 ### Limits
 
 An evaluation runs under `Limits`: a wall-clock `time`, a `cancel` token the

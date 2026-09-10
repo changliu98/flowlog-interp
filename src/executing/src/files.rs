@@ -13,7 +13,7 @@ use parsing::decl::DataType;
 use parsing::diagnostic::{Diagnostic, Result};
 use parsing::parser::Program;
 use parsing::Val;
-use reading::reader::read_relation_file;
+use reading::reader::read_relation_file_partition;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -28,6 +28,20 @@ pub fn read_facts_directory(
     delimiter: u8,
     symbols: &SymbolTable,
 ) -> Result<HashMap<String, Arc<RelationState>>> {
+    read_facts_directory_with_workers(program, directory, delimiter, symbols, 1)
+}
+
+/// Read each relation's byte ranges concurrently, with at most `workers`
+/// readers. The calling thread reads one range; the others join before the
+/// relation is published. Symbol ids are content-derived across all readers.
+pub fn read_facts_directory_with_workers(
+    program: &Program,
+    directory: &Path,
+    delimiter: u8,
+    symbols: &SymbolTable,
+    workers: usize,
+) -> Result<HashMap<String, Arc<RelationState>>> {
+    let workers = workers.max(1);
     let mut states = HashMap::new();
     for declaration in program.edbs() {
         let path = match declaration.path() {
@@ -35,14 +49,36 @@ pub fn read_facts_directory(
             None => directory.join(format!("{}.facts", declaration.name())),
         };
         let types = declaration.column_types();
-        let mut intern = |text: &str| symbols.intern(text);
-        let rows = read_relation_file(
-            declaration.name(),
-            &types,
-            &path.to_string_lossy(),
-            delimiter,
-            &mut intern,
-        )?;
+        let path = path.to_string_lossy();
+        let read = |index| read_relation_file_partition(
+            declaration.name(), &types, &path, delimiter, index, workers,
+            &mut |text| symbols.intern(text),
+        );
+        let rows = if workers == 1 {
+            read(0)?
+        } else {
+            let partitions = std::thread::scope(|scope| {
+                let readers: Vec<_> = (1..workers)
+                    .map(|index| {
+                        let read = &read;
+                        scope.spawn(move || read(index))
+                    })
+                    .collect();
+                let mut results = vec![read(0)];
+                // Join every reader even when an earlier range was invalid.
+                for reader in readers {
+                    results.push(reader.join().unwrap_or_else(|_| Err(Diagnostic::internal(
+                        format!("input reader panicked for relation {}", declaration.name())
+                    ))));
+                }
+                results.into_iter().collect::<Result<Vec<_>>>()
+            })?;
+            let mut rows = Vec::with_capacity(partitions.iter().map(Vec::len).sum());
+            for partition in partitions {
+                rows.extend(partition);
+            }
+            rows
+        };
         states.insert(
             declaration.name().to_string(),
             Arc::new(RelationState::new(declaration.name(), declaration.arity(), rows)),

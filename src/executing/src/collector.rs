@@ -1,3 +1,4 @@
+use timely::progress::Timestamp;
 use crate::aggregation::*;
 use catalog::head::AggregationHeadIDB;
 use macros::codegen_aggregation;
@@ -15,7 +16,6 @@ use reading::row::*;
 #[cfg(not(feature = "isize-type"))]
 use differential_dataflow::difference::IsZero;
 use differential_dataflow::lattice::Lattice;
-use differential_dataflow::operators::reduce::ReduceCore;
 #[cfg(not(feature = "isize-type"))]
 use differential_dataflow::operators::ThresholdTotal;
 use differential_dataflow::trace::implementations::{ValBuilder, ValSpine};
@@ -25,16 +25,15 @@ use itertools::Itertools;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 #[cfg(not(feature = "isize-type"))]
-use timely::dataflow::operators::Map;
+use timely::dataflow::operators::vec::Map;
 use timely::order::TotalOrder;
 
-pub fn non_recursive_collector<G>(
+pub fn non_recursive_collector<'scope, T: Timestamp>(
     last_signatures_map: &HashMap<Arc<CollectionSignature>, Vec<Arc<CollectionSignature>>>,
-    row_map: &mut HashMap<Arc<CollectionSignature>, Arc<Rel<G>>>,
+    row_map: &mut HashMap<Arc<CollectionSignature>, Arc<Rel<'scope, T>>>,
     idb_catalogs: &HashMap<String, AggregationHeadIDB>,
 ) where
-    G: timely::dataflow::scopes::Scope,
-    G::Timestamp: Lattice + TotalOrder,
+    T: Lattice + TotalOrder,
 {
     for (head_signature, last_signatures) in last_signatures_map
         .iter()
@@ -119,14 +118,13 @@ pub fn non_recursive_collector<G>(
     }
 }
 
-pub fn recursive_collector<G>(
+pub fn recursive_collector<'scope, T: Timestamp>(
     group_plan: &GroupStrataQueryPlan,
-    nest_row_map: &HashMap<Arc<CollectionSignature>, Arc<Rel<G>>>,
-    variables_next_map: &mut HashMap<Arc<CollectionSignature>, Arc<Rel<G>>>,
+    nest_row_map: &HashMap<Arc<CollectionSignature>, Arc<Rel<'scope, T>>>,
+    variables_next_map: &mut HashMap<Arc<CollectionSignature>, Arc<Rel<'scope, T>>>,
     idb_catalogs: &HashMap<String, AggregationHeadIDB>,
 ) where
-    G: timely::dataflow::scopes::Scope,
-    G::Timestamp: Lattice + TotalOrder,
+    T: Lattice + TotalOrder,
 {
     for (head_signature, last_signatures) in group_plan
         .last_signatures_map()
@@ -197,13 +195,12 @@ pub fn recursive_collector<G>(
     }
 }
 
-pub fn inspector<G>(
+pub fn inspector<'scope, T: Timestamp>(
     head_signatures_set: &HashSet<Arc<CollectionSignature>>,
-    inspect_map: &mut HashMap<Arc<CollectionSignature>, Arc<Rel<G>>>,
+    inspect_map: &mut HashMap<Arc<CollectionSignature>, Arc<Rel<'scope, T>>>,
     is_recursive: bool,
 ) where
-    G: timely::dataflow::scopes::Scope,
-    G::Timestamp: Lattice + TotalOrder,
+    T: Lattice + TotalOrder,
 {
     for head_signature in head_signatures_set
         .iter()

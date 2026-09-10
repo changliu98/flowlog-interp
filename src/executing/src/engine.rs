@@ -471,11 +471,12 @@ impl Engine {
     ) -> Result<HashMap<String, Arc<RelationState>>> {
         let mut states = match inputs {
             Inputs::States(states) => states,
-            Inputs::Directory(directory) => files::read_facts_directory(
+            Inputs::Directory(directory) => files::read_facts_directory_with_workers(
                 program,
                 &directory,
                 self.config.delimiter,
                 &self.symbols,
+                self.config.workers,
             )?,
             Inputs::Rows(rows) => {
                 let mut states = HashMap::new();

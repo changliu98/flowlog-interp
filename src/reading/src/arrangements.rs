@@ -1,7 +1,7 @@
+use timely::progress::Timestamp;
 use paste::paste;
 use std::rc::Rc; // reference counted pointer // differential dataflow trace implementation
 use timely::order::TotalOrder;
-use timely::dataflow::Scope;
 use differential_dataflow::operators::arrange::Arranged;
 use differential_dataflow::operators::arrange::TraceAgent;
 use differential_dataflow::operators::ThresholdTotal;
@@ -19,43 +19,41 @@ use crate::row::FatRow;
 use differential_dataflow::trace::implementations::Vector;
 use differential_dataflow::trace::implementations::ord_neu::OrdValBatch;
 use differential_dataflow::trace::implementations::spine_fueled::Spine;
-use timely::dataflow::ScopeParent;
 
 /* ------------------------------------------------------------------------------------ */
 /* Dict */
 /* ------------------------------------------------------------------------------------ */
-// Arranged<G, TraceAgent<Spine<Rc<OrdValBatch< Vector<((u32, u32), Product<(), u64>, Present)>> >>>>
+// Arranged<'scope, TraceAgent<Spine<Rc<OrdValBatch< Vector<((u32, u32), Product<(), u64>, Present)>> >>>>
 
 pub type BatchDict<const K: usize, const V: usize, T, R> = ((Row<K>, Row<V>), T, R);
 pub type VectorBatchDict<const K: usize, const V: usize, T, R> = Vector<BatchDict<K, V, T, R>>;
 pub type DictTrace<const K: usize, const V: usize, T, R> = TraceAgent<Spine<Rc< OrdValBatch<VectorBatchDict<K, V, T, R>> >>>;
 
-pub type ArrangedDictType<const K: usize, const V: usize, G, R> = Arranged<G, DictTrace<K, V, <G as ScopeParent>::Timestamp, R>>;
+pub type ArrangedDictType<'scope, const K: usize, const V: usize, T, R> = Arranged<'scope, DictTrace<K, V, T, R>>;
 
 // Fat row arrangements for fallback
 pub type BatchDictFat<T, R> = ((FatRow, FatRow), T, R);
 pub type VectorBatchDictFat<T, R> = Vector<BatchDictFat<T, R>>;
 pub type DictTraceFat<T, R> = TraceAgent<Spine<Rc<OrdValBatch<VectorBatchDictFat<T, R>>>>>;
-pub type ArrangedDictTypeFat<G, R> = Arranged<G, DictTraceFat<<G as ScopeParent>::Timestamp, R>>;
+pub type ArrangedDictTypeFat<'scope, T, R> = Arranged<'scope, DictTraceFat<T, R>>;
 
 macro_rules! impl_dicts {
     ($(($K:literal, $V:literal)),*) => {
         paste! {
-            pub enum ArrangedDict<G: Scope> 
-            where 
-                G: timely::dataflow::scopes::Scope,
-                G::Timestamp: Data+Lattice+TotalOrder,
+            pub enum ArrangedDict<'scope, T: Timestamp>
+            where
+                T: Data+Lattice+TotalOrder,
             {
                 $(
-                    [<ArrangedDict $K _ $V>](ArrangedDictType<$K, $V, G, Semiring>),
+                    [<ArrangedDict $K _ $V>](ArrangedDictType<'scope, $K, $V, T, Semiring>),
                 )*
                 // Fallback for large arities using FatRow
-                ArrangedDictFat(ArrangedDictTypeFat<G, Semiring>, usize, usize), // Store K and V arities
+                ArrangedDictFat(ArrangedDictTypeFat<'scope, T, Semiring>, usize, usize), // Store K and V arities
             }
 
-            impl<G: Scope> ArrangedDict<G>
+            impl<'scope, T: Timestamp> ArrangedDict<'scope, T>
             where
-                G::Timestamp: Data+Lattice+TotalOrder,
+                T: Data+Lattice+TotalOrder,
             {
                 pub fn arity(&self) -> (usize, usize) {
                     match self {
@@ -75,22 +73,22 @@ macro_rules! impl_dicts {
                 }
             }
 
-            impl<G: Scope> ArrangedDict<G>
+            impl<'scope, T: Timestamp> ArrangedDict<'scope, T>
             where
-                G::Timestamp: Data+Lattice+TotalOrder,
+                T: Data+Lattice+TotalOrder,
             {
                 $(
-                    pub fn [<dict_ $K _ $V>](&self) -> &ArrangedDictType<$K, $V, G, Semiring> {
+                    pub fn [<dict_ $K _ $V>](&self) -> ArrangedDictType<'scope, $K, $V, T, Semiring> {
                         match self {
-                            ArrangedDict::[<ArrangedDict $K _ $V>](dict) => dict,
+                            ArrangedDict::[<ArrangedDict $K _ $V>](dict) => dict.clone(),
                             _ => panic!("panic access to dict of arity ({}, {})", $K, $V),
                         }
                     }
                 )*
 
-                pub fn dict_fat(&self) -> &ArrangedDictTypeFat<G, Semiring> {
+                pub fn dict_fat(&self) -> ArrangedDictTypeFat<'scope, T, Semiring> {
                     match self {
-                        ArrangedDict::ArrangedDictFat(dict, _, _) => dict,
+                        ArrangedDict::ArrangedDictFat(dict, _, _) => dict.clone(),
                         _ => panic!("Cannot access fat dict on fixed-arity arrangement"),
                     }
                 }
@@ -125,36 +123,34 @@ impl_dicts!(
 /* ------------------------------------------------------------------------------------ */
 /* Set */
 /* ------------------------------------------------------------------------------------ */
-// Arranged<G, TraceAgent<Spine<Rc<OrdKeyBatch< Vector<((Row<K>, ()), Product<(), u64>, Present)>> >>>>
+// Arranged<'scope, TraceAgent<Spine<Rc<OrdKeyBatch< Vector<((Row<K>, ()), Product<(), u64>, Present)>> >>>>
 use differential_dataflow::trace::implementations::ord_neu::OrdKeyBatch;
 pub type BatchSet<const K: usize, T, R> = ((Row<K>, ()), T, R);
 pub type VectorBatchSet<const K: usize, T, R> = Vector<BatchSet<K, T, R>>;
 pub type SetTrace<const K: usize, T, R> = TraceAgent<Spine<Rc< OrdKeyBatch<VectorBatchSet<K, T, R>> >>>;
-pub type ArrangedSetType<const K: usize, G, R> = Arranged<G, SetTrace<K, <G as ScopeParent>::Timestamp, R>>;
+pub type ArrangedSetType<'scope, const K: usize, T, R> = Arranged<'scope, SetTrace<K, T, R>>;
 
 // Fat row set arrangements for fallback
 pub type BatchSetFat<T, R> = ((FatRow, ()), T, R);
 pub type VectorBatchSetFat<T, R> = Vector<BatchSetFat<T, R>>;
 pub type SetTraceFat<T, R> = TraceAgent<Spine<Rc<OrdKeyBatch<VectorBatchSetFat<T, R>>>>>;
-pub type ArrangedSetTypeFat<G, R> = Arranged<G, SetTraceFat<<G as ScopeParent>::Timestamp, R>>;
+pub type ArrangedSetTypeFat<'scope, T, R> = Arranged<'scope, SetTraceFat<T, R>>;
 
 macro_rules! impl_sets {
     ($($K:literal),*) => {
         paste! {
-            pub enum ArrangedSet<G: Scope> 
-            where 
-                G: timely::dataflow::scopes::Scope,
-                G::Timestamp: Data+Lattice+TotalOrder,
+            pub enum ArrangedSet<'scope, T: Timestamp>
+            where
+                T: Data+Lattice+TotalOrder,
             {
-                $( [<ArrangedSet $K>](ArrangedSetType<$K, G, Semiring>), )*
+                $( [<ArrangedSet $K>](ArrangedSetType<'scope, $K, T, Semiring>), )*
                 // Fallback for large arities using FatRow
-                ArrangedSetFat(ArrangedSetTypeFat<G, Semiring>, usize), // Store K arity
+                ArrangedSetFat(ArrangedSetTypeFat<'scope, T, Semiring>, usize), // Store K arity
             }
 
-            impl<G: Scope> ArrangedSet<G>
+            impl<'scope, T: Timestamp> ArrangedSet<'scope, T>
             where
-                G: timely::dataflow::scopes::Scope,
-                G::Timestamp: Data+Lattice+TotalOrder,
+                T: Data+Lattice+TotalOrder,
             {
                 pub fn arity(&self) -> usize {
                     match self {
@@ -173,7 +169,7 @@ macro_rules! impl_sets {
                     !self.is_fat()
                 }
 
-                pub fn threshold(&self) -> Rel<G> {
+                pub fn threshold(&self) -> Rel<'scope, T> {
                     if self.is_fat() {
                         #[cfg(all(feature = "present-type", not(feature = "isize-type")))]
                         let thresholded = self.set_fat().threshold_semigroup(
@@ -192,11 +188,11 @@ macro_rules! impl_sets {
                         match self {
                             $( ArrangedSet::[<ArrangedSet $K>](set) => {
                                 #[cfg(all(feature = "present-type", not(feature = "isize-type")))]
-                                let thresholded = set.threshold_semigroup(
+                                let thresholded = set.clone().threshold_semigroup(
                                     move |_, _, old| old.is_none().then_some(semiring_one()),
                                 );
                                 #[cfg(all(feature = "isize-type", not(feature = "present-type")))]
-                                let thresholded = set
+                                let thresholded = set.clone()
                                     .threshold_total(|_, count| if *count > 0 { 1 } else { 0 });
 
                                 Rel::[<Collection $K>](thresholded)
@@ -208,23 +204,22 @@ macro_rules! impl_sets {
                 }
             }
 
-            impl<G: Scope> ArrangedSet<G>
+            impl<'scope, T: Timestamp> ArrangedSet<'scope, T>
             where
-                G: timely::dataflow::scopes::Scope,
-                G::Timestamp: Data+Lattice+TotalOrder,
+                T: Data+Lattice+TotalOrder,
             {
                 $(
-                    pub fn [<set_ $K>](&self) -> &ArrangedSetType<$K, G, Semiring> {
+                    pub fn [<set_ $K>](&self) -> ArrangedSetType<'scope, $K, T, Semiring> {
                         match self {
-                            ArrangedSet::[<ArrangedSet $K>](set) => set,
+                            ArrangedSet::[<ArrangedSet $K>](set) => set.clone(),
                             _ => panic!("panic access to set_{} of arity {}", $K, $K),
                         }
                     }
                 )*
 
-                pub fn set_fat(&self) -> &ArrangedSetTypeFat<G, Semiring> {
+                pub fn set_fat(&self) -> ArrangedSetTypeFat<'scope, T, Semiring> {
                     match self {
-                        ArrangedSet::ArrangedSetFat(set, _) => set,
+                        ArrangedSet::ArrangedSetFat(set, _) => set.clone(),
                         _ => panic!("Cannot access fat set on fixed-arity arrangement"),
                     }
                 }

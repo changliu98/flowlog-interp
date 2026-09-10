@@ -15,7 +15,7 @@
 //! engine's admission limit; parallelism inside one is the worker count.
 
 use crate::accounting::{Budget, MemoryTag};
-use crate::dataflow::Assembly;
+use crate::dataflow::{Assembly, BuiltDataflow};
 use parsing::diagnostic::{Diagnostic, Result};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,8 +23,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::Thread;
 use std::time::Duration;
-use timely::communication::{Allocator, WorkerGuards};
-use timely::dataflow::operators::probe::Handle as ProbeHandle;
+use timely::communication::WorkerGuards;
 use timely::worker::Worker;
 use timely::Config;
 use tracing::debug;
@@ -173,7 +172,7 @@ impl Drop for WorkerSet {
 }
 
 fn worker_loop(
-    worker: &mut Worker<Allocator>,
+    worker: &mut Worker,
     receivers: &Mutex<Vec<Option<Receiver<Job>>>>,
     poisoned: &AtomicBool,
     budget: &Arc<Budget>,
@@ -186,7 +185,7 @@ fn worker_loop(
         .and_then(Option::take)
         .expect("every worker has a job receiver");
     let _tag = MemoryTag::new(budget.memory());
-    let mut live: Vec<(Arc<Run>, ProbeHandle<()>)> = Vec::new();
+    let mut live: Vec<(Arc<Run>, BuiltDataflow)> = Vec::new();
 
     loop {
         if poisoned.load(Ordering::Relaxed) {
@@ -214,7 +213,7 @@ fn worker_loop(
                 Job::Run(run) => {
                     let built = catch_unwind(AssertUnwindSafe(|| run.assembly.build(worker)));
                     match built {
-                        Ok(Ok(probe)) => live.push((run, probe)),
+                        Ok(Ok(built)) => live.push((run, built)),
                         Ok(Err(diagnostic)) => run.report(index, Err(diagnostic)),
                         Err(panic) => {
                             poison(poisoned, budget, &live, Some(&run), panic, index);
@@ -236,8 +235,11 @@ fn worker_loop(
             return;
         }
         budget.observe();
-        live.retain(|(run, probe)| {
-            if probe.done() {
+        live.retain(|(run, built)| {
+            if built.probe.done() {
+                for capture in &built.captures {
+                    capture.flush();
+                }
                 run.report(index, Ok(()));
                 false
             } else {
@@ -253,7 +255,7 @@ fn worker_loop(
 fn poison(
     poisoned: &AtomicBool,
     budget: &Arc<Budget>,
-    live: &[(Arc<Run>, ProbeHandle<()>)],
+    live: &[(Arc<Run>, BuiltDataflow)],
     building: Option<&Arc<Run>>,
     panic: Box<dyn std::any::Any + Send>,
     index: usize,

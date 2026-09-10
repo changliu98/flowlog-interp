@@ -3,10 +3,10 @@
 /* ------------------------------------------------------------------------------------ */
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 use differential_dataflow::input::Input;
-use differential_dataflow::operators::iterate::SemigroupVariable;
+use differential_dataflow::operators::iterate::Variable;
 
 use timely::dataflow::Scope;
 use timely::order::Product;
@@ -97,25 +97,44 @@ pub fn read_relation_file(
     delimiter: u8,
     intern: &mut dyn FnMut(&str) -> Result<Val>,
 ) -> Result<Vec<Vec<Val>>> {
+    read_relation_file_partition(rel_name, column_types, rel_path, delimiter, 0, 1, intern)
+}
+
+/// Read the complete lines whose first byte belongs to one worker's range.
+/// Concatenating partitions in worker order reproduces the serial reader,
+/// including duplicate rows, CRLF, and a final line without a newline.
+pub fn read_relation_file_partition(
+    rel_name: &str,
+    column_types: &[DataType],
+    rel_path: &str,
+    delimiter: u8,
+    index: usize,
+    peers: usize,
+    intern: &mut dyn FnMut(&str) -> Result<Val>,
+) -> Result<Vec<Vec<Val>>> {
+    if peers == 0 || index >= peers {
+        return Err(Diagnostic::input(format!(
+            "invalid input partition {index} of {peers} for relation {rel_name}"
+        )).with_relation(rel_name));
+    }
     let arity = column_types.len();
-    let file = File::open(rel_path).map_err(|error| {
+    let input_error = |error| {
         Diagnostic::input(format!(
             "can't read data from \"{rel_path}\" for relation {rel_name}: {error}"
         ))
         .with_relation(rel_name)
-    })?;
-    let mut reader = BufReader::new(file);
+    };
+    let (mut reader, mut remaining) = byte_range_reader(rel_path, index, peers)
+        .map_err(input_error)?;
     let mut rows = Vec::new();
     let mut line = Vec::with_capacity(256);
-    loop {
+    while remaining > 0 {
         line.clear();
-        let bytes_read = reader.read_until(b'\n', &mut line).map_err(|error| {
-            Diagnostic::input(format!("can't read data from \"{rel_path}\": {error}"))
-                .with_relation(rel_name)
-        })?;
+        let bytes_read = reader.read_until(b'\n', &mut line).map_err(input_error)?;
         if bytes_read == 0 {
             break;
         }
+        remaining = remaining.saturating_sub(bytes_read as u64);
         if line.last() == Some(&b'\n') {
             line.pop();
         }
@@ -133,6 +152,28 @@ pub fn read_relation_file(
         rows.push(row);
     }
     Ok(rows)
+}
+
+/// Align the start to a record boundary, and allow the last record to extend
+/// past the range's end. Every I/O error is returned to the caller.
+fn byte_range_reader(path: &str, index: usize, peers: usize) -> std::io::Result<(BufReader<File>, u64)> {
+    let mut file = File::open(path)?;
+    if peers == 1 {
+        return Ok((BufReader::new(file), u64::MAX));
+    }
+    let size = file.metadata()?.len();
+    let chunk = size / peers as u64;
+    let start = chunk * index as u64;
+    let end = if index == peers - 1 { size } else { start + chunk };
+    if start == 0 || start == end {
+        return Ok((BufReader::new(file), end - start));
+    }
+    file.seek(SeekFrom::Start(start - 1))?;
+    let mut reader = BufReader::new(file);
+    let mut previous = [0];
+    reader.read_exact(&mut previous)?;
+    let skipped = if previous[0] == b'\n' { 0 } else { reader.skip_until(b'\n')? };
+    Ok((reader, (end - start).saturating_sub(skipped as u64)))
 }
 
 /// Parses one line of a relation file.
@@ -174,11 +215,11 @@ pub fn parse_row(
 
 macro_rules! generate_construct_session_and_table {
     ($($n:expr),*) => {
-        pub fn construct_session_and_table<G: Scope<Timestamp=Time>>(
-            scope: &mut G,
+        pub fn construct_session_and_table<'scope>(
+            scope: Scope<'scope, Time>,
             arity: usize,
             fat_mode: bool,
-        ) -> (InputSessionGeneric<Time>, Rel<G>) {
+        ) -> (InputSessionGeneric<Time>, Rel<'scope, Time>) {
             if !fat_mode {
                 match arity {
                     $(
@@ -205,7 +246,7 @@ macro_rules! generate_construct_session_and_table {
     };
 }
 
-// `construct_session_and_table(scope: &mut G, arity: usize, fat_mode) -> (InputSessionGeneric<Time>, Rel<G>)` for arities 0 to 8
+// Fixed-size row variants for arities 0 through 8.
 generate_construct_session_and_table!(0, 1, 2, 3, 4, 5, 6, 7, 8);
 
 /* ------------------------------------------------------------------------------------ */
@@ -214,16 +255,16 @@ generate_construct_session_and_table!(0, 1, 2, 3, 4, 5, 6, 7, 8);
 
 macro_rules! generate_construct_var {
     ($($n:expr),*) => {
-        pub fn construct_var<G: Scope<Timestamp=Product<Time, Iter>>>(
-            scope: &mut G,
+        pub fn construct_var<'scope>(
+            scope: Scope<'scope, Product<Time, Iter>>,
             arity: usize,
             fat_mode: bool,
-        ) -> Rel<G> {
+        ) -> Rel<'scope, Product<Time, Iter>> {
             if !fat_mode {
                 match arity {
                     $(
                         $n => paste::paste! {
-                            Rel::[<Variable $n>](SemigroupVariable::<_, Vec<(Row<$n>, Product<Time, Iter>, Semiring)>>::new(scope, Product::new(Default::default(), 1)))
+                            Rel::[<Variable $n>](Variable::<_, Vec<(Row<$n>, Product<Time, Iter>, Semiring)>>::new(scope, Product::new(Default::default(), 1)))
                         },
                     )*
                     _ => unreachable!("arity {} should be handled by match arms if <= MAX_ROW_ARITY", arity),
@@ -231,7 +272,7 @@ macro_rules! generate_construct_var {
             } else {
                 // fat mode
                 Rel::VariableFat(
-                    SemigroupVariable::<_, Vec<(FatRow, Product<Time, Iter>, Semiring)>>::new(scope, Product::new(Default::default(), 1)),
+                    Variable::<_, Vec<(FatRow, Product<Time, Iter>, Semiring)>>::new(scope, Product::new(Default::default(), 1)),
                     arity
                 )
             }
@@ -239,7 +280,7 @@ macro_rules! generate_construct_var {
     };
 }
 
-// `construct_var(scope: &mut G, arity: usize, fat_mode) -> Rel<G>` for arities 0 to 8
+// Fixed-size row variants for arities 0 through 8.
 generate_construct_var!(0, 1, 2, 3, 4, 5, 6, 7, 8);
 
 #[cfg(test)]
@@ -285,6 +326,51 @@ mod tests {
             ]
         );
         std::fs::remove_file(path).expect("remove reader fixture");
+    }
+
+    #[test]
+    fn byte_partitions_preserve_every_row_at_line_and_cell_boundaries() {
+        for contents in [
+            &b""[..], &b"1,2"[..], &b"1,2\n1,2\n"[..],
+            &b"\n1,10\r\n\n222222222,20\n3,-9223372036854775808\r\n9223372036854775807,40"[..],
+        ] {
+            let path = fixture(contents);
+            let path_text = path.to_string_lossy();
+            let types = [DataType::Integer, DataType::Integer];
+            let serial = read_relation_file("Edge", &types, &path_text, b',', &mut no_symbols).unwrap();
+            for peers in 1..=contents.len() + 2 {
+                let mut partitioned = Vec::new();
+                for index in 0..peers {
+                    partitioned.extend(read_relation_file_partition(
+                        "Edge", &types, &path_text, b',', index, peers, &mut no_symbols,
+                    ).unwrap());
+                }
+                assert_eq!(partitioned, serial, "{peers} partitions of {contents:?}");
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn byte_partitions_preserve_nullary_rows_and_long_utf8_symbols() {
+        for (types, contents) in [
+            (vec![], "\n\r\n\n".to_string()),
+            (vec![DataType::Symbol], format!("{}\r\nend", "界".repeat(4096))),
+        ] {
+            let path = fixture(contents.as_bytes());
+            let mut intern = |text: &str| Ok(text.len() as Val);
+            let serial = read_relation_file("R", &types, &path.to_string_lossy(), b',', &mut intern).unwrap();
+            for peers in [2, 3, 4, 8, 17] {
+                let mut partitioned = Vec::new();
+                for index in 0..peers {
+                    partitioned.extend(read_relation_file_partition(
+                        "R", &types, &path.to_string_lossy(), b',', index, peers, &mut intern,
+                    ).unwrap());
+                }
+                assert_eq!(partitioned, serial);
+            }
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

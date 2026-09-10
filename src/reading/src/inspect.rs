@@ -1,3 +1,4 @@
+use timely::progress::Timestamp;
 /* -----------------------------------------------------------------------------------------------
  * inspection and capture
  * -----------------------------------------------------------------------------------------------
@@ -5,10 +6,12 @@
 use differential_dataflow::collection::{AsCollection, VecCollection};
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::{ExchangeData, Hashable};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use timely::dataflow::operators::probe::Handle as ProbeHandle;
-use timely::dataflow::operators::{Inspect, Map, Probe};
-use timely::dataflow::Scope;
+use timely::dataflow::operators::{Inspect, Probe};
+use timely::dataflow::operators::vec::Map;
 use timely::order::TotalOrder;
 
 use crate::rel::{dedup_retained_collection, Rel};
@@ -17,10 +20,9 @@ use crate::{semiring_weight, Semiring, Val};
 use tracing::{debug, info};
 
 /// Prints the size of a relation (number of tuples)
-fn printsize<G, D>(rel: &VecCollection<G, D, Semiring>, name: &str, is_recursive: bool)
+fn printsize<'scope, T: Timestamp, D>(rel: VecCollection<'scope, T, D, Semiring>, name: &str, is_recursive: bool)
 where
-    G: Scope,
-    G::Timestamp: Lattice + TotalOrder,
+    T: Lattice + TotalOrder,
     D: ExchangeData + Hashable,
 {
     let prefix = if is_recursive {
@@ -43,10 +45,9 @@ where
 }
 
 /// Prints the content of a relation (all tuples)
-fn print<G, D>(rel: &VecCollection<G, D, Semiring>, name: &str)
+fn print<'scope, T: Timestamp, D>(rel: VecCollection<'scope, T, D, Semiring>, name: &str)
 where
-    G: Scope,
-    G::Timestamp: Lattice + TotalOrder,
+    T: Lattice + TotalOrder,
     D: ExchangeData + Hashable + std::fmt::Display,
 {
     let name = name.to_owned();
@@ -65,42 +66,64 @@ where
 /// Updates captured while materializing a relation at a cache boundary.
 ///
 /// The integer difference lets the same capture path work in both the default
-/// `Present` build and the `isize` build. Callers consolidate the updates after
-/// the worker frontier has completed.
-pub type MaterializedUpdates = Arc<Mutex<Vec<(Vec<Val>, isize)>>>;
+/// `Present` build and the `isize` build.
+pub type UpdateBatch = Vec<(Vec<Val>, isize)>;
 
-fn capture<G, D>(
-    rel: &VecCollection<G, D, Semiring>,
+/// Worker batches, published only after their capture frontiers complete.
+/// Each vector is moved from one worker; flushing holds the lock for one push.
+pub type MaterializedUpdates = Arc<Mutex<Vec<UpdateBatch>>>;
+
+/// A worker's capture buffer. It stays on that worker until completion; no
+/// process-shared lock is acquired while records arrive.
+pub struct WorkerCapture {
+    local: Rc<RefCell<UpdateBatch>>,
+    shared: MaterializedUpdates,
+}
+
+impl WorkerCapture {
+    /// Publish the whole buffer after the downstream probe has completed.
+    pub fn flush(&self) {
+        let batch = std::mem::take(&mut *self.local.borrow_mut());
+        if !batch.is_empty() {
+            self.shared
+                .lock()
+                .expect("materialized relation lock poisoned")
+                .push(batch);
+        }
+    }
+}
+
+fn capture<'scope, T: Timestamp, D>(
+    rel: VecCollection<'scope, T, D, Semiring>,
     updates: MaterializedUpdates,
-    probe: &ProbeHandle<G::Timestamp>,
-) where
-    G: Scope,
-    G::Timestamp: Lattice + TotalOrder,
+    probe: &ProbeHandle<T>,
+) -> WorkerCapture
+where
+    T: Lattice + TotalOrder,
     D: ExchangeData + Hashable + Array,
 {
+    let local = Rc::new(RefCell::new(Vec::new()));
+    let captured = Rc::clone(&local);
     dedup_retained_collection(rel)
         .inner
-        .probe_with(probe)
         .inspect(move |(row, _time, difference)| {
             let values = (0..row.arity())
                 .map(|column| row.column(column))
                 .collect::<Vec<_>>();
-            updates
-                .lock()
-                .expect("materialized relation lock poisoned")
-                .push((values, semiring_weight(difference)));
-        });
+            captured.borrow_mut().push((values, semiring_weight(difference)));
+        })
+        .probe_with(probe);
+    WorkerCapture { local, shared: updates }
 }
 
-/// Materialize a type-erased relation into a process-owned update buffer,
-/// reporting completion through `probe`.
-pub fn capture_generic<G>(rel: &Rel<G>, updates: MaterializedUpdates, probe: &ProbeHandle<G::Timestamp>)
+/// Capture a type-erased relation locally. The caller must retain the returned
+/// buffer and flush it after `probe` completes, before reporting worker success.
+pub fn capture_generic<'scope, T: Timestamp>(rel: &Rel<'scope, T>, updates: MaterializedUpdates, probe: &ProbeHandle<T>) -> WorkerCapture
 where
-    G: Scope,
-    G::Timestamp: Lattice + TotalOrder,
+    T: Lattice + TotalOrder,
 {
     if rel.is_fat() {
-        capture(rel.rel_fat(), updates, probe);
+        capture(rel.rel_fat(), updates, probe)
     } else {
         match rel.arity() {
             0 => capture(rel.rel_0(), updates, probe),
@@ -118,10 +141,9 @@ where
 }
 
 /// Prints the content of a relation with any arity
-pub fn print_generic<G>(rel: &Rel<G>, name: &str)
+pub fn print_generic<'scope, T: Timestamp>(rel: &Rel<'scope, T>, name: &str)
 where
-    G: Scope,
-    G::Timestamp: Lattice + TotalOrder,
+    T: Lattice + TotalOrder,
 {
     if rel.is_fat() {
         print(rel.rel_fat(), name)
@@ -143,10 +165,9 @@ where
 }
 
 /// Prints the size of a relation with any arity
-pub fn printsize_generic<G>(rel: &Rel<G>, name: &str, is_recursive: bool)
+pub fn printsize_generic<'scope, T: Timestamp>(rel: &Rel<'scope, T>, name: &str, is_recursive: bool)
 where
-    G: Scope,
-    G::Timestamp: Lattice + TotalOrder,
+    T: Lattice + TotalOrder,
 {
     if rel.is_fat() {
         printsize(rel.rel_fat(), name, is_recursive)
@@ -167,3 +188,57 @@ where
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::row::Row;
+    use crate::semiring_one;
+    use differential_dataflow::input::Input;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn workers_publish_complete_batches_with_signed_updates() {
+        let updates = MaterializedUpdates::default();
+        let shared = Arc::clone(&updates);
+        timely::execute(timely::Config::process(4), move |worker| {
+            let probe = ProbeHandle::new();
+            let (mut input, capture) = worker.dataflow::<u64, _, _>(|scope| {
+                let (input, collection) = scope.new_collection::<Row<1>, Semiring>();
+                let capture = capture_generic(&Rel::Collection1(collection), Arc::clone(&shared), &probe);
+                (input, capture)
+            });
+            let row = |value| {
+                let mut row = Row::<1>::new();
+                row.push(value);
+                row
+            };
+            for value in (worker.index()..1024).step_by(worker.peers()) {
+                input.update(row(value as Val), semiring_one());
+                input.update(row(value as Val), semiring_one());
+            }
+            input.advance_to(1);
+            input.flush();
+            worker.step_while(|| probe.less_than(input.time()));
+            assert!(shared.lock().unwrap().is_empty(), "capture published before flush");
+            #[cfg(feature = "isize-type")]
+            for value in (worker.index()..1024).step_by(worker.peers()).filter(|v| v % 3 == 0) {
+                input.update(row(value as Val), -2);
+            }
+            input.close();
+            worker.step_while(|| !probe.done());
+            capture.flush();
+        }).unwrap().join().into_iter().for_each(|result| result.unwrap());
+        let batches = updates.lock().unwrap();
+        assert_eq!(batches.len(), 4);
+        let mut totals = BTreeMap::<Val, isize>::new();
+        for (row, weight) in batches.iter().flatten() {
+            *totals.entry(row[0]).or_default() += weight;
+        }
+        #[cfg(feature = "isize-type")]
+        assert!(batches.iter().flatten().any(|(_, weight)| *weight < 0));
+        for value in 0..1024 {
+            let expected = if cfg!(feature = "isize-type") && value % 3 == 0 { 0 } else { 1 };
+            assert_eq!(totals.get(&value), Some(&expected));
+        }
+    }
+}

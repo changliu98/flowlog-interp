@@ -247,7 +247,7 @@ impl Budget {
     /// The reason the evaluation must stop now, if there is one. Checking
     /// records the reason, so a later `poll` returns the same answer.
     fn reason(&self) -> Option<Diagnostic> {
-        {
+        if self.stopped() {
             let fault = self.fault.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(fault) = fault.as_ref() {
                 return Some(fault.clone());

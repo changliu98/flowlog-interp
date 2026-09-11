@@ -13,39 +13,54 @@ use std::hash::Hash;
 ///
 /// a trait to abstract ops over array implementations
 pub trait Array: Debug + Send + Sync {
-    /// insert a value
-    fn push(&mut self, v: Val);
     /// return the number of columns
     fn arity(&self) -> usize;
     /// return the value of a column
     fn column(&self, id: usize) -> Val;
 }
 
-/// stack-allocated row for small arities using const generics
+/// A fixed-arity dataflow row: exactly N cells, without a runtime length field.
 #[derive(Debug, Clone, Hash, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row<const N: usize> {
-    values: ArrayVec<Val, N>,
+    #[serde(with = "array_values")]
+    values: [Val; N],
 }
 
 impl<const N: usize> Row<N> {
-    pub fn new() -> Self {
-        Self {
-            values: ArrayVec::new(),
-        }
+    pub fn builder() -> RowBuilder<N> {
+        RowBuilder { values: ArrayVec::new() }
     }
 
-    // pub fn extend(&mut self, slice: &[Val]) {
-    //     self.values.extend(slice.iter().cloned());
-    // }
+    pub fn from_slice(values: &[Val]) -> Self {
+        Self { values: values.try_into().expect("row width must match its arity") }
+    }
+
+    pub fn as_slice(&self) -> &[Val] { &self.values }
+}
+
+/// Construction keeps its cursor on the stack; completed rows store only cells.
+pub struct RowBuilder<const N: usize> {
+    values: ArrayVec<Val, N>,
+}
+
+impl<const N: usize> RowBuilder<N> {
+    pub fn push(&mut self, value: Val) { self.values.push(value); }
+
+    pub fn finish(self) -> Row<N> {
+        Row { values: self.values.into_inner().expect("row width must match its arity") }
+    }
+}
+
+impl<const N: usize> FromIterator<Val> for Row<N> {
+    fn from_iter<I: IntoIterator<Item = Val>>(iter: I) -> Self {
+        let values: ArrayVec<Val, N> = iter.into_iter().collect();
+        RowBuilder { values }.finish()
+    }
 }
 
 impl<const N: usize> Array for Row<N> {
-    fn push(&mut self, v: Val) {
-        self.values.push(v);
-    }
-
     fn arity(&self) -> usize {
-        self.values.len()
+        N
     }
 
     fn column(&self, id: usize) -> Val {
@@ -79,19 +94,54 @@ impl FatRow {
             values: SmallVec::new(),
         }
     }
+
+    pub fn push(&mut self, value: Val) { self.values.push(value); }
 }
 
 impl Array for FatRow {
-    fn push(&mut self, v: Val) {
-        self.values.push(v);
-    }
-
     fn arity(&self) -> usize {
         self.values.len()
     }
 
     fn column(&self, id: usize) -> Val {
         unsafe { *self.values.get_unchecked(id) }
+    }
+}
+
+impl FromIterator<Val> for FatRow {
+    fn from_iter<I: IntoIterator<Item = Val>>(iter: I) -> Self {
+        Self { values: iter.into_iter().collect() }
+    }
+}
+
+// Keep the existing serde sequence format while checking the exact width.
+mod array_values {
+    use super::Val;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer, const N: usize>(values: &[Val; N], serializer: S) -> Result<S::Ok, S::Error> {
+        values.as_slice().serialize(serializer)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>, const N: usize>(deserializer: D) -> Result<[Val; N], D::Error> {
+        let values = arrayvec::ArrayVec::<Val, N>::deserialize(deserializer)?;
+        values.into_inner().map_err(|_| serde::de::Error::custom("row width must match its arity"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_rows_are_dense_and_keep_their_serialized_cells() {
+        assert_eq!(std::mem::size_of::<Row<0>>(), 0);
+        assert_eq!(std::mem::size_of::<Row<2>>(), 2 * std::mem::size_of::<Val>());
+        assert_eq!(std::mem::size_of::<Row<8>>(), 8 * std::mem::size_of::<Val>());
+        let row = Row::<3>::from_slice(&[Val::MIN, 0, Val::MAX]);
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json, serde_json::json!({"values": [Val::MIN, 0, Val::MAX]}));
+        assert_eq!(serde_json::from_value::<Row<3>>(json).unwrap(), row);
+        assert!(serde_json::from_str::<Row<3>>(r#"{"values":[1,2]}"#).is_err());
+        assert_eq!(Row::<0>::builder().finish().arity(), 0);
     }
 }
 

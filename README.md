@@ -338,9 +338,12 @@ evaluations is the engine's admission limit (`max_concurrent`, 0 for none).
 
 The runtime uses Differential Dataflow 0.25 and Timely 0.31. Directory inputs
 use the configured worker count to read and parse disjoint byte ranges,
-aligned to complete lines. Each worker captures results into a local buffer
-and publishes the whole buffer after its capture frontier completes. These
-paths serve both schedules, including service reloads.
+aligned to complete lines. Inputs and captures use compact rows while sorting;
+large boundaries merge in parallel before producing the public row vectors.
+Each worker publishes its capture after the frontier completes, preserving
+signed retractions across workers. These paths serve both schedules, including
+service reloads. Active workers step without parking to reduce wakeup latency;
+idle workers block on their job receiver.
 
 For a reproducible release-build comparison, build the `runtime_bench`
 example in each checkout and retain each binary under a separate name. Use a
@@ -360,6 +363,10 @@ result's row count and digest against independently computed expected rows.
 Its manifest records input and binary hashes, run order, and timing scope;
 the output directory also retains raw measurements and median timings. See
 [the recorded comparison](docs/runtime-performance-2026-09-10.md).
+
+For the official FlowLog Bench cohort at 32 workers, see
+[the performance audit and measurements](docs/performance-w32-2026-09-10.md)
+and `scripts/benchmark_flowlog_bench.sh`.
 
 ### Limits
 

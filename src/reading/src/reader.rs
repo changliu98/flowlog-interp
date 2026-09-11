@@ -22,6 +22,31 @@ use crate::Iter;
 use crate::Semiring;
 use crate::Val;
 
+/// Build a checked input row without requiring a heap allocation per record.
+pub trait InputRow: Sized {
+    type Builder;
+    fn begin(arity: usize) -> Self::Builder;
+    fn push(builder: &mut Self::Builder, value: Val);
+    fn finish(builder: Self::Builder) -> Self;
+}
+
+impl InputRow for Vec<Val> {
+    type Builder = Self;
+    fn begin(arity: usize) -> Self { Vec::with_capacity(arity) }
+    fn push(builder: &mut Self, value: Val) { builder.push(value); }
+    fn finish(builder: Self) -> Self { builder }
+}
+
+impl<const N: usize> InputRow for Row<N> {
+    type Builder = crate::row::RowBuilder<N>;
+    fn begin(arity: usize) -> Self::Builder {
+        debug_assert_eq!(arity, N);
+        Row::builder()
+    }
+    fn push(builder: &mut Self::Builder, value: Val) { builder.push(value); }
+    fn finish(builder: Self::Builder) -> Self { builder.finish() }
+}
+
 /// The longest fragment of an input file quoted back in an error message.
 const QUOTED_FRAGMENT_MAX: usize = 120;
 
@@ -112,6 +137,19 @@ pub fn read_relation_file_partition(
     peers: usize,
     intern: &mut dyn FnMut(&str) -> Result<Val>,
 ) -> Result<Vec<Vec<Val>>> {
+    read_relation_file_partition_into(rel_name, column_types, rel_path, delimiter, index, peers, intern)
+}
+
+/// The same validated byte-range reader, collecting into a native row type.
+pub fn read_relation_file_partition_into<R: InputRow>(
+    rel_name: &str,
+    column_types: &[DataType],
+    rel_path: &str,
+    delimiter: u8,
+    index: usize,
+    peers: usize,
+    intern: &mut dyn FnMut(&str) -> Result<Val>,
+) -> Result<Vec<R>> {
     if peers == 0 || index >= peers {
         return Err(Diagnostic::input(format!(
             "invalid input partition {index} of {peers} for relation {rel_name}"
@@ -142,13 +180,13 @@ pub fn read_relation_file_partition(
             line.pop();
         }
         if arity == 0 {
-            rows.push(Vec::new());
+            rows.push(R::finish(R::begin(0)));
             continue;
         }
         if line.is_empty() {
             continue;
         }
-        let row = parse_row(rel_name, column_types, rel_path, &line, delimiter, intern)?;
+        let row = parse_row_into::<R>(rel_name, column_types, rel_path, &line, delimiter, intern)?;
         rows.push(row);
     }
     Ok(rows)
@@ -185,8 +223,19 @@ pub fn parse_row(
     delimiter: u8,
     intern: &mut dyn FnMut(&str) -> Result<Val>,
 ) -> Result<Vec<Val>> {
+    parse_row_into(rel_name, column_types, rel_path, line, delimiter, intern)
+}
+
+fn parse_row_into<R: InputRow>(
+    rel_name: &str,
+    column_types: &[DataType],
+    rel_path: &str,
+    line: &[u8],
+    delimiter: u8,
+    intern: &mut dyn FnMut(&str) -> Result<Val>,
+) -> Result<R> {
     let arity = column_types.len();
-    let mut row = Vec::with_capacity(arity);
+    let mut row = R::begin(arity);
     let mut values = 0usize;
     for cell in line.split(|&byte| byte == delimiter) {
         values += 1;
@@ -195,7 +244,7 @@ pub fn parse_row(
                 DataType::Integer => parse_number_cell(rel_path, line, cell)?,
                 DataType::Symbol => parse_symbol_cell(rel_path, line, cell, intern)?,
             };
-            row.push(value);
+            R::push(&mut row, value);
         }
     }
     if values != arity {
@@ -206,7 +255,7 @@ pub fn parse_row(
         ))
         .with_relation(rel_name));
     }
-    Ok(row)
+    Ok(R::finish(row))
 }
 
 /* ------------------------------------------------------------------------------------ */

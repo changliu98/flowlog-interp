@@ -77,6 +77,12 @@ impl RelationState {
     pub fn new(name: &str, arity: usize, mut rows: Vec<Vec<Val>>) -> Self {
         rows.sort_unstable();
         rows.dedup();
+        Self::from_sorted_rows(name, arity, rows)
+    }
+
+    /// A sorted, distinct boundary produced by the input or capture merge.
+    pub(crate) fn from_sorted_rows(name: &str, arity: usize, rows: Vec<Vec<Val>>) -> Self {
+        debug_assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
         let digest = rows_digest(arity, &rows);
         Self {
             name: name.to_string(),
@@ -128,11 +134,21 @@ fn rows_digest(arity: usize, rows: &[Vec<Val>]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update((arity as u64).to_le_bytes());
     hasher.update((rows.len() as u64).to_le_bytes());
+    // Preserve the byte format while amortizing the hasher's call/buffering
+    // overhead across many cells rather than feeding eight bytes at a time.
+    let mut buffer = [0u8; 8192];
+    let mut used = 0;
     for row in rows {
         for value in row {
-            hasher.update(value.to_le_bytes());
+            buffer[used..used + 8].copy_from_slice(&value.to_le_bytes());
+            used += 8;
+            if used == buffer.len() {
+                hasher.update(&buffer);
+                used = 0;
+            }
         }
     }
+    hasher.update(&buffer[..used]);
     hasher.finalize().into()
 }
 
@@ -1005,6 +1021,29 @@ mod tests {
         assert_eq!(a.rows, b.rows);
         let c = state("R", vec![vec![1, 2]]);
         assert_ne!(a.digest, c.digest);
+    }
+
+    #[test]
+    fn buffered_row_hash_preserves_the_persisted_byte_format() {
+        for arity in [0, 1, 2, 9, 1031] {
+            for count in [0, 1, 1025] {
+                let rows: Vec<Vec<Val>> = (0..count).map(|row| {
+                    (0..arity).map(|column| {
+                        (row as Val).wrapping_mul(Val::MAX).wrapping_add(column as Val)
+                    }).collect()
+                }).collect();
+                let mut reference = Sha256::new();
+                reference.update((arity as u64).to_le_bytes());
+                reference.update((count as u64).to_le_bytes());
+                for row in &rows {
+                    for value in row {
+                        reference.update(value.to_le_bytes());
+                    }
+                }
+                let expected: [u8; 32] = reference.finalize().into();
+                assert_eq!(rows_digest(arity, &rows), expected);
+            }
+        }
     }
 
     #[test]

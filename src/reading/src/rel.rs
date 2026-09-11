@@ -138,8 +138,8 @@ where
 pub fn row_chop<const M: usize, const K: usize, const V: usize>(
 ) -> impl FnMut(Row<M>) -> (Row<K>, Row<V>) {
     move |v| {
-        let mut key = Row::<K>::new();
-        let mut value = Row::<V>::new();
+        let mut key = Row::<K>::builder();
+        let mut value = Row::<V>::builder();
 
         for i in 0..K {
             key.push(v.column(i));
@@ -147,7 +147,7 @@ pub fn row_chop<const M: usize, const K: usize, const V: usize>(
         for i in K..M {
             value.push(v.column(i));
         }
-        (key, value)
+        (key.finish(), value.finish())
     }
 }
 
@@ -266,11 +266,11 @@ macro_rules! impl_rels {
                     match arity {
                         $(
                             $arity => Rel::[<Collection $arity>](rows.map(|row| {
-                                let mut narrow = Row::<$arity>::new();
+                                let mut narrow = Row::<$arity>::builder();
                                 for column in 0..$arity {
                                     narrow.push(row.column(column));
                                 }
-                                narrow
+                                narrow.finish()
                             })),
                         )*
                         _ => Rel::CollectionFat(rows, arity),

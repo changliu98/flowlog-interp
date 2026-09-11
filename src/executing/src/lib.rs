@@ -20,6 +20,7 @@ pub mod explain;
 pub mod files;
 pub mod jn;
 pub mod map;
+mod merge;
 pub mod native_calls;
 pub mod runner;
 pub mod symbols;

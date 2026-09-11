@@ -4,6 +4,7 @@ use timely::progress::Timestamp;
  * -----------------------------------------------------------------------------------------------
  */
 use differential_dataflow::collection::{AsCollection, VecCollection};
+use differential_dataflow::difference::{IsZero, Semigroup};
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::{ExchangeData, Hashable};
 use std::cell::RefCell;
@@ -69,27 +70,21 @@ where
 /// `Present` build and the `isize` build.
 pub type UpdateBatch = Vec<(Vec<Val>, isize)>;
 
-/// Worker batches, published only after their capture frontiers complete.
-/// Each vector is moved from one worker; flushing holds the lock for one push.
+/// Sorted worker batches, published after their capture frontiers complete.
+/// Each row occurs at most once per batch; signed weights can still cancel
+/// across batches. Flushing holds the shared lock for one vector push.
 pub type MaterializedUpdates = Arc<Mutex<Vec<UpdateBatch>>>;
 
 /// A worker's capture buffer. It stays on that worker until completion; no
 /// process-shared lock is acquired while records arrive.
 pub struct WorkerCapture {
-    local: Rc<RefCell<UpdateBatch>>,
-    shared: MaterializedUpdates,
+    flush: Box<dyn Fn()>,
 }
 
 impl WorkerCapture {
     /// Publish the whole buffer after the downstream probe has completed.
     pub fn flush(&self) {
-        let batch = std::mem::take(&mut *self.local.borrow_mut());
-        if !batch.is_empty() {
-            self.shared
-                .lock()
-                .expect("materialized relation lock poisoned")
-                .push(batch);
-        }
+        (self.flush)();
     }
 }
 
@@ -102,18 +97,39 @@ where
     T: Lattice + TotalOrder,
     D: ExchangeData + Hashable + Array,
 {
-    let local = Rc::new(RefCell::new(Vec::new()));
+    // Keep the native row inline while collecting and sorting. Convert to
+    // the public Vec<Val> representation only once per retained worker row.
+    let local = Rc::new(RefCell::new(Vec::<(D, Semiring)>::new()));
     let captured = Rc::clone(&local);
-    dedup_retained_collection(rel)
-        .inner
+    // This is a final snapshot, so normalize signed weights at materialization
+    // instead of adding another exchange/arrangement/threshold to the dataflow.
+    rel.inner
         .inspect(move |(row, _time, difference)| {
-            let values = (0..row.arity())
-                .map(|column| row.column(column))
-                .collect::<Vec<_>>();
-            captured.borrow_mut().push((values, semiring_weight(difference)));
+            captured.borrow_mut().push((row.clone(), *difference));
         })
         .probe_with(probe);
-    WorkerCapture { local, shared: updates }
+    WorkerCapture { flush: Box::new(move || {
+        let mut rows = std::mem::take(&mut *local.borrow_mut());
+        rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        rows.dedup_by(|current, previous| {
+            if current.0 == previous.0 {
+                previous.1.plus_equals(&current.1);
+                true
+            } else {
+                false
+            }
+        });
+        let batch: UpdateBatch = rows.into_iter()
+            .filter(|(_, difference)| !difference.is_zero())
+            .map(|(row, difference)| {
+                let values = (0..row.arity()).map(|column| row.column(column)).collect();
+                (values, semiring_weight(&difference))
+            })
+            .collect();
+        if !batch.is_empty() {
+            updates.lock().expect("materialized relation lock poisoned").push(batch);
+        }
+    }) }
 }
 
 /// Capture a type-erased relation locally. The caller must retain the returned
@@ -208,13 +224,17 @@ mod tests {
                 (input, capture)
             });
             let row = |value| {
-                let mut row = Row::<1>::new();
+                let mut row = Row::<1>::builder();
                 row.push(value);
-                row
+                row.finish()
             };
             for value in (worker.index()..1024).step_by(worker.peers()) {
                 input.update(row(value as Val), semiring_one());
                 input.update(row(value as Val), semiring_one());
+            }
+            #[cfg(feature = "isize-type")]
+            if worker.index() == 0 {
+                input.update(row(-1), 1);
             }
             input.advance_to(1);
             input.flush();
@@ -223,6 +243,10 @@ mod tests {
             #[cfg(feature = "isize-type")]
             for value in (worker.index()..1024).step_by(worker.peers()).filter(|v| v % 3 == 0) {
                 input.update(row(value as Val), -2);
+            }
+            #[cfg(feature = "isize-type")]
+            if worker.index() == 1 {
+                input.update(row(-1), -1);
             }
             input.close();
             worker.step_while(|| !probe.done());
@@ -235,10 +259,13 @@ mod tests {
             *totals.entry(row[0]).or_default() += weight;
         }
         #[cfg(feature = "isize-type")]
-        assert!(batches.iter().flatten().any(|(_, weight)| *weight < 0));
+        {
+            assert!(batches.iter().flatten().any(|(_, weight)| *weight < 0));
+            assert_eq!(totals.get(&-1), Some(&0), "weights must cancel across workers");
+        }
         for value in 0..1024 {
-            let expected = if cfg!(feature = "isize-type") && value % 3 == 0 { 0 } else { 1 };
-            assert_eq!(totals.get(&value), Some(&expected));
+            let present = !(cfg!(feature = "isize-type") && value % 3 == 0);
+            assert_eq!(totals.get(&value).is_some_and(|weight| *weight > 0), present);
         }
     }
 }

@@ -13,7 +13,8 @@ use parsing::decl::DataType;
 use parsing::diagnostic::{Diagnostic, Result};
 use parsing::parser::Program;
 use parsing::Val;
-use reading::reader::read_relation_file_partition;
+use reading::reader::{read_relation_file_partition_into, InputRow};
+use reading::row::Row;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -50,41 +51,79 @@ pub fn read_facts_directory_with_workers(
         };
         let types = declaration.column_types();
         let path = path.to_string_lossy();
-        let read = |index| read_relation_file_partition(
-            declaration.name(), &types, &path, delimiter, index, workers,
-            &mut |text| symbols.intern(text),
-        );
-        let rows = if workers == 1 {
-            read(0)?
-        } else {
-            let partitions = std::thread::scope(|scope| {
-                let readers: Vec<_> = (1..workers)
-                    .map(|index| {
-                        let read = &read;
-                        scope.spawn(move || read(index))
-                    })
-                    .collect();
-                let mut results = vec![read(0)];
-                // Join every reader even when an earlier range was invalid.
-                for reader in readers {
-                    results.push(reader.join().unwrap_or_else(|_| Err(Diagnostic::internal(
-                        format!("input reader panicked for relation {}", declaration.name())
-                    ))));
-                }
-                results.into_iter().collect::<Result<Vec<_>>>()
-            })?;
-            let mut rows = Vec::with_capacity(partitions.iter().map(Vec::len).sum());
-            for partition in partitions {
-                rows.extend(partition);
-            }
-            rows
+        macro_rules! packed {
+            ($arity:literal) => {
+                unpack_rows(read_sorted_file::<Row<$arity>>(
+                    declaration.name(), &types, &path, delimiter, symbols, workers,
+                )?, workers)
+            };
+        }
+        let rows = match types.len() {
+            0 => packed!(0), 1 => packed!(1), 2 => packed!(2),
+            3 => packed!(3), 4 => packed!(4), 5 => packed!(5),
+            6 => packed!(6), 7 => packed!(7), 8 => packed!(8),
+            _ => read_sorted_file::<Vec<Val>>(
+                declaration.name(), &types, &path, delimiter, symbols, workers,
+            )?,
         };
         states.insert(
             declaration.name().to_string(),
-            Arc::new(RelationState::new(declaration.name(), declaration.arity(), rows)),
+            Arc::new(RelationState::from_sorted_rows(declaration.name(), declaration.arity(), rows)),
         );
     }
     Ok(states)
+}
+
+fn read_sorted_file<R: InputRow + Ord + Send>(
+    name: &str,
+    types: &[DataType],
+    path: &str,
+    delimiter: u8,
+    symbols: &SymbolTable,
+    workers: usize,
+) -> Result<Vec<R>> {
+    let read = |index| -> Result<Vec<R>> {
+        let mut rows = read_relation_file_partition_into::<R>(
+            name, types, path, delimiter, index, workers, &mut |text| symbols.intern(text),
+        )?;
+        rows.sort_unstable();
+        rows.dedup();
+        Ok(rows)
+    };
+    if workers == 1 { return read(0); }
+    let partitions = std::thread::scope(|scope| {
+        let readers: Vec<_> = (1..workers).map(|index| {
+            let read = &read;
+            scope.spawn(move || read(index))
+        }).collect();
+        let mut results = vec![read(0)];
+        // Join every reader even when an earlier range was invalid.
+        for reader in readers {
+            results.push(reader.join().unwrap_or_else(|_| Err(Diagnostic::internal(
+                format!("input reader panicked for relation {name}")
+            ))));
+        }
+        results.into_iter().collect::<Result<Vec<_>>>()
+    })?;
+    Ok(crate::merge::sorted(partitions, &R::cmp, &|_, _| true, None))
+}
+
+/// Allocate the public row vectors only after sorting and deduplication have
+/// finished over inline cells. Chunks are already in final global row order.
+fn unpack_rows<const N: usize>(rows: Vec<Row<N>>, workers: usize) -> Vec<Vec<Val>> {
+    let unpack = |rows: &[Row<N>]| rows.iter().map(|row| row.as_slice().to_vec()).collect::<Vec<_>>();
+    if workers == 1 || rows.len() < 131_072 { return unpack(&rows); }
+    std::thread::scope(|scope| {
+        let mut chunks = rows.chunks(rows.len().div_ceil(workers));
+        let first = chunks.next().unwrap_or(&[]);
+        let readers: Vec<_> = chunks.map(|chunk| scope.spawn(move || unpack(chunk))).collect();
+        let mut output = Vec::with_capacity(rows.len());
+        output.extend(unpack(first));
+        for reader in readers {
+            output.extend(reader.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
+        }
+        output
+    })
 }
 
 /// One cell as it is written.
@@ -133,8 +172,11 @@ pub fn write_outputs(
                     out.write_all(std::slice::from_ref(&delimiter)).map_err(write_error)?;
                 }
                 let column_type = types.get(column).copied().unwrap_or(DataType::Integer);
-                out.write_all(render_cell(*cell, column_type, symbols).as_bytes())
-                    .map_err(write_error)?;
+                match column_type {
+                    DataType::Integer => write!(out, "{cell}").map_err(write_error)?,
+                    DataType::Symbol => out.write_all(render_cell(*cell, column_type, symbols).as_bytes())
+                        .map_err(write_error)?,
+                }
             }
             out.write_all(b"\n").map_err(write_error)?;
         }

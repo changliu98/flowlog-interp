@@ -228,24 +228,27 @@ fn worker_loop(
             continue;
         }
         let stepped = catch_unwind(AssertUnwindSafe(|| {
-            worker.step_or_park(Some(Duration::from_millis(1)));
+            // Active evaluations favor latency: parking between short rounds
+            // turns progress traffic into a storm of wakeup syscalls at scale.
+            // Idle workers still block on their job receiver above.
+            worker.step();
+            budget.observe();
+            live.retain(|(run, built)| {
+                if built.probe.done() {
+                    for capture in &built.captures {
+                        capture.flush();
+                    }
+                    run.report(index, Ok(()));
+                    false
+                } else {
+                    true
+                }
+            });
         }));
         if let Err(panic) = stepped {
             poison(poisoned, budget, &live, None, panic, index);
             return;
         }
-        budget.observe();
-        live.retain(|(run, built)| {
-            if built.probe.done() {
-                for capture in &built.captures {
-                    capture.flush();
-                }
-                run.report(index, Ok(()));
-                false
-            } else {
-                true
-            }
-        });
     }
 }
 

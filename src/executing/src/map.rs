@@ -72,9 +72,9 @@ pub fn row_row<const M: usize, const N: usize>(flow: &TransformationFlow, budget
     #[inline(always)]
     move |v|
     if !budget.stopped() && is_filtered(&v, &const_eqs, &var_eqs, &compares, &budget) {
-        let mut row = Row::<N>::new();
+        let mut row = Row::<N>::builder();
         for id in &k_or_v_ids { row.push(v.column(*id)); }
-        Some(row)
+        Some(row.finish())
     } else {
         None
     }
@@ -105,12 +105,12 @@ pub fn row_kv<const M: usize, const K: usize, const V: usize>(flow: &Transformat
     #[inline(always)]
     move |v|
     if !budget.stopped() && is_filtered(&v, &const_eqs, &var_eqs, &compares, &budget) {
-        let mut key = Row::<K>::new();
-        let mut value = Row::<V>::new();
+        let mut key = Row::<K>::builder();
+        let mut value = Row::<V>::builder();
         for id in &kids { key.push(v.column(*id)); }
         for id in &vids { value.push(v.column(*id)); }
 
-        Some((key, value))
+        Some((key.finish(), value.finish()))
     } else {
         None
     }
@@ -236,6 +236,10 @@ impl RowProgramRunner {
     /// drops the row, the evaluation is stopping, or a step faulted (the
     /// fault is recorded on the budget).
     pub fn evaluate(&self, input: &dyn Array) -> Option<Vec<Val>> {
+        self.evaluate_as(input)
+    }
+
+    fn evaluate_as<R: FromIterator<Val>>(&self, input: &dyn Array) -> Option<R> {
         if self.budget.stopped() {
             return None;
         }
@@ -353,16 +357,7 @@ pub fn row_program<const M: usize, const N: usize>(
     runner: &Arc<RowProgramRunner>,
 ) -> impl FnMut(Row<M>) -> Option<Row<N>> {
     let runner = Arc::clone(runner);
-    move |input| {
-        runner.evaluate(&input).map(|values| {
-            debug_assert_eq!(values.len(), N);
-            let mut output = Row::<N>::new();
-            for value in values {
-                output.push(value);
-            }
-            output
-        })
-    }
+    move |input| runner.evaluate_as(&input)
 }
 
 
@@ -411,20 +406,9 @@ pub fn row_row_fat(flow: &TransformationFlow, budget: &Arc<Budget>) -> impl FnMu
 
 pub fn row_program_fat(runner: &Arc<RowProgramRunner>) -> impl FnMut(FatRow) -> Option<FatRow> {
     let runner = Arc::clone(runner);
-    move |input| {
-        runner.evaluate(&input).map(|values| {
-            let mut output = FatRow::new();
-            for value in values {
-                output.push(value);
-            }
-            output
-        })
-    }
+    move |input| runner.evaluate_as(&input)
 }
 
-/* ------------------------------------------------------------------------ */
-/* renders for map from fat row to fat kv */
-/* ------------------------------------------------------------------------ */
 pub fn row_kv_fat(flow: &TransformationFlow, budget: &Arc<Budget>) -> impl FnMut(FatRow) -> Option<(FatRow, FatRow)> {
     let (kids, vids) =
         if let TransformationFlow::KVToKV { key, value, .. } = flow {

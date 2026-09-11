@@ -27,7 +27,7 @@ use parsing::parser::Program;
 use parsing::rule::{Atom, AtomArg, FLRule};
 use parsing::Val;
 use planning::calls::RowProgram;
-use reading::row::{Array, FatRow};
+use reading::row::FatRow;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;

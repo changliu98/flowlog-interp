@@ -33,7 +33,7 @@ fn jn_extractor<const K: usize, const V: usize, const W: usize, const N: usize>(
     v2: &Row<W>,
     extracts: &[(bool, bool, usize)],
 ) -> Row<N> {
-    let mut row = Row::<N>::new();
+    let mut row = Row::<N>::builder();
     for &(l_or_r, k_or_v, id) in extracts {
         if !k_or_v {
             // from key
@@ -47,7 +47,7 @@ fn jn_extractor<const K: usize, const V: usize, const W: usize, const N: usize>(
             }
         }
     }
-    row
+    row.finish()
 }
 
 /* (k, v) jn (k, v) → (k, v) */
@@ -98,7 +98,7 @@ fn cartesian_extractor<const V: usize, const W: usize, const N: usize>(
     v2: &Row<W>,
     extracts: &[(bool, usize)],
 ) -> Row<N> {
-    let mut row = Row::<N>::new();
+    let mut row = Row::<N>::builder();
     for &(l_or_r, id) in extracts {
         // always from value
         if !l_or_r {
@@ -107,7 +107,7 @@ fn cartesian_extractor<const V: usize, const W: usize, const N: usize>(
             row.push(v2.column(id)); // from right
         }
     }
-    row
+    row.finish()
 }
 
 pub fn cartesian_logic<const V: usize, const W: usize, const N: usize>(
@@ -159,7 +159,7 @@ fn v1_jn_extractor<const K: usize, const V: usize, const N: usize>(
     extracts: &[(bool, usize)],
 ) -> Row<N> {
     // v1 -- always from left
-    let mut row = Row::<N>::new();
+    let mut row = Row::<N>::builder();
     for &(k_or_v, id) in extracts {
         if !k_or_v {
             row.push(k.column(id)); // from key
@@ -167,7 +167,7 @@ fn v1_jn_extractor<const K: usize, const V: usize, const N: usize>(
             row.push(v1.column(id)); // from value
         }
     }
-    row
+    row.finish()
 }
 
 /* (k, v) jn (k, ∅) → (k, v) */
@@ -214,11 +214,11 @@ fn v2_jn_deconstructor<const N: usize>(
 
 #[inline(always)]
 fn v2_jn_extractor<const K: usize, const N: usize>(k: &Row<K>, extracts: &[usize]) -> Row<N> {
-    let mut row = Row::<N>::new();
+    let mut row = Row::<N>::builder();
     for &id in extracts {
         row.push(k.column(id));
     }
-    row
+    row.finish()
 }
 
 /* (k, ∅) jn (k, ∅) → (k, v) */
@@ -261,7 +261,7 @@ pub fn aj_flatten<const K: usize, const V: usize, const N: usize>(
     };
 
     move |k, v| {
-        let mut row = Row::<N>::new();
+        let mut row = Row::<N>::builder();
         for &(k_or_v, id) in &rids {
             if !k_or_v {
                 row.push(k.column(id)); // from key
@@ -269,7 +269,7 @@ pub fn aj_flatten<const K: usize, const V: usize, const N: usize>(
                 row.push(v.column(id)); // from value
             }
         }
-        row
+        row.finish()
     }
 }
 
@@ -305,11 +305,11 @@ pub fn v1_aj_flatten<const K: usize, const N: usize>(
     };
 
     move |k, _| {
-        let mut row = Row::<N>::new();
+        let mut row = Row::<N>::builder();
         for &id in &rids {
             row.push(k.column(id)); // from key
         }
-        row
+        row.finish()
     }
 }
 

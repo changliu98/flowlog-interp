@@ -71,6 +71,37 @@ fn memory_engine() -> Arc<Engine> {
     memory_engine_with(|_| {})
 }
 
+#[test]
+fn parallel_file_preparation_preserves_states_and_refuses_bad_rows() {
+    let temp = TempTree::new("parallel-input");
+    let program = Program::parse(
+        ".in\n.decl E(x: number, y: number)\n.input E.facts\n\
+         .decl Z()\n.input Z.facts\n.decl S(s: symbol)\n.input S.facts\n\
+         .printsize\n.decl O(x: number)\n.rule\nO(x) :- E(x,y).\n",
+        "parallel-input.dl",
+    ).unwrap();
+    let mut contents = String::new();
+    for value in (0..2051).rev() {
+        let line = format!("{value},{}\r\n", value % 11);
+        contents.push_str(&line);
+        contents.push_str(&line);
+    }
+    fs::write(temp.path("E.facts"), &contents).unwrap();
+    fs::write(temp.path("Z.facts"), "\n\r\n\n").unwrap();
+    fs::write(temp.path("S.facts"), "zebra\n字\r\nalpha\n字").unwrap();
+    let symbols = flowlog::symbols::SymbolTable::new();
+    let serial = files::read_facts_directory(&program, &temp.0, b',', &symbols).unwrap();
+    let parallel = files::read_facts_directory_with_workers(&program, &temp.0, b',', &symbols, 32).unwrap();
+    for (name, state) in &serial {
+        assert_eq!(state.rows, parallel[name].rows, "{name}");
+        assert_eq!(state.digest, parallel[name].digest, "{name}");
+    }
+    contents.push_str("2052,bad\n");
+    fs::write(temp.path("E.facts"), contents).unwrap();
+    let error = files::read_facts_directory_with_workers(&program, &temp.0, b',', &symbols, 32).unwrap_err();
+    assert!(error.message.contains("not a number"), "{error}");
+}
+
 fn memory_engine_with(adjust: impl FnOnce(&mut EngineConfig)) -> Arc<Engine> {
     let mut config = EngineConfig {
         workers: 2,

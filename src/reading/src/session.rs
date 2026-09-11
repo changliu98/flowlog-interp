@@ -6,7 +6,6 @@ use crate::Time;
 use crate::{semiring_one, Semiring};
 use crate::row::Row;
 use crate::row::FatRow;
-use crate::row::Array;
 use parsing::Val;
 
 /* ------------------------------------------------------------------------------------ */
@@ -52,18 +51,12 @@ macro_rules! impl_input_sessions {
                     match self {
                         $(
                             InputSessionGeneric::[<InputSession $arity>](session) => {
-                                let mut row = Row::<$arity>::new();
-                                for &value in values {
-                                    row.push(value);
-                                }
+                                let row = Row::<$arity>::from_slice(values);
                                 session.update(row, semiring_one());
                             }
                         )*
                         InputSessionGeneric::InputSessionFat(session, _) => {
-                            let mut row = FatRow::new();
-                            for &value in values {
-                                row.push(value);
-                            }
+                            let row = values.iter().copied().collect::<FatRow>();
                             session.update(row, semiring_one());
                         }
                     }

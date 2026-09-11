@@ -14,12 +14,12 @@ use reading::{semiring_one, Semiring, Val};
 ///
 /// `count` counts the rows of the group (which are distinct, the input being
 /// a set); `sum` wraps on overflow like every other arithmetic of the engine.
-fn aggregate_ints(input: &[Val], op: &AggregationOperator) -> Option<Val> {
+fn aggregate_ints(input: impl Iterator<Item = Val>, op: &AggregationOperator) -> Option<Val> {
     match op {
-        AggregationOperator::Count => Some(input.len() as Val),
-        AggregationOperator::Sum => Some(input.iter().fold(0 as Val, |sum, value| sum.wrapping_add(*value))),
-        AggregationOperator::Min => input.iter().min().copied(),
-        AggregationOperator::Max => input.iter().max().copied(),
+        AggregationOperator::Count => Some(input.count() as Val),
+        AggregationOperator::Sum => Some(input.fold(0 as Val, |sum, value| sum.wrapping_add(value))),
+        AggregationOperator::Min => input.min(),
+        AggregationOperator::Max => input.max(),
     }
 }
 
@@ -40,11 +40,11 @@ pub fn aggregation_reduce_logic<const N_GB: usize>(
     let operator = aggregation.operator().clone();
 
     move |_key, input, _existing_output, updates| {
-        let mut out = Row::<1>::new();
-        let values: Vec<Val> = input.iter().map(|(row, _)| row.column(0)).collect();
-        if let Some(result) = aggregate_ints(&values, &operator) {
+        let mut out = Row::<1>::builder();
+        let values = input.iter().map(|(row, _)| row.column(0));
+        if let Some(result) = aggregate_ints(values, &operator) {
             out.push(result);
-            updates.push((out, semiring_one()));
+            updates.push((out.finish(), semiring_one()));
         }
     }
 }
@@ -55,8 +55,8 @@ pub fn aggregation_separate<const ARITY: usize, const KEY: usize>(
     position: usize,
 ) -> impl Fn(Row<ARITY>) -> (Row<KEY>, Row<1>) {
     move |row| {
-        let mut key = Row::<KEY>::new();
-        let mut value = Row::<1>::new();
+        let mut key = Row::<KEY>::builder();
+        let mut value = Row::<1>::builder();
         for column in 0..ARITY {
             if column == position {
                 value.push(row.column(column));
@@ -64,7 +64,7 @@ pub fn aggregation_separate<const ARITY: usize, const KEY: usize>(
                 key.push(row.column(column));
             }
         }
-        (key, value)
+        (key.finish(), value.finish())
     }
 }
 
@@ -74,7 +74,7 @@ pub fn aggregation_merge<const KEY: usize, const ARITY: usize>(
     position: usize,
 ) -> impl Fn((Row<KEY>, Row<1>)) -> Row<ARITY> {
     move |(key, value)| {
-        let mut out = Row::<ARITY>::new();
+        let mut out = Row::<ARITY>::builder();
         let mut next_key = 0;
         for column in 0..ARITY {
             if column == position {
@@ -84,7 +84,7 @@ pub fn aggregation_merge<const KEY: usize, const ARITY: usize>(
                 next_key += 1;
             }
         }
-        out
+        out.finish()
     }
 }
 
@@ -104,11 +104,11 @@ pub fn aggregation_reduce_logic_fat(
     let operator = aggregation.operator().clone();
 
     move |_key, input, _existing_output, updates| {
-        let mut out = Row::<1>::new();
-        let values: Vec<Val> = input.iter().map(|(row, _)| row.column(0)).collect();
-        if let Some(result) = aggregate_ints(&values, &operator) {
+        let mut out = Row::<1>::builder();
+        let values = input.iter().map(|(row, _)| row.column(0));
+        if let Some(result) = aggregate_ints(values, &operator) {
             out.push(result);
-            updates.push((out, semiring_one()));
+            updates.push((out.finish(), semiring_one()));
         }
     }
 }
@@ -117,7 +117,7 @@ pub fn aggregation_reduce_logic_fat(
 pub fn aggregation_separate_fat(position: usize) -> impl Fn(FatRow) -> (FatRow, Row<1>) {
     move |row| {
         let mut key = FatRow::new();
-        let mut value = Row::<1>::new();
+        let mut value = Row::<1>::builder();
         for column in 0..row.arity() {
             if column == position {
                 value.push(row.column(column));
@@ -125,7 +125,7 @@ pub fn aggregation_separate_fat(position: usize) -> impl Fn(FatRow) -> (FatRow, 
                 key.push(row.column(column));
             }
         }
-        (key, value)
+        (key, value.finish())
     }
 }
 
@@ -153,10 +153,11 @@ mod tests {
 
     #[test]
     fn the_aggregate_column_round_trips_from_any_position() {
-        let mut row = Row::<3>::new();
+        let mut row = Row::<3>::builder();
         row.push(10);
         row.push(20);
         row.push(30);
+        let row = row.finish();
         let (key, value) = aggregation_separate::<3, 2>(1)(row.clone());
         assert_eq!((key.column(0), key.column(1), value.column(0)), (10, 30, 20));
         let merged = aggregation_merge::<2, 3>(1)((key, value));

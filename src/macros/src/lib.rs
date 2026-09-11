@@ -595,14 +595,14 @@ pub fn codegen_min_optimize(_: TokenStream) -> TokenStream {
                     .flat_map({
                         let position = idb_catalog.position();
                         move |(row, t, _)| {
-                            let mut key = reading::row::Row::<#key_arity>::new();
+                            let mut key = reading::row::Row::<#key_arity>::builder();
                             for i in 0..#arity {
                                 if i != position {
                                     key.push(row.column(i));
                                 }
                             }
                             let value = row.column(position);
-                            std::iter::once((key, reading::Min::new(value))).into_iter().map(move |(x, d2)| (x, t.clone(), d2))
+                            std::iter::once((key.finish(), reading::Min::new(value))).into_iter().map(move |(x, d2)| (x, t.clone(), d2))
                         }
                     })
                     .as_collection()
@@ -631,7 +631,7 @@ pub fn codegen_min_optimize(_: TokenStream) -> TokenStream {
                     .flat_map({
                         let position = idb_catalog.position();
                         move |(key, t, min_val)| {
-                            let mut result = reading::row::Row::<#arity>::new();
+                            let mut result = reading::row::Row::<#arity>::builder();
                             let mut next_key = 0;
                             for i in 0..#arity {
                                 if i == position {
@@ -642,7 +642,7 @@ pub fn codegen_min_optimize(_: TokenStream) -> TokenStream {
                                     next_key += 1;
                                 }
                             }
-                            std::iter::once((result, reading::semiring_one())).into_iter().map(move |(x2, d2)| (x2, t.clone(), d2))
+                            std::iter::once((result.finish(), reading::semiring_one())).into_iter().map(move |(x2, d2)| (x2, t.clone(), d2))
                         }
                     })
                     .as_collection()

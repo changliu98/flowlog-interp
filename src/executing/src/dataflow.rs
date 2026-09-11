@@ -606,10 +606,9 @@ impl Assembly {
         // an open input keeps the dataflow, and with it the worker, waiting.
         for (mut session, rows) in sessions.drain(..) {
             if failure.is_none() {
-                for (row_index, row) in rows.iter().enumerate() {
-                    if row_index % peers == index {
-                        session.update_values(row);
-                    }
+                let chunk = rows.len().div_ceil(peers).max(1);
+                for row in rows.chunks(chunk).nth(index).unwrap_or(&[]) {
+                    session.update_values(row);
                 }
             }
             session.close();

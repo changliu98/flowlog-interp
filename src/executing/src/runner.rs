@@ -9,7 +9,7 @@
 //! intermediates across strata, and never touches the cache. Both run on the
 //! same worker set and capture the same states.
 
-use crate::accounting::Budget;
+use crate::accounting::{Budget, MemoryCounter};
 use crate::cache::{
     contribution_key, symbol_cells, unit_inputs, unit_key, units_of_stratum, CacheEntry,
     CacheRunStats, HitSource, RelationState, StrataCache, Unit,
@@ -20,6 +20,7 @@ use crate::engine::{budget_of, Engine, EngineConfig, EvaluationOptions, Schedule
 use crate::native_calls::NativeCallModule;
 use crate::worker::WorkerSet;
 use catalog::head::aggregation_catalog_from_program;
+use itertools::Itertools;
 use parsing::diagnostic::Result;
 use parsing::parser::Program;
 use parsing::Val;
@@ -225,11 +226,11 @@ fn run_whole(
     stats.execution_micros = duration_micros(started.elapsed());
 
     for (name, updates) in captures {
-        let rows = consolidate(&updates);
+        let rows = consolidate(&updates, budget.memory());
         budget.note_tuples(rows.len() as u64);
         let arity = heads[&name];
         stats.rows_cached += rows.len();
-        states.insert(name.clone(), Arc::new(RelationState::new(&name, arity, rows)));
+        states.insert(name.clone(), Arc::new(RelationState::from_sorted_rows(&name, arity, rows)));
     }
     budget.poll()?;
     Ok(states)
@@ -427,12 +428,12 @@ fn run_per_stratum(
             for (pending, captures) in missed.into_iter().zip(unit_captures) {
                 let mut relations = BTreeMap::new();
                 for (name, updates) in captures {
-                    let rows = consolidate(&updates);
+                    let rows = consolidate(&updates, budget.memory());
                     budget.note_tuples(rows.len() as u64);
                     let arity = pending.unit.heads[&name];
                     relations.insert(
                         name.clone(),
-                        Arc::new(RelationState::new(&name, arity, rows)),
+                        Arc::new(RelationState::from_sorted_rows(&name, arity, rows)),
                     );
                 }
                 let entry = entry_of(relations);
@@ -454,13 +455,18 @@ fn run_per_stratum(
             // Reconstruct from active contributions. A deletion omits one
             // support, never subtracts a tuple still supported by another rule
             // or by the head's state entering this stratum.
-            let rows = union
+            let contributions: Vec<_> = union
                 .inherited
                 .iter()
                 .chain(union.contributions.iter())
-                .flat_map(|state| state.rows.iter().cloned())
-                .collect::<Vec<Vec<Val>>>();
-            let state = Arc::new(RelationState::new(&union.head, union.arity, rows));
+                .collect();
+            let state = if contributions.len() == 1 {
+                Arc::clone(contributions[0])
+            } else {
+                let rows = contributions.iter().map(|state| state.rows.iter())
+                    .kmerge().dedup().cloned().collect();
+                Arc::new(RelationState::from_sorted_rows(&union.head, union.arity, rows))
+            };
             stats.rows_cached += state.rows.len();
             let entry = entry_of(BTreeMap::from([(union.head, state)]));
             stats.disk += store(union.key, Arc::clone(&entry));
@@ -485,18 +491,32 @@ fn run_per_stratum(
 
 /// The rows a capture accumulated, as a set: every row whose total weight is
 /// positive once the worker frontier has closed.
-pub(crate) fn consolidate(updates: &MaterializedUpdates) -> Vec<Vec<Val>> {
-    let mut consolidated = BTreeMap::<Vec<Val>, isize>::new();
+pub(crate) fn consolidate(updates: &MaterializedUpdates, memory: &Arc<MemoryCounter>) -> Vec<Vec<Val>> {
     let batches = std::mem::take(&mut *updates.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
-    for (row, difference) in batches.into_iter().flatten() {
-        *consolidated.entry(row).or_default() += difference;
-    }
-    consolidated
-        .into_iter()
-        .filter_map(|(row, difference)| (difference > 0).then_some(row))
-        .collect()
+    let merged = crate::merge::sorted(batches,
+        &|a: &(Vec<Val>, isize), b| a.0.cmp(&b.0),
+        &|a, b| { a.1 += b.1; a.1 != 0 }, Some(memory));
+    merged.into_iter().filter_map(|(row, weight)| (weight > 0).then_some(row)).collect()
 }
 
 pub(crate) fn duration_micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn materialization_merges_signed_support_across_workers() {
+        let updates = Arc::new(Mutex::new(vec![
+            vec![(vec![], 1), (vec![1], 2), (vec![2], -1), (vec![4], 3)],
+            vec![],
+            vec![(vec![], -1), (vec![1], -2), (vec![2], 2), (vec![3], -1)],
+            vec![(vec![3], 1), (vec![4], -2), (vec![5], -1)],
+        ]));
+        let memory = Arc::new(MemoryCounter::default());
+        assert_eq!(consolidate(&updates, &memory), vec![vec![2], vec![4]]);
+        assert!(consolidate(&updates, &memory).is_empty());
+    }
 }

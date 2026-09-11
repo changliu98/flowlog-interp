@@ -2,11 +2,13 @@
 //!
 //! A program's `.code rust` blocks are independent compilation units. Each
 //! block is compiled by `rustc` into a shared library named by the digest of
-//! the block's source, the compiler's version and the call interface version,
-//! so a block that did not change is never rebuilt, whatever else in the
-//! program did. The library exports one entry point per public function,
-//! `__flowlog_call_<name>`, and one `__flowlog_last_panic` that hands back
-//! the location and message of the most recent panic on the calling thread.
+//! the complete generated source, the compiler's version and the call
+//! interface version. Changes to the engine's scaffolding invalidate the
+//! library along with changes to the block. Unchanged, valid libraries are
+//! reused, whatever else in the program did. The library exports one entry
+//! point per public function, `__flowlog_call_<name>`, and one
+//! `__flowlog_last_panic` that hands back the location and message of the
+//! most recent panic on the calling thread.
 //!
 //! The call interface (`CALL_ABI_VERSION`) is the engine's contract with the
 //! generated wrapper, independent of how the engine lays out rows:
@@ -40,8 +42,9 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
-use tracing::info;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use tracing::{info, warn};
 
 /// The version of the call interface; part of every library's digest.
 pub const CALL_ABI_VERSION: &str = "flowlog-call-abi-v3-cells-context";
@@ -169,23 +172,13 @@ impl NativeCallModule {
         let mut blocks = Vec::with_capacity(embedded.blocks().len());
         let mut functions = HashMap::new();
         for (index, block) in embedded.blocks().iter().enumerate() {
-            let loaded = load_block(&rustc, &rustc_version, &cache_root, block, program_name)?;
-            for function in block.functions() {
-                let symbol_name = format!("__flowlog_call_{}", function.name());
-                let call = unsafe { loaded._library.get::<NativeCall>(symbol_name.as_bytes()) }
-                    .map_err(|error| {
-                        Diagnostic::internal(format!(
-                            "embedded Rust export {:?} is missing symbol {symbol_name:?} in {}: \
-                             {error}",
-                            function.name(),
-                            loaded.path.display()
-                        ))
-                        .with_function(function.name())
-                    })?;
+            let (loaded, calls) =
+                load_block(&rustc, &rustc_version, &cache_root, block, program_name)?;
+            for (function, call) in block.functions().iter().zip(calls) {
                 functions.insert(
                     function.name().to_string(),
                     LoadedFunction {
-                        call: *call,
+                        call,
                         block: index,
                         arity: function.arity(),
                         return_type: function.return_type(),
@@ -302,15 +295,33 @@ fn cache_directory(requested: Option<&Path>) -> PathBuf {
     env::temp_dir().join("flowlog-calls")
 }
 
-/// The digest a block's library is named by.
-pub fn block_digest(source: &str, rustc_version: &str) -> String {
+/// The digest a block's library is named by. `generated` must be the complete
+/// source passed to rustc, including the engine's scaffolding and wrappers.
+pub fn block_digest(generated: &str, rustc_version: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(CALL_ABI_VERSION.as_bytes());
     hasher.update([0]);
     hasher.update(rustc_version.as_bytes());
     hasher.update([0]);
-    hasher.update(source.as_bytes());
+    hasher.update(generated.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Share a lock among all loaders of a digest, without retaining every digest
+/// a long-lived daemon has seen. The registry is unlocked before any build.
+fn block_compile_lock(digest: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(digest).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(digest.to_string(), Arc::downgrade(&lock));
+    lock
 }
 
 fn load_block(
@@ -319,8 +330,13 @@ fn load_block(
     cache_root: &Path,
     block: &EmbeddedBlock,
     program_name: &str,
-) -> Result<LoadedBlock> {
-    let digest = block_digest(block.source(), rustc_version);
+) -> Result<(LoadedBlock, Vec<NativeCall>)> {
+    let generated = render_block(block);
+    let digest = block_digest(&generated, rustc_version);
+    let block_lock = block_compile_lock(&digest);
+    // Serialize the cache check, compilation and publication for this digest.
+    // Keep the guard through loading and repair, which can compile again.
+    let _guard = block_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let cache_dir = cache_root.join(&digest);
     fs::create_dir_all(&cache_dir).map_err(|error| {
         Diagnostic::function(format!(
@@ -335,53 +351,125 @@ fn load_block(
         env::consts::DLL_SUFFIX
     ));
     if !library_path.is_file() {
-        compile_block(rustc, block, &digest, &cache_dir, &library_path, program_name)?;
+        compile_block(
+            rustc,
+            block,
+            &generated,
+            &digest,
+            &cache_dir,
+            &library_path,
+            program_name,
+        )?;
     }
 
-    let library = match unsafe { Library::new(&library_path) } {
-        Ok(library) => library,
+    let (library, last_panic, calls) = match load_library(&library_path, block) {
+        Ok(loaded) => loaded,
         Err(first_error) => {
-            // A killed compiler or an externally damaged cache entry must not
-            // permanently poison this digest: rebuild beside it and replace
-            // the library atomically.
-            compile_block(rustc, block, &digest, &cache_dir, &library_path, program_name)?;
-            unsafe { Library::new(&library_path) }.map_err(|second_error| {
-                Diagnostic::function(format!(
-                    "cannot load the compiled embedded Rust block at {} after rebuilding it: \
-                     {second_error} (first attempt: {first_error})",
-                    library_path.display()
-                ))
+            // Loading the file is not enough: an old or damaged library may
+            // lack a required export. load_library drops the failed handle
+            // before we rebuild beside it and replace the file atomically.
+            warn!("rebuilding an unusable embedded Rust cache entry: {first_error}");
+            compile_block(
+                rustc,
+                block,
+                &generated,
+                &digest,
+                &cache_dir,
+                &library_path,
+                program_name,
+            )
+            .map_err(|repair_error| {
+                cache_repair_diagnostic(&library_path, &first_error, repair_error)
+            })?;
+            load_library(&library_path, block).map_err(|repair_error| {
+                cache_repair_diagnostic(&library_path, &first_error, repair_error)
             })?
         }
     };
+    info!("embedded Rust block ready ({})", library_path.display());
+    Ok((
+        LoadedBlock {
+            _library: library,
+            last_panic,
+            first_line: block.first_line(),
+            path: library_path,
+            digest,
+        },
+        calls,
+    ))
+}
+
+/// Open a library and resolve every required export before accepting it.
+/// On failure the library is dropped here, so a retry can load its replacement.
+fn load_library(
+    library_path: &Path,
+    block: &EmbeddedBlock,
+) -> Result<(Library, LastPanic, Vec<NativeCall>)> {
+    let library = unsafe { Library::new(library_path) }.map_err(|error| {
+        Diagnostic::function(format!(
+            "cannot load the embedded Rust cache entry {}: {error}",
+            library_path.display()
+        ))
+    })?;
     let last_panic = unsafe { library.get::<LastPanic>(b"__flowlog_last_panic") }
         .map(|symbol| *symbol)
         .map_err(|error| {
-            Diagnostic::internal(format!(
-                "the compiled embedded Rust block at {} has no panic channel: {error}",
+            Diagnostic::function(format!(
+                "the embedded Rust cache entry {} is missing the required panic channel \
+                 symbol __flowlog_last_panic: {error}",
                 library_path.display()
             ))
         })?;
-    info!("embedded Rust block ready ({})", library_path.display());
-    Ok(LoadedBlock {
-        _library: library,
-        last_panic,
-        first_line: block.first_line(),
-        path: library_path,
-        digest,
-    })
+    let mut calls = Vec::with_capacity(block.functions().len());
+    for function in block.functions() {
+        let symbol_name = format!("__flowlog_call_{}", function.name());
+        let call = unsafe { library.get::<NativeCall>(symbol_name.as_bytes()) }
+            .map(|symbol| *symbol)
+            .map_err(|error| {
+                Diagnostic::function(format!(
+                    "the embedded Rust cache entry {} is missing the required call wrapper \
+                     symbol {symbol_name}: {error}",
+                    library_path.display()
+                ))
+                .with_function(function.name())
+            })?;
+        calls.push(call);
+    }
+    Ok((library, last_panic, calls))
+}
+
+fn cache_repair_diagnostic(
+    library_path: &Path,
+    first_error: &Diagnostic,
+    repair_error: Diagnostic,
+) -> Diagnostic {
+    Diagnostic::function(format!(
+        "the embedded Rust cache entry {} is unusable and one rebuild attempt failed; \
+         remove this file and retry, or select a writable cache directory with --call-cache \
+         or FLOWLOG_CALL_CACHE",
+        library_path.display()
+    ))
+    .with_detail(format!(
+        "Initial cache failure: {first_error}\nRepair failure: {repair_error}"
+    ))
 }
 
 fn compile_block(
     rustc: &OsString,
     block: &EmbeddedBlock,
+    generated: &str,
     digest: &str,
     cache_dir: &Path,
     library_path: &Path,
     program_name: &str,
 ) -> Result<()> {
-    let generated = render_block(block);
-    let unique = format!("{}.{}", std::process::id(), &digest[..16]);
+    static NEXT_COMPILATION: AtomicU64 = AtomicU64::new(0);
+    let unique = format!(
+        "{}.{}.{}",
+        std::process::id(),
+        NEXT_COMPILATION.fetch_add(1, Ordering::Relaxed),
+        &digest[..16]
+    );
     let source_path = cache_dir.join(format!("block.{unique}.rs"));
     let temporary_library = cache_dir.join(format!("library.{unique}.tmp"));
     fs::write(&source_path, generated).map_err(|error| {

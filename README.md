@@ -296,12 +296,15 @@ Renamed(R, K) :- Named(N, K), R = @call(suffixed, N).
   naming the function, the line of its block as written, the program line,
   and the rule that called it. It never unwinds into the engine.
 - Each block is compiled by `rustc` into a shared library named by the digest
-  of its source, the compiler version and the call interface version
+  of the complete generated source (including the engine's scaffolding and
+  call wrappers), the compiler version and the call interface version
   (`CALL_ABI_VERSION`), under `--call-cache`, `FLOWLOG_CALL_CACHE`,
   `$XDG_CACHE_HOME/flowlog/calls`, `$HOME/.cache/flowlog/calls` or a temporary
-  directory. A block that did not change is never rebuilt, whatever else in
-  the program did. A block that does not compile is a `function` diagnostic
-  carrying rustc's report with lines counted inside the block.
+  directory. Unchanged, valid libraries are reused. A library that cannot
+  load or lacks the panic channel or any call wrapper is rebuilt once and
+  replaced atomically. If repair fails, a `function` diagnostic names the
+  cache file to remove and reports both failures. A block that does not
+  compile carries rustc's report with lines counted inside the block.
 - The call interface is documented in `src/executing/src/native_calls.rs`:
   one `i64` cell per argument and result, and a context of two callbacks over
   the engine's symbol table. Embedded Rust is trusted native code and runs

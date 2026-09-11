@@ -1,7 +1,15 @@
-# FlowLog Bench performance at 32 workers
+# FlowLog and Ink performance at 32 workers
+
+The four FlowLog Bench cases improve by **3.22x** geometric mean. A separate
+four-function Ink decompiler sample saves **2.85% end to end**; warm resident
+cache performance is effectively unchanged. These are different workloads
+and timing scopes, detailed below.
+
+## FlowLog Bench
 
 The frozen baseline is `fd566eaa7ce86b0da66c31673e4448b1b429134b`, already
 using DD 0.25.1 / Timely 0.31.0 and the preceding byte-range/capture fixes.
+The optimized engine is `ca8d05655b832f13c7ed611787f49dc22afe2225`.
 The benchmark repository is [FlowLog Bench](https://github.com/flowlog-rs/flowlog-bench/tree/2db7c2eab9f64852242a1691b51707f3fb3454ff)
 at `2db7c2eab9f64852242a1691b51707f3fb3454ff`.
 
@@ -104,3 +112,74 @@ other three workloads use less peak memory. Active stepping and parallel
 materialization favor latency on a machine with spare cores; these results
 do not establish behavior under CPU oversubscription. The full 64-bit cell
 domain and complete returned relation states were retained throughout.
+
+## Ink decompiler integration
+
+The same engine revisions were compared through Ink's actual CLI at
+32 workers, using Python 3.12.13 and Ink revision
+`a3db3e30570c463529ed248b1753877d430e3738` with its pre-existing local edits.
+The rebuilt engine worked at the adapter's default binary path without
+adapter changes. These runs explicitly selected FlowLog and 32 workers;
+the pool configuration at measurement time defaulted to two engine workers.
+
+The frozen learned base was `rules:f452167cfd7504195a8f9f52`, containing
+1,225 clauses and one embedded function. Its rule-log SHA-256 was
+`6fd0424ec8b121117be7363336d65f5f5fbec576ca40018fa6897f0f440e9302`.
+The input module was `datasets/masked/plain/obj_e694796b4073.ll`, SHA-256
+`fe02a1b5835a7fef009d34ac40a406ef813508f65931bda04e1208f7c655ce76`.
+Four fixed TRAIN functions were selected, one per optimization level.
+
+Each function ran three times per engine with batch caching disabled and
+run order shuffled using seed 8541. Native function compilation caches were
+already populated. Complete CLI time includes Python startup, imports,
+rule replay, LLVM loading, Datalog, MaxSMT, emission, and cleanup. Oracle
+compilation, KLEE, shipped tests, and LLM calls are outside these timings.
+Every timed C output matched its validated digest.
+
+| Function | Level | Baseline s | Optimized s | Saved s |
+|---|---|---:|---:|---:|
+| `obj_0064c93f7856` | o0 | 9.936 | 9.734 | 0.201 |
+| `obj_026d643b7b84` | o1 | 7.480 | 7.129 | 0.351 |
+| `obj_05032907c30d` | o2 | 7.229 | 6.879 | 0.350 |
+| `obj_0587476cf731` | o3 | 10.586 | 10.486 | 0.100 |
+
+The following totals sum the four per-function medians, so they describe
+sequential execution. They do not measure a parallel learning-pool round.
+Savings are calculated before rounding.
+
+| Timing scope | Baseline s | Optimized s | Saved s | Saved % |
+|---|---:|---:|---:|---:|
+| Complete CLI | 35.231 | 34.228 | 1.002 | 2.85% |
+| Decompiler pipeline | 24.338 | 23.508 | 0.830 | 3.41% |
+| Datalog stages, including adapter/provenance | 23.008 | 22.199 | 0.809 | 3.52% |
+| Native engine reported evaluation | 8.257 | 7.561 | 0.696 | 8.43% |
+
+The native timer excludes native input preparation and output CSV writing.
+Time outside it also includes Python setup, translation/provenance, and
+process startup; this comparison does not profile their individual costs.
+The measured saving is about **one second per four-function pass**. Three
+repetitions on this selected cohort do not establish a reliable gain across
+the corpus.
+
+A separate resident-daemon comparison used the o0 function, one untimed
+priming evaluation, and three warm evaluations per engine. Median pipeline
+time was **5.175 s before and 5.217 s after**, effectively unchanged.
+Every warm evaluation hit all 996 cached units and evaluated zero rules.
+
+Integration checks exercised batch, disk-backed CLI, and resident-daemon
+execution. All four functions emitted the same C and the same 74,925 semantic
+facts across the optimized engine, baseline engine, and Python evaluator;
+fact order was normalized before comparison. All four compiled under Ink's
+actual clang-18 oracle settings. Shipped assertions passed for **3/4**;
+the o1 function's failure is shared by the identical baseline/evaluator C.
+KLEE reported **1/4 `no_difference_within_bound` and 3/4 refused**, with a
+10-second budget and scale 1. The refusals involved floating-point
+concretization, timeout/model-limited memory operations, and allocation
+address observations. Backend parity and successful compilation do not
+establish semantic correctness for the refused cases.
+
+Local evidence remains under `target/ink-integration-j7dl6ms1/`: the input
+and rule manifest, frozen rule copy, phase journals, semantic facts,
+generated C, oracle reports, individual timing runs, and batch/daemon
+summaries. These generated artifacts are ignored by Git. No live rule base
+or pool configuration was changed for this comparison.

@@ -275,6 +275,7 @@ pub unsafe extern "C" fn flowlog_evaluate(
             },
             inputs: Inputs::Rows(rows),
             options: EvaluationOptions {
+                profile_path: None,
                 limits: Limits {
                     time: options.budget_seconds.map(Duration::from_secs_f64),
                     cancel: None,

@@ -133,6 +133,10 @@ println!("{:?}", result.stats);                               // the run's count
 `Engine::evaluate` never panics: a defect in the engine's own code comes back
 as a diagnostic of kind `internal`. `EvaluationOptions` carries the limits,
 whether to read along the cache, the schedule, and the rows to explain.
+State caching is off by default for the CLI, library and service. Set
+`options.cache = Some(true)` (JSON `"cache": true`), `--cached`, or the CLI's
+`--cache-dir` explicitly to enable it. No disk-cache directory is chosen by
+default.
 
 ### C
 
@@ -298,10 +302,12 @@ Renamed(R, K) :- Named(N, K), R = @call(suffixed, N).
 - Each block is compiled by `rustc` into a shared library named by the digest
   of the complete generated source (including the engine's scaffolding and
   call wrappers), the compiler version and the call interface version
-  (`CALL_ABI_VERSION`), under `--call-cache`, `FLOWLOG_CALL_CACHE`,
-  `$XDG_CACHE_HOME/flowlog/calls`, `$HOME/.cache/flowlog/calls` or a temporary
-  directory. Unchanged, valid libraries are reused. A library that cannot
-  load or lacks the panic channel or any call wrapper is rebuilt once and
+  (`CALL_ABI_VERSION`). By default, it compiles in a temporary build directory
+  removed when the loaded module is released; it does not create a persistent
+  cache in the home, XDG, or temporary directory. `--call-cache` or
+  `FLOWLOG_CALL_CACHE` explicitly opts into persistent compiled libraries.
+  Only that explicit store reuses libraries across evaluations. A library that
+  cannot load or lacks the panic channel or any call wrapper is rebuilt once and
   replaced atomically. If repair fails, a `function` diagnostic names the
   cache file to remove and reports both failures. A block that does not
   compile carries rustc's report with lines counted inside the block.
@@ -327,9 +333,9 @@ projection. A rule that needs none of it has no row program.
 
 ### Schedules
 
-- **Whole program** (the command line's default without a cache): every
+- **Whole program** (the CLI, library and service default): every
   stratum in one dataflow, sharing intermediates across strata. Never cached.
-- **Per stratum** (the library's default, and the command line's with
+- **Per stratum** (explicit caching or scheduling, including the CLI's
   `--cached` or `--cache-dir`): one dataflow per stratum, each unit keyed
   against the state cache.
 

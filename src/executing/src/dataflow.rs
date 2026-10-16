@@ -55,6 +55,7 @@ pub(crate) struct AssemblyContext<'a> {
     pub idb_map: &'a HashMap<String, AggregationHeadIDB>,
     pub budget: &'a Arc<Budget>,
     pub program_name: &'a str,
+    pub profile: &'a Option<Arc<crate::profile::Profile>>,
 }
 
 /// Assemble one group's operators into `scope`.
@@ -93,7 +94,8 @@ pub(crate) fn assemble_group<'scope>(
 
     if !group_plan.is_recursive() {
         /* construct dataflow for a non-recursive strata */
-        for next_transformation in group_plan.strata_plan() {
+        for (rule, next_transformation) in group_plan.strata_plan_with_rules() {
+                let _profile_rule = context.profile.as_ref().map(|profile| profile.rule(scope.worker(), rule, group_plan.is_recursive()));
             let output = next_transformation.output();
             let output_signature = output.signature();
             let (ok, ov) = output.arity();
@@ -285,7 +287,8 @@ pub(crate) fn assemble_group<'scope>(
             }
 
             // mostly identical to the non-recursive case
-            for next_transformation in group_plan.strata_plan() {
+            for (rule, next_transformation) in group_plan.strata_plan_with_rules() {
+                let _profile_rule = context.profile.as_ref().map(|profile| profile.rule(scope.worker(), rule, group_plan.is_recursive()));
                 let output = next_transformation.output();
                 let output_signature = output.signature();
                 let (ok, ov) = output.arity();
@@ -498,6 +501,7 @@ pub struct Assembly {
     pub native_calls: Option<Arc<NativeCallModule>>,
     pub budget: Arc<Budget>,
     pub program_name: String,
+    pub profile: Option<Arc<crate::profile::Profile>>,
 }
 
 /// Completion and the buffers that must be published before reporting it.
@@ -558,6 +562,7 @@ impl Assembly {
                 idb_map: &self.idb_map,
                 budget: &self.budget,
                 program_name: &self.program_name,
+                profile: &self.profile,
             };
 
             for computation in self.computations.iter() {

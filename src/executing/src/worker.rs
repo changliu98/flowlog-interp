@@ -51,11 +51,12 @@ pub struct WorkerSet {
     guards: Option<WorkerGuards<()>>,
     poisoned: Arc<AtomicBool>,
     peers: usize,
+    profile: Option<Arc<crate::profile::Profile>>,
 }
 
 impl WorkerSet {
     /// Start `workers` threads for an evaluation running under `budget`.
-    pub fn start(workers: usize, budget: Arc<Budget>) -> Result<Self> {
+    pub fn start(workers: usize, budget: Arc<Budget>, profile: Option<Arc<crate::profile::Profile>>) -> Result<Self> {
         let workers = workers.max(1);
         let mut senders = Vec::with_capacity(workers);
         let mut receivers = Vec::with_capacity(workers);
@@ -67,10 +68,12 @@ impl WorkerSet {
         let receivers = Arc::new(Mutex::new(receivers));
         let poisoned = Arc::new(AtomicBool::new(false));
 
+        let saved_profile = profile.clone();
         let closure_receivers = Arc::clone(&receivers);
         let closure_poisoned = Arc::clone(&poisoned);
         let closure_budget = Arc::clone(&budget);
         let guards = timely::execute(Config::process(workers), move |worker| {
+            if let Some(profile) = &profile { profile.attach(worker); }
             worker_loop(
                 worker,
                 &closure_receivers,
@@ -92,8 +95,11 @@ impl WorkerSet {
             guards: Some(guards),
             poisoned,
             peers: workers,
+            profile: saved_profile,
         })
     }
+
+    pub fn profile(&self) -> Option<Arc<crate::profile::Profile>> { self.profile.clone() }
 
     pub fn peers(&self) -> usize {
         self.peers

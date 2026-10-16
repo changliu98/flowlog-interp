@@ -44,7 +44,7 @@ pub struct Args {
     #[arg(short = 'O', value_parser = clap::value_parser!(u8).range(0..=3))]
     opt_level: Option<u8>,
 
-    /// directory for content-addressed compiled `.code rust` blocks
+    /// opt-in persistent directory for compiled `.code rust` blocks (temporary by default)
     #[arg(long)]
     call_cache: Option<PathBuf>,
 
@@ -77,6 +77,10 @@ pub struct Args {
     /// wall-clock budget of the evaluation, in seconds
     #[arg(long)]
     budget_seconds: Option<f64>,
+
+    /// Write partial operator costs here while evaluating.
+    #[arg(long)]
+    profile_json: Option<PathBuf>,
 
     /// bytes the evaluation may hold at once, in MiB
     #[arg(long)]
@@ -161,6 +165,7 @@ impl Args {
 
     pub fn options(&self) -> EvaluationOptions {
         EvaluationOptions {
+            profile_path: self.profile_json.clone(),
             limits: Limits {
                 time: self.budget_seconds.map(Duration::from_secs_f64),
                 cancel: None,

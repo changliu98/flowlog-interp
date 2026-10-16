@@ -79,6 +79,7 @@ pub struct ExplainSpec {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct OptionsSpec {
+    pub profile_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_seconds: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -456,6 +457,7 @@ impl Service {
             program: ProgramSource::Parsed(parsed),
             inputs: engine_inputs,
             options: EvaluationOptions {
+                profile_path: options.profile_path.clone(),
                 limits: Limits {
                     time: options.budget_seconds.map(Duration::from_secs_f64),
                     cancel: Some(cancel),

@@ -104,15 +104,19 @@ pub fn run(
     options: &EvaluationOptions,
 ) -> Result<RunOutcome> {
     let total_started = Instant::now();
+    let profile_run = crate::profile::ProfileRun::start(options.profile_path.as_ref());
+    let profile = profile_run.as_ref().map(|run| Arc::clone(&run.profile));
     let config = engine.config();
     let strata = Strata::try_from_parser(program.clone())?;
     debugging::debugger::display_info("Strata", false, format!("{}\n{}", strata.dependency_graph(), strata));
     let (whole_plan, fat_mode) = plan_check(&strata, config)?;
+    if let Some(profile) = &profile { profile.phase("compiling_helpers"); }
     let native = native_module(engine, &program)?;
     let idb_map = Arc::new(aggregation_catalog_from_program(&program));
     let budget = budget_of(options);
     let _tag = crate::accounting::MemoryTag::new(budget.memory());
-    let workers = WorkerSet::start(config.workers, Arc::clone(&budget))?;
+    let workers = WorkerSet::start(config.workers, Arc::clone(&budget), profile.clone())?;
+    if let Some(profile) = &profile { profile.phase("executing"); }
     let planning_elapsed = total_started.elapsed();
 
     let mut stats = CacheRunStats::default();
@@ -161,6 +165,7 @@ pub fn run(
         stats.contribution_hits, stats.contribution_disk_hits, stats.contribution_misses,
         stats.rules_evaluated
     );
+    if let Some(profile) = &profile { profile.complete(); }
     Ok(RunOutcome {
         program,
         states,
@@ -221,6 +226,7 @@ fn run_whole(
         native_calls: native.clone(),
         budget: Arc::clone(budget),
         program_name: program.name().to_string(),
+        profile: workers.profile(),
     });
     workers.run(assembly)?;
     stats.execution_micros = duration_micros(started.elapsed());
@@ -421,6 +427,7 @@ fn run_per_stratum(
                 native_calls: native.clone(),
                 budget: Arc::clone(budget),
                 program_name: program.name().to_string(),
+        profile: workers.profile(),
             });
             workers.run(assembly)?;
             execution += started.elapsed();

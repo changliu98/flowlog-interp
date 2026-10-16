@@ -5,7 +5,9 @@
 //! the complete generated source, the compiler's version and the call
 //! interface version. Changes to the engine's scaffolding invalidate the
 //! library along with changes to the block. Unchanged, valid libraries are
-//! reused, whatever else in the program did. The library exports one entry
+//! reused only when a persistent cache was explicitly requested. Otherwise
+//! compilation uses a temporary directory removed when the module is released.
+//! The library exports one entry
 //! point per public function, `__flowlog_call_<name>`, and one
 //! `__flowlog_last_panic` that hands back the location and message of the
 //! most recent panic on the calling thread.
@@ -135,6 +137,44 @@ struct LoadedBlock {
     digest: String,
 }
 
+/// Compilation needs files even when caching is disabled. This directory is
+/// owned by one loaded module and is removed after its libraries are dropped.
+struct TemporaryBuildDirectory(PathBuf);
+
+impl TemporaryBuildDirectory {
+    fn new() -> Result<Self> {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..128 {
+            let path = env::temp_dir().join(format!(
+                "flowlog-rust-{}-{}",
+                std::process::id(),
+                NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed),
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(Diagnostic::function(format!(
+                        "cannot create temporary embedded Rust build directory {}: {error}",
+                        path.display(),
+                    )));
+                }
+            }
+        }
+        Err(Diagnostic::function(
+            "could not reserve a temporary embedded Rust build directory",
+        ))
+    }
+}
+
+impl Drop for TemporaryBuildDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.0) {
+            warn!("could not remove temporary Rust build {}: {error}", self.0.display());
+        }
+    }
+}
+
 /// Every block of one program, compiled and loaded. Keeping the libraries
 /// here keeps every entry point valid for as long as a dataflow may call it.
 pub struct NativeCallModule {
@@ -143,10 +183,12 @@ pub struct NativeCallModule {
     context: Box<CallContext>,
     _symbols: Arc<SymbolTable>,
     program_name: String,
+    // Fields drop in declaration order: the libraries above close first.
+    _temporary_build: Option<TemporaryBuildDirectory>,
 }
 
 impl NativeCallModule {
-    /// Compile every block the cache does not hold, load them all.
+    /// Compile and load every block, using persistent storage only on opt-in.
     pub fn compile_and_load(
         embedded: &EmbeddedRust,
         requested_cache: Option<&Path>,
@@ -167,7 +209,13 @@ impl NativeCallModule {
             )));
         }
         let rustc_version = String::from_utf8_lossy(&version_output.stdout).to_string();
-        let cache_root = cache_directory(requested_cache);
+        let (cache_root, temporary_build) = match cache_directory(requested_cache) {
+            Some(path) => (path, None),
+            None => {
+                let directory = TemporaryBuildDirectory::new()?;
+                (directory.0.clone(), Some(directory))
+            }
+        };
 
         let mut blocks = Vec::with_capacity(embedded.blocks().len());
         let mut functions = HashMap::new();
@@ -199,6 +247,7 @@ impl NativeCallModule {
             context,
             _symbols: symbols,
             program_name: program_name.to_string(),
+            _temporary_build: temporary_build,
         }))
     }
 
@@ -276,23 +325,13 @@ impl NativeCallModule {
     }
 }
 
-fn cache_directory(requested: Option<&Path>) -> PathBuf {
+fn cache_directory(requested: Option<&Path>) -> Option<PathBuf> {
     if let Some(path) = requested {
-        return path.to_path_buf();
+        return Some(path.to_path_buf());
     }
-    if let Some(path) = env::var_os("FLOWLOG_CALL_CACHE").filter(|value| !value.is_empty()) {
-        return PathBuf::from(path);
-    }
-    if let Some(path) = env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(path).join("flowlog").join("calls");
-    }
-    if let Some(path) = env::var_os("HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(path)
-            .join(".cache")
-            .join("flowlog")
-            .join("calls");
-    }
-    env::temp_dir().join("flowlog-calls")
+    env::var_os("FLOWLOG_CALL_CACHE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 /// The digest a block's library is named by. `generated` must be the complete

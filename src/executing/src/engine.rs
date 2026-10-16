@@ -50,7 +50,8 @@ pub struct EngineConfig {
     pub cache_dir: Option<PathBuf>,
     /// Bytes the disk tier may hold.
     pub cache_disk_bytes: u64,
-    /// A directory for compiled embedded blocks; the platform cache by default.
+    /// Opt-in persistent storage for compiled embedded blocks. Without this or
+    /// FLOWLOG_CALL_CACHE, builds use temporary directories removed on release.
     pub call_cache: Option<PathBuf>,
     /// Evaluations allowed to run at once; 0 for no limit.
     pub max_concurrent: usize,
@@ -114,8 +115,10 @@ pub enum Schedule {
 /// What an evaluation may do and how far it reports.
 #[derive(Debug, Clone, Default)]
 pub struct EvaluationOptions {
+    /// Optional live operator profile, atomically refreshed during evaluation.
+    pub profile_path: Option<PathBuf>,
     pub limits: Limits,
-    /// Read along and write into the state cache. `None` reads along it.
+    /// Read along and write into the state cache. Disabled unless explicitly true.
     pub cache: Option<bool>,
     /// `None` is per-stratum when caching, whole-program otherwise.
     pub schedule: Option<Schedule>,
@@ -127,7 +130,7 @@ pub struct EvaluationOptions {
 
 impl EvaluationOptions {
     pub fn cached(&self) -> bool {
-        self.cache.unwrap_or(true)
+        self.cache.unwrap_or(false)
     }
 
     pub fn schedule(&self) -> Schedule {

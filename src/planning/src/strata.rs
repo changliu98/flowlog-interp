@@ -202,6 +202,10 @@ impl GroupStrataQueryPlan {
         &self.rules
     }
 
+    pub fn strata_plan_with_rules(&self) -> impl Iterator<Item = (&FLRule, &Transformation)> {
+        self.rules.iter().zip(&self.strata_plan).flat_map(|(rule, plan)| plan.iter().map(move |op| (rule, op)))
+    }
+
     pub fn strata_plan(&self) -> Vec<&Transformation> {
         self.strata_plan.iter().flatten().collect()
     }

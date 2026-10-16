@@ -22,6 +22,7 @@ pub mod jn;
 pub mod map;
 mod merge;
 pub mod native_calls;
+pub mod profile;
 pub mod runner;
 pub mod symbols;
 pub mod transformer;

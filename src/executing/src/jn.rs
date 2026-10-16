@@ -567,3 +567,134 @@ pub fn v1_aj_flatten_fat(flow: &TransformationFlow) -> impl FnMut(&FatRow, &()) 
         row
     }
 }
+
+/* Fat mode joins that run their row program inside the join */
+
+/// The row a join would produce, read in place: each column comes from the
+/// key or one side's value, as the join's extraction names it. A row program
+/// that follows the join reads this instead of a materialized row, so a pair
+/// the program discards costs no row at all.
+#[derive(Debug)]
+struct JoinedView<'a> {
+    key: Option<&'a FatRow>,
+    left: Option<&'a FatRow>,
+    right: Option<&'a FatRow>,
+    /// (from the right side, from a value, column), as `jn_deconstructor_fat`.
+    extracts: &'a [(bool, bool, usize)],
+}
+
+impl Array for JoinedView<'_> {
+    fn arity(&self) -> usize {
+        self.extracts.len()
+    }
+
+    #[inline(always)]
+    fn column(&self, id: usize) -> parsing::Val {
+        let (right, from_value, column) = self.extracts[id];
+        let source = match (from_value, right) {
+            (false, _) => self.key,
+            (true, false) => self.left,
+            (true, true) => self.right,
+        };
+        source.expect("the join supplies every side it extracts from").column(column)
+    }
+}
+
+fn extracts_of(flow: &TransformationFlow, caller: &str) -> Vec<(bool, bool, usize)> {
+    match flow {
+        TransformationFlow::JnToKV { key, value, .. } => {
+            jn_deconstructor_fat(&Arc::new(key.iter().chain(value.iter()).cloned().collect()))
+        }
+        _ => panic!("{caller}: must be a jn flow"),
+    }
+}
+
+/// `jn_logic_fat` followed by `runner`, as one closure.
+pub fn jn_program_fat(
+    flow: &TransformationFlow,
+    budget: &Arc<Budget>,
+    runner: Arc<crate::map::RowProgramRunner>,
+) -> impl FnMut(&FatRow, &FatRow, &FatRow) -> Option<FatRow> {
+    let extracts = extracts_of(flow, "jn_program_fat");
+    let compares = flow.compares().clone();
+    let budget = Arc::clone(budget);
+    move |k, v1, v2| {
+        if budget.stopped()
+            || !compares.iter().all(|compare| jn_compare(Some(k), Some(v1), Some(v2), compare, &budget))
+        {
+            return None;
+        }
+        runner.evaluate_as(&JoinedView { key: Some(k), left: Some(v1), right: Some(v2), extracts: &extracts })
+    }
+}
+
+/// `v1_jn_logic_fat` followed by `runner`, as one closure.
+pub fn v1_jn_program_fat(
+    flow: &TransformationFlow,
+    budget: &Arc<Budget>,
+    runner: Arc<crate::map::RowProgramRunner>,
+) -> impl FnMut(&FatRow, &FatRow, &()) -> Option<FatRow> {
+    let extracts = extracts_of(flow, "v1_jn_program_fat");
+    let compares = flow.compares().clone();
+    let budget = Arc::clone(budget);
+    move |k, v1, _| {
+        if budget.stopped()
+            || !compares.iter().all(|compare| jn_compare(Some(k), Some(v1), None, compare, &budget))
+        {
+            return None;
+        }
+        runner.evaluate_as(&JoinedView { key: Some(k), left: Some(v1), right: None, extracts: &extracts })
+    }
+}
+
+/// `v2_jn_logic_fat` followed by `runner`, as one closure.
+pub fn v2_jn_program_fat(
+    flow: &TransformationFlow,
+    budget: &Arc<Budget>,
+    runner: Arc<crate::map::RowProgramRunner>,
+) -> impl FnMut(&FatRow, &(), &()) -> Option<FatRow> {
+    // Exactly the columns `v2_jn_extractor_fat` takes: the left key's.
+    let TransformationFlow::JnToKV { key, value, .. } = flow else {
+        panic!("v2_jn_program_fat: must be a jn flow");
+    };
+    let extracts: Vec<(bool, bool, usize)> = v2_jn_deconstructor_fat(&Arc::new(key.iter().chain(value.iter()).cloned().collect()))
+        .into_iter()
+        .map(|column| (false, false, column))
+        .collect();
+    let compares = flow.compares().clone();
+    let budget = Arc::clone(budget);
+    move |k, _, _| {
+        if budget.stopped()
+            || !compares.iter().all(|compare| jn_compare(Some(k), None, None, compare, &budget))
+        {
+            return None;
+        }
+        runner.evaluate_as(&JoinedView { key: Some(k), left: None, right: None, extracts: &extracts })
+    }
+}
+
+/// `cartesian_logic_fat` followed by `runner`, as one closure.
+pub fn cartesian_program_fat(
+    flow: &TransformationFlow,
+    budget: &Arc<Budget>,
+    runner: Arc<crate::map::RowProgramRunner>,
+) -> impl FnMut(&(), &FatRow, &FatRow) -> Option<FatRow> {
+    let TransformationFlow::JnToKV { key, value, .. } = flow else {
+        panic!("cartesian_program_fat: must be a jn flow");
+    };
+    // A product's columns all come from the two values.
+    let extracts: Vec<(bool, bool, usize)> = cartesian_deconstructor_fat(&Arc::new(key.iter().chain(value.iter()).cloned().collect()))
+        .into_iter()
+        .map(|(right, column)| (right, true, column))
+        .collect();
+    let compares = flow.compares().clone();
+    let budget = Arc::clone(budget);
+    move |_, v1, v2| {
+        if budget.stopped()
+            || !compares.iter().all(|compare| jn_compare(None, Some(v1), Some(v2), compare, &budget))
+        {
+            return None;
+        }
+        runner.evaluate_as(&JoinedView { key: None, left: Some(v1), right: Some(v2), extracts: &extracts })
+    }
+}

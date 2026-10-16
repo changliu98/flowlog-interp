@@ -126,7 +126,7 @@ impl<'a> Explainer<'a> {
     pub fn explain(&self, relation: &str, row: &[Val]) -> Result<Witness> {
         let present = self
             .state(relation)
-            .is_some_and(|state| state.rows.binary_search_by(|candidate| candidate.as_slice().cmp(row)).is_ok());
+            .is_some_and(|state| state.rows.binary_search(row).is_ok());
         let mut witness = Witness {
             relation: relation.to_string(),
             row: row.to_vec(),
@@ -370,7 +370,7 @@ impl<'a> Explainer<'a> {
             if consistent {
                 parents.push(Parent {
                     relation: atom.name().to_string(),
-                    row: matched.clone(),
+                    row: matched.to_vec(),
                 });
                 found = self.search(atoms, depth + 1, bindings, parents, on_solution)?;
                 parents.pop();

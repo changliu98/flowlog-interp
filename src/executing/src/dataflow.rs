@@ -8,7 +8,7 @@
 //! relation maps, so two computations contributing to one head cannot see
 //! each other's rows.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use itertools::Itertools;
 use tracing::debug;
@@ -56,6 +56,35 @@ pub(crate) struct AssemblyContext<'a> {
     pub budget: &'a Arc<Budget>,
     pub program_name: &'a str,
     pub profile: &'a Option<Arc<crate::profile::Profile>>,
+    /// How many operators, rule outputs and entering scopes read each
+    /// collection of the computation being assembled.
+    pub consumers: &'a HashMap<Arc<CollectionSignature>, usize>,
+}
+
+/// How often each collection of one computation's groups is read: as an
+/// operator's input, as a rule's output its head collects, or as a
+/// collection a recursive group brings into its scope.
+fn count_consumers(groups: &[GroupStrataQueryPlan]) -> HashMap<Arc<CollectionSignature>, usize> {
+    let mut consumers: HashMap<Arc<CollectionSignature>, usize> = HashMap::new();
+    let mut read = |signature: &Arc<CollectionSignature>| {
+        *consumers.entry(Arc::clone(signature)).or_default() += 1;
+    };
+    for group in groups {
+        for transformation in group.strata_plan() {
+            if transformation.is_unary() {
+                read(transformation.unary().signature());
+            } else {
+                let (left, right) = transformation.binary();
+                read(left.signature());
+                read(right.signature());
+            }
+        }
+        for lasts in group.last_signatures_map().values() {
+            lasts.iter().for_each(&mut read);
+        }
+        group.enter_scope_set().iter().for_each(&mut read);
+    }
+    consumers
 }
 
 /// Assemble one group's operators into `scope`.
@@ -94,8 +123,14 @@ pub(crate) fn assemble_group<'scope>(
 
     if !group_plan.is_recursive() {
         /* construct dataflow for a non-recursive strata */
-        for (rule, next_transformation) in group_plan.strata_plan_with_rules() {
-                let _profile_rule = context.profile.as_ref().map(|profile| profile.rule(scope.worker(), rule, group_plan.is_recursive()));
+        let plan: Vec<_> = group_plan.strata_plan_with_rules().collect();
+        // Row programs already run inside the join they follow.
+        let mut fused: HashSet<usize> = HashSet::new();
+        for (index, &(rule, next_transformation)) in plan.iter().enumerate() {
+            if fused.contains(&index) {
+                continue;
+            }
+            let _profile_rule = context.profile.as_ref().map(|profile| profile.rule(scope.worker(), rule, group_plan.is_recursive()));
             let output = next_transformation.output();
             let output_signature = output.signature();
             let (ok, ov) = output.arity();
@@ -156,6 +191,31 @@ pub(crate) fn assemble_group<'scope>(
                     } else {
                         (binary.0.signature(), binary.1.signature(), next_transformation.flow())
                     };
+
+                // A row program that is the only reader of this join's rows
+                // runs inside the join, so the rows it discards never exist.
+                if ok == 0 && context.consumers.get(output_signature) == Some(&1) {
+                    let compute = plan.get(index + 1).and_then(|&(_, candidate)| match candidate {
+                        Transformation::Compute { output: compute_output, .. }
+                            if candidate.unary().signature() == output_signature =>
+                        {
+                            Some(compute_output)
+                        }
+                        _ => None,
+                    });
+                    if let Some(compute_output) = compute {
+                        let (cok, cov) = compute_output.arity();
+                        let runner = &runners[compute_output.signature()];
+                        if let Some(output_rel) = fused_join_program(
+                            next_transformation, large, small, row_map, kv_map, k_map, flow, runner,
+                            cok + cov, budget,
+                        ) {
+                            row_map.insert(Arc::clone(compute_output.signature()), output_rel);
+                            fused.insert(index + 1);
+                            continue;
+                        }
+                    }
+                }
 
                 let output_rel = match next_transformation {
                         Transformation::JnKvKv { .. } =>
@@ -556,16 +616,17 @@ impl Assembly {
                 sessions.push((session, Arc::clone(&state.rows)));
             }
 
-            let context = AssemblyContext {
-                fat_mode: self.fat_mode,
-                native_calls: &context_native,
-                idb_map: &self.idb_map,
-                budget: &self.budget,
-                program_name: &self.program_name,
-                profile: &self.profile,
-            };
-
             for computation in self.computations.iter() {
+                let consumers = count_consumers(&computation.groups);
+                let context = AssemblyContext {
+                    fat_mode: self.fat_mode,
+                    native_calls: &context_native,
+                    idb_map: &self.idb_map,
+                    budget: &self.budget,
+                    program_name: &self.program_name,
+                    profile: &self.profile,
+                    consumers: &consumers,
+                };
                 let mut row_map: RowMap<'_, _> = computation
                     .inputs
                     .keys()
@@ -612,7 +673,7 @@ impl Assembly {
         for (mut session, rows) in sessions.drain(..) {
             if failure.is_none() {
                 let chunk = rows.len().div_ceil(peers).max(1);
-                for row in rows.chunks(chunk).nth(index).unwrap_or(&[]) {
+                for row in rows.range(index * chunk, (index + 1) * chunk) {
                     session.update_values(row);
                 }
             }

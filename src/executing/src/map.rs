@@ -127,6 +127,7 @@ enum ResolvedStep {
         function: LoadedFunction,
         arguments: Vec<ValueRef>,
         output: Option<usize>,
+        lenient: bool,
     },
     Arithmetic {
         init: ValueRef,
@@ -166,6 +167,7 @@ impl RowProgramRunner {
                     function,
                     arguments,
                     output,
+                    lenient,
                 } => {
                     let loaded = module
                         .and_then(|module| module.function(function))
@@ -183,6 +185,7 @@ impl RowProgramRunner {
                         function: loaded,
                         arguments: arguments.clone(),
                         output: *output,
+                        lenient: *lenient,
                     }
                 }
                 Step::Arithmetic { init, rest, output } => ResolvedStep::Arithmetic {
@@ -239,7 +242,7 @@ impl RowProgramRunner {
         self.evaluate_as(input)
     }
 
-    fn evaluate_as<R: FromIterator<Val>>(&self, input: &dyn Array) -> Option<R> {
+    pub(crate) fn evaluate_as<R: FromIterator<Val>>(&self, input: &dyn Array) -> Option<R> {
         if self.budget.stopped() {
             return None;
         }
@@ -262,6 +265,7 @@ impl RowProgramRunner {
                     function,
                     arguments,
                     output,
+                    lenient,
                 } => {
                     let cells = arguments
                         .iter()
@@ -270,6 +274,9 @@ impl RowProgramRunner {
                     let module = self.module.as_ref().expect("a call resolved a module");
                     let value = match module.call(name, function, &cells) {
                         Ok(value) => value,
+                        // The row may never have reached this filter where
+                        // the rule wrote it; it runs again there.
+                        Err(_) if *lenient => continue,
                         Err(diagnostic) => {
                             self.fault(diagnostic);
                             return None;

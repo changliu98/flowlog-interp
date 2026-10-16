@@ -1,3 +1,6 @@
 [build]
 # Use all available CPU cores for parallel compilation
 jobs = 128
+# Code for the CPU of the machine that builds it: the binary must run where
+# it was built (the toolchain image builds it on the host it serves).
+rustflags = ["-C", "target-cpu=native"]

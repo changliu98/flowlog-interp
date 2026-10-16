@@ -234,16 +234,15 @@ pub fn serve(engine: Arc<Engine>, defaults: ServiceDefaults, socket_path: PathBu
     });
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
     info!(
-        "FlowLog service listening on {} (protocol {PROTOCOL_VERSION}, memory tier {} bytes{})",
+        "FlowLog service listening on {} (protocol {PROTOCOL_VERSION}, {})",
         socket_path.display(),
-        service.engine.config().cache_memory_bytes,
         service
             .engine
             .config()
             .cache_dir
             .as_ref()
-            .map(|directory| format!(", disk tier {}", directory.display()))
-            .unwrap_or_default()
+            .map(|directory| format!("state cache {}", directory.display()))
+            .unwrap_or_else(|| "no state cache".to_string())
     );
 
     for connection in listener.incoming() {

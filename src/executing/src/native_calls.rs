@@ -523,6 +523,10 @@ fn compile_block(
         .arg("--crate-type=cdylib")
         .arg("-C")
         .arg("opt-level=3")
+        // One unit: a block is many tiny functions, where splitting costs
+        // more than the parallel code generation it buys.
+        .arg("-C")
+        .arg("codegen-units=1")
         .arg("-C")
         .arg("panic=unwind")
         .arg("--crate-name")
@@ -618,46 +622,27 @@ fn render_block(block: &EmbeddedBlock) -> String {
                 .join(", ");
             let result = match function.return_type() {
                 RustReturnType::I64 => format!(
-                    "let value: i64 = super::{}({arguments}); output.write(value);",
+                    "let value: i64 = super::{}({arguments}); value",
                     function.name()
                 ),
                 RustReturnType::Bool => format!(
-                    "let value: bool = super::{}({arguments}); output.write(i64::from(value));",
+                    "let value: bool = super::{}({arguments}); i64::from(value)",
                     function.name()
                 ),
                 RustReturnType::Symbol => format!(
-                    "let value: super::Symbol = super::{}({arguments}); output.write(value.0);",
+                    "let value: super::Symbol = super::{}({arguments}); value.0",
                     function.name()
                 ),
             };
+            // Each entry point hands a non-capturing body to the one shared
+            // trampoline, so the unwinding machinery is instantiated once per
+            // block and not once per function: rustc's time on a block of a
+            // few hundred functions is dominated by those instantiations.
             format!(
                 r#"
     #[export_name = "__flowlog_call_{name}"]
-    pub unsafe extern "C" fn call_{name}(
-        arguments: *const i64,
-        argument_count: usize,
-        output: *mut i64,
-        context: *const Context,
-    ) -> i32 {{
-        if argument_count != {arity}
-            || (argument_count != 0 && arguments.is_null())
-            || output.is_null()
-            || context.is_null()
-        {{
-            return 2;
-        }}
-        install_hook();
-        CONTEXT.with(|current| current.set(context));
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{
-            let arguments = if argument_count == 0 {{
-                &[][..]
-            }} else {{
-                std::slice::from_raw_parts(arguments, argument_count)
-            }};
-            {result}
-        }}));
-        CONTEXT.with(|current| current.set(std::ptr::null()));
-        if outcome.is_ok() {{ 0 }} else {{ 1 }}
+    pub unsafe extern "C" fn call_{name}(arguments: *const i64, argument_count: usize, output: *mut i64, context: *const Context) -> i32 {{
+        call({arity}, arguments, argument_count, output, context, |arguments| {{ {result} }})
     }}
 "#,
                 name = function.name(),
@@ -792,6 +777,38 @@ const ABI_MODULE: &str = r#"
                 });
             }));
         });
+    }
+
+    /// The boundary every entry point shares: check the arguments, run the
+    /// body with the engine's context installed, and turn a panic into status 1.
+    #[inline(never)]
+    pub unsafe fn call(
+        arity: usize,
+        arguments: *const i64,
+        argument_count: usize,
+        output: *mut i64,
+        context: *const Context,
+        body: fn(&[i64]) -> i64,
+    ) -> i32 {
+        if argument_count != arity
+            || (argument_count != 0 && arguments.is_null())
+            || output.is_null()
+            || context.is_null()
+        {
+            return 2;
+        }
+        install_hook();
+        CONTEXT.with(|current| current.set(context));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let arguments = if argument_count == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(arguments, argument_count)
+            };
+            output.write(body(arguments));
+        }));
+        CONTEXT.with(|current| current.set(std::ptr::null()));
+        if outcome.is_ok() { 0 } else { 1 }
     }
 
     #[export_name = "__flowlog_last_panic"]

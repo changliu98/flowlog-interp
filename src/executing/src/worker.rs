@@ -22,11 +22,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::Thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use timely::communication::WorkerGuards;
 use timely::worker::Worker;
 use timely::Config;
 use tracing::debug;
+
+/// How long a worker keeps stepping a dataflow that gives it nothing to do
+/// before it parks: long enough to ride out the gaps between a peer's
+/// batches without a wake-up for each, short enough that waiting workers do
+/// not hold cores the working ones - and other evaluations - need. With four
+/// evaluations of eight workers side by side, spinning 1 ms rather than 50 us
+/// cost a fifth more CPU and no less time; parking at once saved little CPU
+/// and made the wake-ups cost more system time.
+const SPIN_BEFORE_PARK: Duration = Duration::from_micros(50);
+
+/// The longest a parked worker sleeps before it looks at its budget again.
+/// A message for it, or a new job, wakes it at once.
+const PARK_AT_MOST: Duration = Duration::from_millis(5);
 
 enum Job {
     Run(Arc<Run>),
@@ -192,6 +205,8 @@ fn worker_loop(
         .expect("every worker has a job receiver");
     let _tag = MemoryTag::new(budget.memory());
     let mut live: Vec<(Arc<Run>, BuiltDataflow)> = Vec::new();
+    // Since when the dataflows have had nothing for this worker to run.
+    let mut idle_since: Option<Instant> = None;
 
     loop {
         if poisoned.load(Ordering::Relaxed) {
@@ -234,10 +249,14 @@ fn worker_loop(
             continue;
         }
         let stepped = catch_unwind(AssertUnwindSafe(|| {
-            // Active evaluations favor latency: parking between short rounds
-            // turns progress traffic into a storm of wakeup syscalls at scale.
-            // Idle workers still block on their job receiver above.
-            worker.step();
+            // Spin through short idle gaps (parking between short rounds turns
+            // progress traffic into a storm of wake-up syscalls), but park once
+            // idle for longer: a worker spinning on an empty dataflow takes a
+            // core from the workers with work, and from other evaluations.
+            let park = idle_since.is_some_and(|since| since.elapsed() >= SPIN_BEFORE_PARK);
+            worker.step_or_park(Some(if park { PARK_AT_MOST } else { Duration::ZERO }));
+            let busy = worker.activations().borrow().empty_for() == Some(Duration::ZERO);
+            idle_since = if busy { None } else { idle_since.or_else(|| Some(Instant::now())) };
             budget.observe();
             live.retain(|(run, built)| {
                 if built.probe.done() {

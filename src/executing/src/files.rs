@@ -7,6 +7,7 @@
 //! adapter over it, and nothing in the engine depends on it.
 
 use crate::cache::{CacheRunStats, RelationState};
+use crate::rows::Rows;
 use crate::explain::Witness;
 use crate::symbols::SymbolTable;
 use parsing::decl::DataType;
@@ -53,22 +54,22 @@ pub fn read_facts_directory_with_workers(
         let path = path.to_string_lossy();
         macro_rules! packed {
             ($arity:literal) => {
-                unpack_rows(read_sorted_file::<Row<$arity>>(
+                flatten_rows(read_sorted_file::<Row<$arity>>(
                     declaration.name(), &types, &path, delimiter, symbols, workers,
-                )?, workers)
+                )?)
             };
         }
         let rows = match types.len() {
             0 => packed!(0), 1 => packed!(1), 2 => packed!(2),
             3 => packed!(3), 4 => packed!(4), 5 => packed!(5),
             6 => packed!(6), 7 => packed!(7), 8 => packed!(8),
-            _ => read_sorted_file::<Vec<Val>>(
+            arity => Rows::from_vecs(arity, &read_sorted_file::<Vec<Val>>(
                 declaration.name(), &types, &path, delimiter, symbols, workers,
-            )?,
+            )?),
         };
         states.insert(
             declaration.name().to_string(),
-            Arc::new(RelationState::from_sorted_rows(declaration.name(), declaration.arity(), rows)),
+            Arc::new(RelationState::from_sorted(declaration.name(), declaration.arity(), rows)),
         );
     }
     Ok(states)
@@ -108,22 +109,13 @@ fn read_sorted_file<R: InputRow + Ord + Send>(
     Ok(crate::merge::sorted(partitions, &R::cmp, &|_, _| true, None))
 }
 
-/// Allocate the public row vectors only after sorting and deduplication have
-/// finished over inline cells. Chunks are already in final global row order.
-fn unpack_rows<const N: usize>(rows: Vec<Row<N>>, workers: usize) -> Vec<Vec<Val>> {
-    let unpack = |rows: &[Row<N>]| rows.iter().map(|row| row.as_slice().to_vec()).collect::<Vec<_>>();
-    if workers == 1 || rows.len() < 131_072 { return unpack(&rows); }
-    std::thread::scope(|scope| {
-        let mut chunks = rows.chunks(rows.len().div_ceil(workers));
-        let first = chunks.next().unwrap_or(&[]);
-        let readers: Vec<_> = chunks.map(|chunk| scope.spawn(move || unpack(chunk))).collect();
-        let mut output = Vec::with_capacity(rows.len());
-        output.extend(unpack(first));
-        for reader in readers {
-            output.extend(reader.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
-        }
-        output
-    })
+/// Sorted, distinct fixed-width rows laid out flat, in the same order.
+fn flatten_rows<const N: usize>(rows: Vec<Row<N>>) -> Rows {
+    let mut cells = Vec::with_capacity(rows.len() * N);
+    for row in &rows {
+        cells.extend_from_slice(row.as_slice());
+    }
+    Rows::from_cells(N, cells, rows.len())
 }
 
 /// One cell as it is written.
@@ -151,47 +143,110 @@ pub fn write_outputs(
     let mut sizes = BufWriter::new(File::create(&sizes_path).map_err(|error| {
         Diagnostic::input(format!("cannot create {}: {error}", sizes_path.display()))
     })?);
-    for declaration in program.idbs() {
-        let Some(state) = states.get(declaration.name()) else {
-            continue;
-        };
-        let types = program
-            .column_types(declaration.name())
-            .map(<[DataType]>::to_vec)
-            .unwrap_or_else(|| declaration.column_types());
-        let path = csvs.join(format!("{}.csv", declaration.name()));
-        let mut out = BufWriter::new(File::create(&path).map_err(|error| {
-            Diagnostic::input(format!("cannot create {}: {error}", path.display()))
-        })?);
-        let write_error = |error: std::io::Error| {
-            Diagnostic::input(format!("cannot write {}: {error}", path.display()))
-        };
-        for row in state.rows.iter() {
-            for (column, cell) in row.iter().enumerate() {
-                if column > 0 {
-                    out.write_all(std::slice::from_ref(&delimiter)).map_err(write_error)?;
-                }
-                let column_type = types.get(column).copied().unwrap_or(DataType::Integer);
-                match column_type {
-                    DataType::Integer => write!(out, "{cell}").map_err(write_error)?,
-                    DataType::Symbol => out.write_all(render_cell(*cell, column_type, symbols).as_bytes())
-                        .map_err(write_error)?,
-                }
-            }
-            out.write_all(b"\n").map_err(write_error)?;
-        }
-        out.flush().map_err(write_error)?;
+    let relations: Vec<(&str, &RelationState, Vec<DataType>)> = program
+        .idbs()
+        .iter()
+        .filter_map(|declaration| {
+            let state = states.get(declaration.name())?;
+            let types = program
+                .column_types(declaration.name())
+                .map(<[DataType]>::to_vec)
+                .unwrap_or_else(|| declaration.column_types());
+            Some((declaration.name(), state.as_ref(), types))
+        })
+        .collect();
+
+    // Every relation is its own file: write them on a few threads, the
+    // largest first, each onto the thread with the fewest rows so far.
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |count| count.get())
+        .clamp(1, 8)
+        .min(relations.len().max(1));
+    let mut order: Vec<usize> = (0..relations.len()).collect();
+    order.sort_by_key(|&index| std::cmp::Reverse(relations[index].1.rows.len()));
+    let mut shares = vec![(0usize, Vec::new()); threads];
+    for index in order {
+        let share = shares.iter_mut().min_by_key(|share| share.0).expect("one thread at least");
+        share.0 += relations[index].1.rows.len() + 1;
+        share.1.push(index);
+    }
+    let written: Vec<Result<()>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = shares
+            .iter()
+            .map(|(_, indices)| {
+                let relations = &relations;
+                let csvs = &csvs;
+                scope.spawn(move || -> Result<()> {
+                    for &index in indices {
+                        let (name, state, types) = &relations[index];
+                        write_relation(&csvs.join(format!("{name}.csv")), state, types, delimiter, symbols)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().unwrap_or_else(|_| {
+                    Err(Diagnostic::internal("an output writer thread panicked"))
+                })
+            })
+            .collect()
+    });
+    written.into_iter().collect::<Result<Vec<()>>>()?;
+
+    for (name, state, _) in &relations {
         if !state.rows.is_empty() {
-            writeln!(sizes, "{}: ((), (), {})", declaration.name(), state.rows.len()).map_err(
+            writeln!(sizes, "{}: ((), (), {})", name, state.rows.len()).map_err(
                 |error| Diagnostic::input(format!("cannot write {}: {error}", sizes_path.display())),
             )?;
         }
-        info!("Size of [{}]: {}", declaration.name(), state.rows.len());
+        info!("Size of [{}]: {}", name, state.rows.len());
     }
     sizes.flush().map_err(|error| {
         Diagnostic::input(format!("cannot write {}: {error}", sizes_path.display()))
     })?;
     Ok(())
+}
+
+/// One relation's rows as a file: one line per row, cells joined by the
+/// delimiter, each line assembled whole before it is written.
+fn write_relation(
+    path: &Path,
+    state: &RelationState,
+    types: &[DataType],
+    delimiter: u8,
+    symbols: &SymbolTable,
+) -> Result<()> {
+    let write_error = |error: std::io::Error| {
+        Diagnostic::input(format!("cannot write {}: {error}", path.display()))
+    };
+    let mut out = BufWriter::with_capacity(
+        1 << 20,
+        File::create(path).map_err(|error| {
+            Diagnostic::input(format!("cannot create {}: {error}", path.display()))
+        })?,
+    );
+    let mut line = Vec::with_capacity(256);
+    let mut digits = itoa::Buffer::new();
+    for row in state.rows.iter() {
+        line.clear();
+        for (column, cell) in row.iter().enumerate() {
+            if column > 0 {
+                line.push(delimiter);
+            }
+            match types.get(column).copied().unwrap_or(DataType::Integer) {
+                DataType::Integer => line.extend_from_slice(digits.format(*cell).as_bytes()),
+                DataType::Symbol => line.extend_from_slice(
+                    render_cell(*cell, DataType::Symbol, symbols).as_bytes(),
+                ),
+            }
+        }
+        line.push(b'\n');
+        out.write_all(&line).map_err(write_error)?;
+    }
+    out.flush().map_err(write_error)
 }
 
 /// The run's counters, as JSON beside the outputs.

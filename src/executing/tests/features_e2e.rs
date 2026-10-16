@@ -76,7 +76,7 @@ fn evaluate(
 }
 
 fn sorted(result: &EvaluationResult, relation: &str) -> Vec<Vec<i64>> {
-    result.outputs[relation].rows.iter().cloned().collect()
+    result.outputs[relation].rows.to_vecs()
 }
 
 #[test]
@@ -400,7 +400,7 @@ fn a_comparison_over_a_call_result_and_a_computed_head_agree_with_the_whole_prog
         &engine,
         program,
         vec![rows("E", &[&[1, 0], &[1, 5], &[3, 2]])],
-        EvaluationOptions::default(),
+        EvaluationOptions { schedule: Some(Schedule::PerStratum), ..EvaluationOptions::default() },
     )
     .unwrap();
     let whole = evaluate(
@@ -666,5 +666,49 @@ fn the_c_interface_round_trips_cells_and_diagnostics() {
         capi::flowlog_string_free(json);
         capi::flowlog_result_free(result);
         capi::flowlog_engine_free(engine);
+    }
+}
+
+#[test]
+fn a_declared_relation_no_rule_defines_reads_as_empty_on_either_schedule() {
+    // `Tag` is declared and read, but its only rule was deleted: an edit a
+    // rule author makes, and the program stays valid.
+    let program = ".in\n.decl E(x: number)\n.input E.facts\n\
+                   .printsize\n.decl Tag(x: number)\n.decl Head(x: number)\n\
+                   .rule\nHead(x) :- E(x).\nHead(x) :- Tag(x).\n";
+    for schedule in [Schedule::WholeProgram, Schedule::PerStratum] {
+        let result = evaluate(
+            &engine(),
+            program,
+            vec![rows("E", &[&[1], &[2]])],
+            EvaluationOptions { schedule: Some(schedule), ..EvaluationOptions::default() },
+        )
+        .unwrap_or_else(|diagnostic| panic!("{schedule:?}: {diagnostic}"));
+        assert_eq!(sorted(&result, "Head"), vec![vec![1], vec![2]], "{schedule:?}");
+    }
+}
+
+#[test]
+fn a_filter_run_early_refuses_exactly_the_rows_it_would_have_refused() {
+    // Planning runs `small` on the join of E and F, ahead of G. There it
+    // meets x = 500, which it refuses, but which G discards unless G holds a
+    // row for 5: only then does the rule reach the filter with it.
+    let program = ".code rust\n\
+                   pub fn small(x: i64, z: i64) -> bool { if x > 100 { panic!(\"too large: {}\", x) } x < z }\n\
+                   .endcode\n\
+                   .in\n.decl E(a: number, b: number)\n.decl F(a: number, b: number)\n.decl G(a: number, b: number)\n\
+                   .printsize\n.decl H(a: number, b: number)\n.rule\n\
+                   H(x, w) :- E(x, y), F(y, z), G(z, w), @call(small, x, z).\n";
+    let inputs = |g: &[&[i64]]| {
+        vec![rows("E", &[&[1, 2], &[500, 4]]), rows("F", &[&[2, 3], &[4, 5]]), rows("G", g)]
+    };
+    for schedule in [Schedule::WholeProgram, Schedule::PerStratum] {
+        let options = || EvaluationOptions { schedule: Some(schedule), ..EvaluationOptions::default() };
+        let result = evaluate(&engine(), program, inputs(&[&[3, 7]]), options())
+            .unwrap_or_else(|diagnostic| panic!("{schedule:?}: {diagnostic}"));
+        assert_eq!(sorted(&result, "H"), vec![vec![1, 7]], "{schedule:?}");
+        let error = evaluate(&engine(), program, inputs(&[&[3, 7], &[5, 9]]), options()).unwrap_err();
+        assert_eq!(error.function.as_deref(), Some("small"), "{schedule:?}: {error}");
+        assert!(error.message.contains("too large: 500"), "{schedule:?}: {error}");
     }
 }

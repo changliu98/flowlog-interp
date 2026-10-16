@@ -64,11 +64,25 @@ where
     // use std::fmt::Display for D (i.e. Row)
 }
 
-/// Updates captured while materializing a relation at a cache boundary.
-///
-/// The integer difference lets the same capture path work in both the default
-/// `Present` build and the `isize` build.
-pub type UpdateBatch = Vec<(Vec<Val>, isize)>;
+/// One worker's updates to a relation it materializes at a cache boundary:
+/// its rows sorted and each once, laid out row-major in `cells`, with one
+/// integer weight per row. The integer weight lets the same capture path work
+/// in both the default `Present` build and the `isize` build.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UpdateBatch {
+    pub cells: Vec<Val>,
+    pub weights: Vec<isize>,
+}
+
+impl UpdateBatch {
+    /// Each row of `arity` cells with its weight, in order.
+    pub fn rows(&self, arity: usize) -> impl Iterator<Item = (&[Val], isize)> + '_ {
+        self.weights
+            .iter()
+            .enumerate()
+            .map(move |(index, weight)| (&self.cells[index * arity..(index + 1) * arity], *weight))
+    }
+}
 
 /// Sorted worker batches, published after their capture frontiers complete.
 /// Each row occurs at most once per batch; signed weights can still cancel
@@ -97,8 +111,8 @@ where
     T: Lattice + TotalOrder,
     D: ExchangeData + Hashable + Array,
 {
-    // Keep the native row inline while collecting and sorting. Convert to
-    // the public Vec<Val> representation only once per retained worker row.
+    // Keep the native row inline while collecting and sorting, then lay the
+    // retained rows out flat, as the relation's state will hold them.
     let local = Rc::new(RefCell::new(Vec::<(D, Semiring)>::new()));
     let captured = Rc::clone(&local);
     // This is a final snapshot, so normalize signed weights at materialization
@@ -119,14 +133,16 @@ where
                 false
             }
         });
-        let batch: UpdateBatch = rows.into_iter()
-            .filter(|(_, difference)| !difference.is_zero())
-            .map(|(row, difference)| {
-                let values = (0..row.arity()).map(|column| row.column(column)).collect();
-                (values, semiring_weight(&difference))
-            })
-            .collect();
-        if !batch.is_empty() {
+        let arity = rows.first().map_or(0, |(row, _)| row.arity());
+        let mut batch = UpdateBatch {
+            cells: Vec::with_capacity(rows.len() * arity),
+            weights: Vec::with_capacity(rows.len()),
+        };
+        for (row, difference) in rows.into_iter().filter(|(_, difference)| !difference.is_zero()) {
+            batch.cells.extend((0..row.arity()).map(|column| row.column(column)));
+            batch.weights.push(semiring_weight(&difference));
+        }
+        if !batch.weights.is_empty() {
             updates.lock().expect("materialized relation lock poisoned").push(batch);
         }
     }) }
@@ -255,12 +271,12 @@ mod tests {
         let batches = updates.lock().unwrap();
         assert_eq!(batches.len(), 4);
         let mut totals = BTreeMap::<Val, isize>::new();
-        for (row, weight) in batches.iter().flatten() {
+        for (row, weight) in batches.iter().flat_map(|batch| batch.rows(1)) {
             *totals.entry(row[0]).or_default() += weight;
         }
         #[cfg(feature = "isize-type")]
         {
-            assert!(batches.iter().flatten().any(|(_, weight)| *weight < 0));
+            assert!(batches.iter().flat_map(|batch| batch.rows(1)).any(|(_, weight)| weight < 0));
             assert_eq!(totals.get(&-1), Some(&0), "weights must cancel across workers");
         }
         for value in 0..1024 {

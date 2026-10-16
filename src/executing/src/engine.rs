@@ -44,11 +44,14 @@ pub struct EngineConfig {
     /// Optimization level (0-3): sideways information passing and structural
     /// planning; `None` follows each rule's own hints.
     pub opt_level: Option<u8>,
-    /// Bytes the memory tier of the state cache may hold.
+    /// Bytes of cached states a process keeps in memory in front of its
+    /// cache directory.
     pub cache_memory_bytes: usize,
-    /// A directory for the disk tier of the state cache; none by default.
+    /// The state cache: a directory evaluations read and write their states
+    /// in, shared by every process that points at it. Without one nothing is
+    /// cached, whatever a request asks.
     pub cache_dir: Option<PathBuf>,
-    /// Bytes the disk tier may hold.
+    /// Bytes the cache directory may hold.
     pub cache_disk_bytes: u64,
     /// Opt-in persistent storage for compiled embedded blocks. Without this or
     /// FLOWLOG_CALL_CACHE, builds use temporary directories removed on release.
@@ -62,7 +65,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            workers: 1,
+            workers: 4,
             fat_mode: false,
             sharing: true,
             opt_level: None,
@@ -118,7 +121,9 @@ pub struct EvaluationOptions {
     /// Optional live operator profile, atomically refreshed during evaluation.
     pub profile_path: Option<PathBuf>,
     pub limits: Limits,
-    /// Read along and write into the state cache. Disabled unless explicitly true.
+    /// Read along and write into the engine's cache directory; `None` does
+    /// whenever the engine has one, `Some(false)` opts out. An engine without
+    /// a cache directory caches nothing.
     pub cache: Option<bool>,
     /// `None` is per-stratum when caching, whole-program otherwise.
     pub schedule: Option<Schedule>,
@@ -129,12 +134,14 @@ pub struct EvaluationOptions {
 }
 
 impl EvaluationOptions {
-    pub fn cached(&self) -> bool {
-        self.cache.unwrap_or(false)
+    /// Whether the evaluation reads along and writes into the cache of an
+    /// engine configured as `config`.
+    pub fn cached(&self, config: &EngineConfig) -> bool {
+        config.cache_dir.is_some() && self.cache.unwrap_or(true)
     }
 
-    pub fn schedule(&self) -> Schedule {
-        self.schedule.unwrap_or(if self.cached() {
+    pub fn schedule(&self, config: &EngineConfig) -> Schedule {
+        self.schedule.unwrap_or(if self.cached(config) {
             Schedule::PerStratum
         } else {
             Schedule::WholeProgram
@@ -278,6 +285,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(config: EngineConfig) -> Arc<Self> {
+        crate::accounting::tune_allocator();
         let cache = StrataCache::new(config.cache_memory_bytes);
         let cache = match &config.cache_dir {
             Some(directory) => {
@@ -439,7 +447,7 @@ impl Engine {
                 for declaration in outcome.program.idbs() {
                     if let Some(state) = outcome.states.get(declaration.name()) {
                         for row in state.rows.iter() {
-                            requests.push((declaration.name().to_string(), row.clone()));
+                            requests.push((declaration.name().to_string(), row.to_vec()));
                         }
                     }
                 }

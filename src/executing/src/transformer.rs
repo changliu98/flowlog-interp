@@ -39,6 +39,74 @@ where
     )
 }
 
+/// A join and the row program that reads its rows, as one operator over fat
+/// rows: the program filters and projects inside the join's own logic.
+///
+/// Differential's join emits every result of one key before it yields any,
+/// so a join whose rows a selective program then discards still held every
+/// product of its largest key at once - all of them, when the key is a column
+/// with a single value. Here a discarded row is never produced. `None` when
+/// the operands are not fat rows or the join is not one of these shapes; the
+/// caller then assembles the join and the program separately.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_join_program<'scope, T: Timestamp>(
+    transformation: &planning::transformations::Transformation,
+    large: &Arc<CollectionSignature>,
+    small: &Arc<CollectionSignature>,
+    row_map: &HashMap<Arc<CollectionSignature>, Arc<Rel<'scope, T>>>,
+    kv_map: &HashMap<Arc<CollectionSignature>, (Arc<DoubleRel<'scope, T>>, Arc<ArrangedDict<'scope, T>>)>,
+    k_map: &HashMap<Arc<CollectionSignature>, (Arc<Rel<'scope, T>>, Arc<ArrangedSet<'scope, T>>)>,
+    flow: &TransformationFlow,
+    runner: &Arc<crate::map::RowProgramRunner>,
+    target: usize,
+    budget: &Arc<Budget>,
+) -> Option<Arc<Rel<'scope, T>>>
+where
+    T: Data + Lattice + TotalOrder,
+{
+    use planning::transformations::Transformation;
+    let runner = Arc::clone(runner);
+    let collection = match transformation {
+        Transformation::JnKvKv { .. } => {
+            let (_, dict_0) = kv_map.get(large)?;
+            let (_, dict_1) = kv_map.get(small)?;
+            if !(dict_0.is_fat() && dict_1.is_fat()) {
+                return None;
+            }
+            dict_0.dict_fat().join_core(dict_1.dict_fat(), jn_program_fat(flow, budget, runner))
+        }
+        Transformation::JnKvK { .. } | Transformation::JnKKv { .. } => {
+            let (_, dict_0) = kv_map.get(large)?;
+            let (_, set_1) = k_map.get(small)?;
+            if !(dict_0.is_fat() && set_1.is_fat()) {
+                return None;
+            }
+            dict_0.dict_fat().join_core(set_1.set_fat(), v1_jn_program_fat(flow, budget, runner))
+        }
+        Transformation::JnKK { .. } => {
+            let (_, set_0) = k_map.get(large)?;
+            let (_, set_1) = k_map.get(small)?;
+            if !(set_0.is_fat() && set_1.is_fat()) {
+                return None;
+            }
+            set_0.set_fat().join_core(set_1.set_fat(), v2_jn_program_fat(flow, budget, runner))
+        }
+        Transformation::Cartesian { .. } => {
+            let rel_0 = row_map.get(large)?;
+            let rel_1 = row_map.get(small)?;
+            if !(rel_0.is_fat() && rel_1.is_fat()) {
+                return None;
+            }
+            rel_0.rel_fat().map(|row| ((), row)).arrange_by_key().join_core(
+                rel_1.rel_fat().map(|row| ((), row)).arrange_by_key(),
+                cartesian_program_fat(flow, budget, runner),
+            )
+        }
+        _ => return None,
+    };
+    Some(Arc::new(CollectionFat(collection, target)))
+}
+
 pub fn cartesian<'scope, T: Timestamp>(
     large: &Arc<CollectionSignature>,
     small: &Arc<CollectionSignature>,

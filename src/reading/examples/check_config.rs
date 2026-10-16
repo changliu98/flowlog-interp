@@ -24,7 +24,7 @@ fn main() {
     
     // Configuration parameters
     println!("--- Configuration Parameters ---");
-    println!("FALLBACK_ARITY: {} (max arity before forcing fat mode)", FALLBACK_ARITY);
+    println!("FALLBACK_ARITY: {} (cells a fat row holds inline)", FALLBACK_ARITY);
     println!("KV_MAX: {} (max arity for key-value operations)", KV_MAX);
     println!("ROW_MAX: {} (max arity for row operations)", ROW_MAX);
     println!("PROD_MAX: {} (max arity for product operations)", PROD_MAX);

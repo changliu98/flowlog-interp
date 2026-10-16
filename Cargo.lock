@@ -270,6 +270,8 @@ dependencies = [
  "debugging",
  "differential-dataflow",
  "itertools",
+ "itoa",
+ "libc",
  "libloading",
  "macros",
  "mimalloc",

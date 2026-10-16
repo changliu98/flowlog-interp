@@ -240,7 +240,7 @@ fn check_shape(program: &Program, rule: &FLRule, declared: &HashMap<String, RelD
                 }
                 call_outputs.insert(output.clone(), value_type);
             }
-            CallPredicate::Filter(_) => {
+            CallPredicate::Filter(_) | CallPredicate::Prefilter(_) => {
                 if function.return_type() != RustReturnType::Bool {
                     return Err(refuse(
                         program,

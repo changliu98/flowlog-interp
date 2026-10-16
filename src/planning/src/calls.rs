@@ -40,11 +40,14 @@ pub enum ValueRef {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Step {
     /// An embedded call. `output` is the result the call binds; `None` for a
-    /// bool-returning filter, which drops the row when it returns false.
+    /// bool-returning filter, which drops the row when it returns false. A
+    /// `lenient` filter is a prefilter (`CallPredicate::Prefilter`): a fault
+    /// keeps the row instead of ending the evaluation.
     Call {
         function: String,
         arguments: Vec<ValueRef>,
         output: Option<usize>,
+        lenient: bool,
     },
     /// Left-to-right arithmetic over values, binding a result.
     Arithmetic {
@@ -134,14 +137,16 @@ impl RowProgram {
                 .iter()
                 .map(|argument| builder.atom_argument(argument))
                 .collect::<Vec<_>>();
-            let output = match predicate {
-                CallPredicate::Bind { output, .. } => Some(builder.bind(output)),
-                CallPredicate::Filter(_) => None,
+            let (output, lenient) = match predicate {
+                CallPredicate::Bind { output, .. } => (Some(builder.bind(output)), false),
+                CallPredicate::Filter(_) => (None, false),
+                CallPredicate::Prefilter(_) => (None, true),
             };
             builder.steps.push(Step::Call {
                 function: call.function().to_string(),
                 arguments,
                 output,
+                lenient,
             });
         }
 
@@ -327,10 +332,12 @@ impl fmt::Display for Step {
                 function,
                 arguments,
                 output,
+                lenient,
             } => {
                 write!(
                     f,
-                    "{function}({})->{}",
+                    "{function}{}({})->{}",
+                    if *lenient { "?" } else { "" },
                     arguments
                         .iter()
                         .map(ToString::to_string)

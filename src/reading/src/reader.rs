@@ -72,6 +72,9 @@ fn quoted(fragment: &[u8]) -> String {
 /// with less data than the file contained. There is no value in the domain that
 /// means "unreadable", so the only honest outcomes are the number or a refusal.
 pub fn parse_number_cell(rel_path: &str, line: &[u8], cell: &[u8]) -> Result<Val> {
+    if let Some(value) = parse_decimal(cell) {
+        return Ok(value);
+    }
     let text = std::str::from_utf8(cell).map_err(|error| {
         Diagnostic::input(format!(
             "can't read data from \"{rel_path}\": cell {} is not valid UTF-8 ({error}), \
@@ -88,6 +91,36 @@ pub fn parse_number_cell(rel_path: &str, line: &[u8], cell: &[u8]) -> Result<Val
             quoted(line),
         ))
     })
+}
+
+/// A plain decimal integer: an optional sign and at most 19 digits, which is
+/// what nearly every cell of an input file is. Anything else, including a
+/// value out of range, is `None`, and the caller defers to the standard parser
+/// so that every other spelling it accepts or refuses is unchanged.
+#[inline]
+fn parse_decimal(cell: &[u8]) -> Option<Val> {
+    let (negative, digits) = match cell.first()? {
+        b'-' => (true, &cell[1..]),
+        b'+' => (false, &cell[1..]),
+        _ => (false, cell),
+    };
+    if digits.is_empty() || digits.len() > 19 {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for &byte in digits {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        // Nineteen digits stay below u64::MAX.
+        value = value * 10 + u64::from(digit);
+    }
+    if negative {
+        (value <= (Val::MAX as u64) + 1).then(|| (value as Val).wrapping_neg())
+    } else {
+        (value <= Val::MAX as u64).then_some(value as Val)
+    }
 }
 
 /// Reads one symbol cell: the text between the delimiters, interned.
@@ -162,22 +195,25 @@ pub fn read_relation_file_partition_into<R: InputRow>(
         ))
         .with_relation(rel_name)
     };
-    let (mut reader, mut remaining) = byte_range_reader(rel_path, index, peers)
+    let (mut reader, remaining) = byte_range_reader(rel_path, index, peers)
         .map_err(input_error)?;
+    // The range in one read, then the rest of a line that crosses its end:
+    // a line belongs to the range its first byte is in.
+    let mut data = Vec::new();
+    (&mut reader).take(remaining).read_to_end(&mut data).map_err(input_error)?;
+    if !data.is_empty() && data.last() != Some(&b'\n') {
+        reader.read_until(b'\n', &mut data).map_err(input_error)?;
+    }
     let mut rows = Vec::new();
-    let mut line = Vec::with_capacity(256);
-    while remaining > 0 {
-        line.clear();
-        let bytes_read = reader.read_until(b'\n', &mut line).map_err(input_error)?;
-        if bytes_read == 0 {
-            break;
-        }
-        remaining = remaining.saturating_sub(bytes_read as u64);
-        if line.last() == Some(&b'\n') {
-            line.pop();
-        }
+    let mut rest = data.as_slice();
+    while !rest.is_empty() {
+        let (mut line, next) = match rest.iter().position(|&byte| byte == b'\n') {
+            Some(end) => (&rest[..end], &rest[end + 1..]),
+            None => (rest, &rest[rest.len()..]),
+        };
+        rest = next;
         if line.last() == Some(&b'\r') {
-            line.pop();
+            line = &line[..line.len() - 1];
         }
         if arity == 0 {
             rows.push(R::finish(R::begin(0)));
@@ -186,7 +222,7 @@ pub fn read_relation_file_partition_into<R: InputRow>(
         if line.is_empty() {
             continue;
         }
-        let row = parse_row_into::<R>(rel_name, column_types, rel_path, &line, delimiter, intern)?;
+        let row = parse_row_into::<R>(rel_name, column_types, rel_path, line, delimiter, intern)?;
         rows.push(row);
     }
     Ok(rows)
@@ -262,6 +298,12 @@ fn parse_row_into<R: InputRow>(
 /* construct session and table of some arity */
 /* ------------------------------------------------------------------------------------ */
 
+// An input enters without a deduplicating pass. Its rows come from a state,
+// which is sorted and distinct, and each worker feeds a disjoint share of
+// them, so the collection is already a set; every operator that needs one
+// arranges it anyway. Consolidating here arranged every input of every
+// dataflow once more, which the per-stratum schedule repeated in each stratum
+// that read a large relation.
 macro_rules! generate_construct_session_and_table {
     ($($n:expr),*) => {
         pub fn construct_session_and_table<'scope>(
@@ -277,7 +319,7 @@ macro_rules! generate_construct_session_and_table {
                             paste::paste! {
                                 (
                                     InputSessionGeneric::[<InputSession $n>](session),
-                                    Rel::[<Collection $n>](input_rel).dedup(),
+                                    Rel::[<Collection $n>](input_rel),
                                 )
                             }
                         }
@@ -288,7 +330,7 @@ macro_rules! generate_construct_session_and_table {
                 let (session, input_rel) = scope.new_collection::<FatRow, Semiring>();
                 (
                     InputSessionGeneric::InputSessionFat(session, arity),
-                    Rel::CollectionFat(input_rel, arity).dedup()
+                    Rel::CollectionFat(input_rel, arity)
                 )
             }
         }
@@ -483,5 +525,22 @@ mod tests {
             .unwrap();
         assert_eq!(rows, vec![Vec::<Val>::new()]);
         std::fs::remove_file(path).expect("remove reader fixture");
+    }
+
+    #[test]
+    fn the_decimal_fast_path_agrees_with_the_standard_parser() {
+        let cells: &[&str] = &[
+            "0", "7", "-7", "+7", "007", "-0", "9223372036854775807", "-9223372036854775808",
+            "9223372036854775808", "-9223372036854775809", "99999999999999999999",
+            "00000000000000000000001", "", "-", "+", "1a", " 1", "1 ", "--1", "1.0",
+        ];
+        for cell in cells {
+            let standard = cell.parse::<Val>().ok();
+            let fast = parse_number_cell("cells", cell.as_bytes(), cell.as_bytes()).ok();
+            assert_eq!(fast, standard, "cell {cell:?}");
+            if let Some(value) = parse_decimal(cell.as_bytes()) {
+                assert_eq!(Some(value), standard, "fast path on {cell:?}");
+            }
+        }
     }
 }

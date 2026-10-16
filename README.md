@@ -98,6 +98,13 @@ cargo build --release
 target/release/executing -p reach.dl -f reach -c output -w 8
 ```
 
+The release build trades build time for speed: the whole program is
+optimized as one unit (fat LTO, one codegen unit) for the CPU of the machine
+that builds it (`target-cpu=native` in `.cargo/config.toml`). It takes about
+an hour, and the binary runs only on CPUs with the builder's instruction set.
+A quick build for development:
+`CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo build --release`.
+
 Every log line goes to standard error; standard output carries data only
 (the `--check` report).
 
@@ -133,10 +140,12 @@ println!("{:?}", result.stats);                               // the run's count
 `Engine::evaluate` never panics: a defect in the engine's own code comes back
 as a diagnostic of kind `internal`. `EvaluationOptions` carries the limits,
 whether to read along the cache, the schedule, and the rows to explain.
-State caching is off by default for the CLI, library and service. Set
-`options.cache = Some(true)` (JSON `"cache": true`), `--cached`, or the CLI's
-`--cache-dir` explicitly to enable it. No disk-cache directory is chosen by
-default.
+The state cache is a directory, and nothing else: an engine caches only when
+it has one (`EngineConfig::cache_dir`, the CLI's `--cache-dir`), and then
+every evaluation reads and writes it unless its options opt out
+(`cache: Some(false)`, JSON `"cache": false`). Without a directory nothing is
+cached, whatever a request asks, and an evaluation is one whole-program
+dataflow.
 
 ### C
 
@@ -174,7 +183,7 @@ admission limit (`--max-concurrent`).
 
 ```bash
 target/release/executing -p reach.dl -f reach -c output -w 8 \
-  --daemon-socket /tmp/flowlog.sock --cache-max-mib 4096 --cache-dir /tmp/flowlog-states
+  --daemon-socket /tmp/flowlog.sock --cache-dir /tmp/flowlog-states
 
 target/release/flowlogctl -s /tmp/flowlog.sock evaluate --id one --program other.dl \
   --facts other-facts --csvs other-output --inline --budget-seconds 30 --explain
@@ -333,11 +342,10 @@ projection. A rule that needs none of it has no row program.
 
 ### Schedules
 
-- **Whole program** (the CLI, library and service default): every
+- **Whole program** (the default without a cache directory): every
   stratum in one dataflow, sharing intermediates across strata. Never cached.
-- **Per stratum** (explicit caching or scheduling, including the CLI's
-  `--cached` or `--cache-dir`): one dataflow per stratum, each unit keyed
-  against the state cache.
+- **Per stratum** (the default with a cache directory, or when asked for):
+  one dataflow per stratum, each unit keyed against the state cache.
 
 Both run on the evaluation's own worker set: `workers` threads started for the
 evaluation, handed every dataflow of it in turn, and joined when it ends. The
@@ -351,8 +359,10 @@ aligned to complete lines. Inputs and captures use compact rows while sorting;
 large boundaries merge in parallel before producing the public row vectors.
 Each worker publishes its capture after the frontier completes, preserving
 signed retractions across workers. These paths serve both schedules, including
-service reloads. Active workers step without parking to reduce wakeup latency;
-idle workers block on their job receiver.
+service reloads. A worker its dataflow gives nothing to do spins for 50 us,
+then parks until a peer's message or a new job wakes it, so waiting workers
+leave their cores to the working ones and to other evaluations; idle workers
+block on their job receiver.
 
 For a reproducible release-build comparison, build the `runtime_bench`
 example in each checkout and retain each binary under a separate name. Use a
@@ -415,14 +425,45 @@ rows inherited from earlier strata: adding or replacing a clause reuses the
 unchanged clauses; deleting one preserves tuples still supported by another.
 A union whose contributions all hit needs no dataflow.
 
-Two tiers hold one key. The memory tier is the default, bounded by
-`cache_memory_bytes` and evicted least recently used. The disk tier is a spill
-a caller asks for (`cache_dir`), shared by every process that points at the
-same directory, bounded by `cache_disk_bytes` and swept by access time in
-bounded slices under a nonblocking lock. An entry carries the texts of the
-symbols in its rows, so a process that never interned them reads them by name;
-entries are written whole and verified against their digest on every read.
-Neither tier is a source of truth: a miss costs one evaluation.
+The cache is a directory (`cache_dir`, `--cache-dir`), bounded by
+`cache_disk_bytes` (32 GiB by default) and shared by every process that points
+at it; a process keeps what it reads and writes there in memory too, bounded
+by `cache_memory_bytes` and evicted least recently used. The directory is laid
+out for a slow, seek-bound disk:
+
+```text
+<cache_dir>/FORMAT              the layout: "flowlog-state-store 4"
+<cache_dir>/index.log           append-only records, every process's
+<cache_dir>/packs/<id>.pack     what one process wrote to one shelf, in the order it computed it
+<cache_dir>/.maintenance.lock   held by the one process evicting or compacting
+<cache_dir>/.index.lock         shared while appending, exclusive while the index is replaced
+```
+
+- A relation's rows are a blob named by their digest and stored once, however
+  many entries hold them (two processes computing the same rows at once may
+  each store them); an entry names the digests its unit settled.
+- A process appends everything it stores to packs of its own, so writing is
+  sequential and needs no per-entry file, rename or sync. Unit states and rule
+  contributions go to separate packs: an evaluation whose units all hit reads
+  unit states only, stratum after stratum, as they were written.
+- The index is read whole when a process first needs it and tailed between
+  strata, so a lookup touches no file; the hits of a stratum are read sorted
+  by pack and offset, nearby blobs merged into one read, and the kernel is
+  asked for the reads ahead of the readers, so the disk sees them together
+  and orders them.
+- Over budget, the process that notices removes whole packs, least recently
+  used first, under a nonblocking lock, and rewrites the index without them.
+  A pack read or written in the last ten minutes, or still held by the live
+  process writing it, is never removed; appenders wait the moment the new
+  index takes the old one's place, so no record is lost to it.
+- Index records carry a check and blobs their digest; nothing is synced, and
+  whatever a crash left short reads as absent.
+
+An entry carries the texts of the symbols in its rows, so a process that
+never interned them reads them by name. The cache is not a source of truth:
+a miss costs one evaluation. Version 4 neither reads nor removes the
+one-file-per-entry layout of earlier versions: delete its `<cache_dir>/??/`
+directories and `<cache_dir>/.sweep.lock`.
 
 What the cache is not: it retains no dataflow topology and does not
 incrementally update a recursive fixed point. A missed recursive or aggregate
@@ -442,8 +483,10 @@ it to `<csvs>/csvs/cache-stats.json`:
 | `rules_evaluated` | source rules assembled into dataflows |
 | `rows_loaded`, `rows_cached`, `contribution_rows_*` | rows served / stored, whole units and contributions separately |
 | `planning_micros`, `execution_micros`, `cache_micros`, `output_micros`, `total_micros` | preparation, dataflow, cache bookkeeping, output, the whole run |
-| `disk_sweep_*` | the disk tier's cleanup work |
-| `entries`, `resident_rows`, `resident_bytes`, `max_bytes` | the memory tier after the run |
+| `disk_sweep_*` | the cache directory's maintenance: passes, packs examined and removed, bytes removed |
+| `disk_reads`, `disk_read_bytes` | reads issued to the cache directory after merging nearby blobs, and the bytes they covered |
+| `disk_written_bytes`, `disk_shared_states` | bytes this run appended; states it found stored already and did not write again |
+| `entries`, `resident_rows`, `resident_bytes`, `max_bytes` | the states the process kept in memory, after the run |
 | `peak_memory_bytes`, `materialized_rows` | the evaluation's own footprint |
 
 ---
@@ -492,12 +535,11 @@ target/release/executing -p <program.dl> -f <facts_directory> [-c <output>] [opt
 | `-f, --facts <DIR>` | input relation files |
 | `-c, --csvs <DIR>` | write outputs to `<DIR>/csvs/<Relation>.csv`, sizes to `size.txt`, counters to `cache-stats.json` |
 | `-d, --delimiter <CHAR>` | column delimiter (default `,`) |
-| `-w, --workers <N>` | worker threads per evaluation (default 1) |
+| `-w, --workers <N>` | worker threads per evaluation (default 4) |
 | `-O <0-3>` | optimization: 1 sideways information passing, 2 structural planning, 3 both |
 | `--fat-mode`, `--no-sharing` | heap rows everywhere; no common-subexpression reuse |
 | `--check` | parse, validate, stratify and plan; print the report as JSON |
-| `--cached` | evaluate per stratum against the memory tier |
-| `--cache-dir <DIR>`, `--cache-max-mib`, `--cache-disk-max-mib` | the disk tier, and both tiers' budgets |
+| `--cache-dir <DIR>` | the state cache: read and write states in this directory, evaluating per stratum; without it nothing is cached |
 | `--call-cache <DIR>` | compiled blocks |
 | `--budget-seconds`, `--memory-limit-mib`, `--tuple-limit` | the evaluation's limits |
 | `--explain` | write a witness per output row to `explain.jsonl` |

@@ -319,25 +319,30 @@ impl Lexeme for CallExpr {
 pub enum CallPredicate {
     Bind { output: String, call: CallExpr },
     Filter(CallExpr),
+    /// A copy of a filter that planning runs early, on rows later joins may
+    /// still discard. False drops the row; a fault keeps it, because the
+    /// filter still runs where the rule wrote it and faults there if the row
+    /// gets that far. Never parsed.
+    Prefilter(CallExpr),
 }
 
 impl CallPredicate {
     pub fn call(&self) -> &CallExpr {
         match self {
-            Self::Bind { call, .. } | Self::Filter(call) => call,
+            Self::Bind { call, .. } | Self::Filter(call) | Self::Prefilter(call) => call,
         }
     }
 
     pub fn output(&self) -> Option<&str> {
         match self {
             Self::Bind { output, .. } => Some(output),
-            Self::Filter(_) => None,
+            Self::Filter(_) | Self::Prefilter(_) => None,
         }
     }
 
     fn lower_symbols(&mut self, intern: &mut dyn FnMut(&str) -> Result<Val>) -> Result<()> {
         match self {
-            Self::Bind { call, .. } | Self::Filter(call) => call.lower_symbols(intern),
+            Self::Bind { call, .. } | Self::Filter(call) | Self::Prefilter(call) => call.lower_symbols(intern),
         }
     }
 }
@@ -347,6 +352,7 @@ impl fmt::Display for CallPredicate {
         match self {
             Self::Bind { output, call } => write!(f, "{output} = {call}"),
             Self::Filter(call) => write!(f, "{call}"),
+            Self::Prefilter(call) => write!(f, "{call}?"),
         }
     }
 }

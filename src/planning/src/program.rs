@@ -30,17 +30,23 @@ impl ProgramQueryPlan {
     pub fn from_strata(strata: &Strata, disable_sharing: bool, opt_level: Option<u8>) -> Self {
         // accumulative seen set across all strata
         let mut seen_set = HashSet::new();
+        // Every stratum's rules are numbered past the previous stratum's: the
+        // slices planning adds are named by rule number, and every stratum
+        // here goes into one dataflow.
+        let mut first_rule_identifier = 0;
         let program_plan = strata
             .strata()
             .iter()
             .zip(strata.is_recursive_strata_bitmap())
             .flat_map(|(stratum, &is_recursive)| {
+                let first = first_rule_identifier;
+                first_rule_identifier += stratum.len();
                 plan_rules(
                     stratum,
                     is_recursive,
                     opt_level,
                     strata.program(),
-                    0,
+                    first,
                     &mut seen_set,
                     disable_sharing,
                 )
@@ -196,6 +202,38 @@ impl ProgramQueryPlan {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slices_of_rules_in_different_strata_have_different_names() {
+        // The two rules of h land in different strata, at the same place in
+        // each; both are cut, and one dataflow holds both slices.
+        let source = ".code rust\npub fn lt(a: i64, b: i64) -> bool { a < b }\n.endcode\n\
+                      .in\n.decl e(a: number, b: number)\n.input e.facts\n\
+                      .decl f(a: number, b: number)\n.input f.facts\n\
+                      .decl g(a: number, b: number)\n.input g.facts\n\
+                      .printsize\n.decl h(a: number, b: number)\n.decl k(a: number, b: number)\n\
+                      .rule\n\
+                      h(X, W) :- k(X, Y), f(Y, Z), g(Z, W), @call(lt, X, Z).\n\
+                      k(X, Y) :- f(X, Y).\n\
+                      h(X, W) :- e(X, Y), f(Y, Z), e(Z, W), @call(lt, X, Z).\n";
+        let program = Program::parse(source, "slices.dl").expect("parses");
+        let strata = Strata::from_parser(program);
+        let plan = ProgramQueryPlan::from_strata(&strata, false, None);
+        let mut slices: Vec<String> = plan
+            .program_plan()
+            .iter()
+            .flat_map(|group| group.rules().iter().map(|rule| rule.head().name().to_string()))
+            .filter(|name| name.starts_with("__flowlog_pushdown__"))
+            .collect();
+        assert_eq!(slices.len(), 2, "{slices:?}");
+        slices.dedup();
+        assert_eq!(slices.len(), 2, "{slices:?}");
+    }
+}
+
 impl fmt::Display for ProgramQueryPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, group_plan) in self.program_plan.iter().enumerate() {
@@ -226,6 +264,63 @@ pub fn plan_rules(
     let embedded_rust = program.embedded_rust();
     let mut rule_identifier = first_rule_identifier;
     let mut any_sip = false;
+
+    // Filter calls run where their arguments are bound (see `pushdown`). The
+    // slices of one level are planned as one group ahead of the stratum's
+    // rules, so the rules of every head stay in one group and a slice is
+    // complete before anything reads it.
+    let is_planning = |rule: &FLRule, catalog: &Catalog| {
+        catalog.is_core_atom_bitmap().iter().filter(|&&is_core| is_core).count() > 2
+            && (opt_level.is_some_and(|level| level >= 2) || rule.is_planning())
+    };
+    let mut slice_levels: Vec<Vec<FLRule>> = Vec::new();
+    let mut rests: Vec<FLRule> = Vec::new();
+    let mut is_cut = Vec::with_capacity(rules.len());
+    // Only where the plan joins core atoms in the order the rule lists them:
+    // not under sideways passing or the optimizer.
+    if !is_recursive && matches!(opt_level, None | Some(0)) {
+        for (offset, &rule) in rules.iter().enumerate() {
+            let cut = (!rule.is_sip() && !rule.is_planning())
+                .then(|| crate::pushdown::push_down_filter_calls(rule, first_rule_identifier + offset))
+                .flatten();
+            is_cut.push(cut.is_some());
+            if let Some((slices, rest)) = cut {
+                for (level, slice) in slices.into_iter().enumerate() {
+                    if slice_levels.len() <= level {
+                        slice_levels.push(Vec::new());
+                    }
+                    slice_levels[level].push(slice);
+                }
+                rests.push(rest);
+            }
+        }
+    }
+    let mut next_rest = rests.iter();
+    let rules: Vec<&FLRule> = rules
+        .iter()
+        .enumerate()
+        .map(|(index, &rule)| {
+            if is_cut.get(index).copied().unwrap_or(false) {
+                next_rest.next().expect("one rest per cut rule")
+            } else {
+                rule
+            }
+        })
+        .collect();
+    let slice_groups: Vec<GroupStrataQueryPlan> = slice_levels
+        .iter()
+        .map(|slices| {
+            let plans = slices
+                .iter()
+                .map(|slice| {
+                    let catalog = Catalog::from_strata(slice);
+                    let planning = is_planning(slice, &catalog);
+                    RuleQueryPlan::from_catalog_with_embedded(&catalog, planning, embedded_rust)
+                })
+                .collect();
+            GroupStrataQueryPlan::new(false, plans, seen_set, disable_sharing)
+        })
+        .collect();
 
     let chain: Vec<RuleQueryPlan> = rules
         .iter()
@@ -294,10 +389,9 @@ pub fn plan_rules(
         }
     }
 
-    grouped
-        .into_iter()
-        .map(|(is_recursive, rule_plans)| {
-            GroupStrataQueryPlan::new(is_recursive, rule_plans, seen_set, disable_sharing)
-        })
-        .collect()
+    let mut groups = slice_groups;
+    groups.extend(grouped.into_iter().map(|(is_recursive, rule_plans)| {
+        GroupStrataQueryPlan::new(is_recursive, rule_plans, seen_set, disable_sharing)
+    }));
+    groups
 }

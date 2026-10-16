@@ -32,3 +32,12 @@ paste = "1.0.15"
 mimalloc = "0.1.47"
 libloading = "0.8.9"
 sha2 = "0.10.9"
+
+# Everything for speed: every crate optimized as one unit. Panics stay
+# "unwind": the engine turns a panic on a worker into a diagnostic.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+incremental = false

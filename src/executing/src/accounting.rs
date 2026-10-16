@@ -128,6 +128,26 @@ impl MemoryTag {
             _counter: Arc::clone(counter),
         }
     }
+
+    /// The counter this thread's allocations are charged to, if it is
+    /// tagged: helper threads it starts take it, since what they allocate is
+    /// the same evaluation's.
+    pub fn current() -> Option<Arc<MemoryCounter>> {
+        COUNTER
+            .try_with(|current| {
+                let pointer = current.get();
+                (!pointer.is_null()).then(|| {
+                    // SAFETY: a tagged thread's pointer comes from
+                    // `Arc::as_ptr` of a counter its live tag holds.
+                    unsafe {
+                        Arc::increment_strong_count(pointer);
+                        Arc::from_raw(pointer)
+                    }
+                })
+            })
+            .ok()
+            .flatten()
+    }
 }
 
 impl Drop for MemoryTag {
@@ -135,6 +155,54 @@ impl Drop for MemoryTag {
         let _ = PENDING.try_with(flush_pending);
         let _ = COUNTER.try_with(|current| current.set(std::ptr::null()));
     }
+}
+
+// --------------------------------------------------------------- allocator
+
+extern "C" {
+    fn mi_option_get(option: std::ffi::c_int) -> std::ffi::c_long;
+    fn mi_option_set(option: std::ffi::c_int, value: std::ffi::c_long);
+}
+
+/// `mi_option_t` values, and their defaults, in the mimalloc this build links
+/// (libmimalloc-sys 0.1.43). A different version is left untouched.
+const MI_OPTION_ALLOW_LARGE_OS_PAGES: std::ffi::c_int = 6;
+const MI_DEFAULT_ALLOW_LARGE_OS_PAGES: std::ffi::c_long = 2;
+const MI_OPTION_PURGE_DELAY: std::ffi::c_int = 15;
+const MI_DEFAULT_PURGE_DELAY: std::ffi::c_long = 10;
+/// Milliseconds freed memory stays with the process before it is returned.
+const PURGE_DELAY_MILLIS: std::ffi::c_long = 1000;
+
+/// Allocator settings for dataflow evaluation, where the environment has
+/// not chosen its own (`MIMALLOC_ALLOW_LARGE_OS_PAGES`, `MIMALLOC_PURGE_DELAY`).
+///
+/// mimalloc marks its memory for transparent huge pages by default, and a
+/// fault in such memory compacts the host's memory in the faulting thread
+/// when no huge page is free: on a long-running, fragmented host those stalls
+/// made system time several times user time. It also returns freed pages to
+/// the OS after 10 ms, while a dataflow frees and reallocates batches far
+/// more often than that, so the same memory was faulted in again and again.
+/// Without huge pages and with a one-second purge delay, page faults fell
+/// about fivefold and system time by an order of magnitude on the same
+/// evaluation.
+pub fn tune_allocator() {
+    static TUNED: std::sync::Once = std::sync::Once::new();
+    TUNED.call_once(|| {
+        let unset = |names: &[&str]| names.iter().all(|name| std::env::var_os(name).is_none());
+        // SAFETY: plain option reads and writes of the linked allocator.
+        unsafe {
+            if unset(&["MIMALLOC_ALLOW_LARGE_OS_PAGES", "MIMALLOC_LARGE_OS_PAGES"])
+                && mi_option_get(MI_OPTION_ALLOW_LARGE_OS_PAGES) == MI_DEFAULT_ALLOW_LARGE_OS_PAGES
+            {
+                mi_option_set(MI_OPTION_ALLOW_LARGE_OS_PAGES, 0);
+            }
+            if unset(&["MIMALLOC_PURGE_DELAY", "MIMALLOC_RESET_DELAY"])
+                && mi_option_get(MI_OPTION_PURGE_DELAY) == MI_DEFAULT_PURGE_DELAY
+            {
+                mi_option_set(MI_OPTION_PURGE_DELAY, PURGE_DELAY_MILLIS);
+            }
+        }
+    });
 }
 
 // ------------------------------------------------------------------ budget

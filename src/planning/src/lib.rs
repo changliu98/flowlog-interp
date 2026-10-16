@@ -9,5 +9,6 @@ pub mod calls;
 pub mod compare;
 
 pub mod program;
+pub mod pushdown;
 pub mod strata;
 pub mod rule;

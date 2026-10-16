@@ -66,9 +66,9 @@ fn program_with(base: &str, step: &str, mark_rule: &str, extra_declarations: &st
     )
 }
 
-/// An engine with a 64 MiB memory tier and no disk tier.
-fn memory_engine() -> Arc<Engine> {
-    memory_engine_with(|_| {})
+/// An engine whose state cache is a directory of its own under `temp`.
+fn cache_engine(temp: &TempTree) -> Arc<Engine> {
+    cache_engine_with(temp, |_| {})
 }
 
 #[test]
@@ -102,10 +102,13 @@ fn parallel_file_preparation_preserves_states_and_refuses_bad_rows() {
     assert!(error.message.contains("not a number"), "{error}");
 }
 
-fn memory_engine_with(adjust: impl FnOnce(&mut EngineConfig)) -> Arc<Engine> {
+fn cache_engine_with(temp: &TempTree, adjust: impl FnOnce(&mut EngineConfig)) -> Arc<Engine> {
+    static STORES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let store = STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut config = EngineConfig {
         workers: 2,
         cache_memory_bytes: 64 * 1024 * 1024,
+        cache_dir: Some(temp.path(&format!("store-{store}"))),
         ..EngineConfig::default()
     };
     adjust(&mut config);
@@ -216,7 +219,7 @@ fn clause_edits_reuse_contributions_and_deletions_preserve_other_support() {
     for fat_mode in [false, true] {
         let temp = TempTree::new("contribution-edits");
         let (program_path, facts) = contribution_fixture(&temp);
-        let engine = memory_engine_with(|config| config.fat_mode = fat_mode);
+        let engine = cache_engine_with(&temp, |config| config.fat_mode = fat_mode);
         // Start with two overlapping rules, then add, delete, replace, and
         // respell clauses. Later heads have not previously been cached whole.
         let edits = [
@@ -273,7 +276,7 @@ fn changed_positive_and_negative_inputs_invalidate_only_their_contributions() {
         contribution_program("H(x) :- A(x).\nH(x) :- B(x), !C(x)."),
     )
     .unwrap();
-    let engine = memory_engine();
+    let engine = cache_engine(&temp);
     let output = temp.path("initial");
     cached(&engine, &program_path, &facts, &output);
     assert_clean_outputs(&engine, &program_path, &facts, &output);
@@ -312,7 +315,7 @@ fn a_contribution_does_not_capture_inherited_head_rows() {
         ".decl H(x: number)\n.decl G(x: number)",
     );
     fs::write(&program_path, &source).unwrap();
-    let engine = memory_engine();
+    let engine = cache_engine(&temp);
     cached(&engine, &program_path, &facts, &temp.path("initial"));
 
     // H's earlier state changes, while H <- G's body does not. If that
@@ -348,7 +351,7 @@ fn recursive_support_and_aggregate_changes_use_whole_unit_evaluation() {
                 ".decl H(x: number)\n.decl Q(x: number)\n.decl M(x: number)",
             );
     fs::write(&program_path, &source).unwrap();
-    let engine = memory_engine();
+    let engine = cache_engine(&temp);
     let output = temp.path("initial");
     let initial = cached(&engine, &program_path, &facts, &output);
     assert_eq!(
@@ -401,7 +404,7 @@ fn sideways_plans_keep_same_head_contributions_separate() {
     let forward = "H(x, z) :- A(x, y), B(y, w), C(w, z).\n";
     let reverse = "H(z, x) :- A(x, y), B(y, w), C(w, z).\n";
     let program_path = temp.path("program.dl");
-    let engine = memory_engine_with(|config| config.opt_level = Some(3));
+    let engine = cache_engine_with(&temp, |config| config.opt_level = Some(3));
     fs::write(&program_path, format!("{header}{forward}{reverse}")).unwrap();
     let initial_output = temp.path("initial");
     cached(&engine, &program_path, &facts, &initial_output);
@@ -427,7 +430,7 @@ fn native_source_changes_invalidate_only_calling_contributions() {
     let temp = TempTree::new("contribution-native");
     let (program_path, facts) = contribution_fixture(&temp);
     let calls = temp.path("calls");
-    let engine = memory_engine_with(|config| config.call_cache = Some(calls.clone()));
+    let engine = cache_engine_with(&temp, |config| config.call_cache = Some(calls.clone()));
     for increment in [1, 2] {
         let source = format!(
             ".code rust\npub fn shift(x: i64) -> i64 {{ x + {increment} }}\n.endcode\n{}",
@@ -458,7 +461,7 @@ fn an_edit_to_an_uncalled_block_invalidates_nothing() {
     let temp = TempTree::new("uncalled-block");
     let (program_path, facts) = contribution_fixture(&temp);
     let calls = temp.path("calls");
-    let engine = memory_engine_with(|config| config.call_cache = Some(calls.clone()));
+    let engine = cache_engine_with(&temp, |config| config.call_cache = Some(calls.clone()));
     for constant in [10, 20] {
         let source = format!(
             ".code rust\npub fn shift(x: i64) -> i64 {{ x + 1 }}\n.endcode\n\
@@ -513,7 +516,7 @@ fn one_shot_processes_share_contributions_for_a_new_rule_revision() {
             assert_eq!(stats["rules_evaluated"], 0);
             assert_eq!(sorted_rows(&output.join("csvs/H.csv")), vec!["2", "3"]);
         }
-        let engine = memory_engine();
+        let engine = cache_engine(&temp);
         assert_clean_outputs(&engine, &program_path, &facts, &output);
     }
 }
@@ -523,7 +526,7 @@ fn a_downstream_rule_edit_reuses_the_recursive_upstream_stratum() {
     let temp = TempTree::new("downstream-edit");
     let (program_path, facts, output) = fixture(&temp, "Mark(x) :- Reach(1, x).");
 
-    let engine = memory_engine();
+    let engine = cache_engine(&temp);
     let cold = cached(&engine, &program_path, &facts, &output);
     assert_eq!((cold.hits, cold.misses), (0, 3), "{cold:?}");
     assert_eq!(cold.strata, 3);
@@ -537,7 +540,7 @@ fn a_downstream_rule_edit_reuses_the_recursive_upstream_stratum() {
     assert_eq!((edited.hits, edited.misses), (2, 1));
 
     let clean_output = temp.path("clean-output");
-    let clean_engine = memory_engine();
+    let clean_engine = cache_engine(&temp);
     let clean = cached(&clean_engine, &program_path, &facts, &clean_output);
     assert_eq!((clean.hits, clean.misses), (0, 3));
 
@@ -562,7 +565,7 @@ fn a_downstream_rule_edit_reuses_the_recursive_upstream_stratum() {
 fn a_rule_rewritten_to_mean_the_same_thing_keeps_every_entry() {
     let temp = TempTree::new("respelled");
     let (program_path, facts, output) = fixture(&temp, "Mark(x) :- Reach(1, x).");
-    let engine = memory_engine();
+    let engine = cache_engine(&temp);
     let cold = cached(&engine, &program_path, &facts, &output);
     assert_eq!((cold.hits, cold.misses), (0, 3));
 
@@ -599,7 +602,7 @@ fn a_rule_rewritten_to_mean_the_same_thing_keeps_every_entry() {
 fn an_upstream_edit_that_leaves_the_rows_unchanged_stops_invalidating_there() {
     let temp = TempTree::new("cutoff");
     let (program_path, facts, output) = fixture(&temp, "Mark(x) :- Reach(1, x).");
-    let engine = memory_engine();
+    let engine = cache_engine(&temp);
     cached(&engine, &program_path, &facts, &output);
 
     // A second base rule that derives nothing new: the base unit's rules
@@ -640,11 +643,11 @@ fn the_disk_store_serves_a_process_that_never_computed() {
     let (program_path, facts, output) = fixture(&temp, "Mark(x) :- Reach(1, x).");
     let store = temp.path("state-store");
 
-    let first = memory_engine_with(|config| config.cache_dir = Some(store.clone()));
+    let first = cache_engine_with(&temp, |config| config.cache_dir = Some(store.clone()));
     let cold = cached(&first, &program_path, &facts, &output);
     assert_eq!((cold.hits, cold.misses, cold.disk_hits), (0, 3, 0));
 
-    let second = memory_engine_with(|config| config.cache_dir = Some(store.clone()));
+    let second = cache_engine_with(&temp, |config| config.cache_dir = Some(store.clone()));
     let other_output = temp.path("other-output");
     let warm = cached(&second, &program_path, &facts, &other_output);
     assert_eq!(
@@ -690,7 +693,7 @@ fn the_service_serves_named_paths_concurrently_and_removes_its_socket() {
     let (program_path, facts, output) = fixture(&temp, "Mark(x) :- Reach(1, x).");
     let socket = temp.path("flowlog.sock");
 
-    let engine = memory_engine();
+    let engine = cache_engine(&temp);
     let defaults = ServiceDefaults {
         program: Some(program_path.clone()),
         facts: Some(facts.clone()),
@@ -810,7 +813,7 @@ fn cached_sideways_information_passing_keeps_private_boundaries() {
     )
     .unwrap();
     let output = temp.path("output");
-    let engine = memory_engine_with(|config| config.opt_level = Some(1));
+    let engine = cache_engine_with(&temp, |config| config.opt_level = Some(1));
 
     let cold = cached(&engine, &program_path, &facts, &output);
     assert!(cold.misses > 0);
@@ -855,7 +858,7 @@ fn a_head_with_rules_in_two_strata_accumulates_across_them() {
     )
     .unwrap();
     let output = temp.path("output");
-    let engine = memory_engine();
+    let engine = cache_engine(&temp);
     let cold = cached(&engine, &program_path, &facts, &output);
     assert_eq!(cold.misses, cold.units, "{cold:?}");
     assert_eq!(
@@ -892,7 +895,7 @@ fn a_cached_state_carries_its_symbols_across_engines() {
     )
     .unwrap();
     let store = temp.path("state-store");
-    let first = memory_engine_with(|config| config.cache_dir = Some(store.clone()));
+    let first = cache_engine_with(&temp, |config| config.cache_dir = Some(store.clone()));
     let output = temp.path("first");
     let cold = cached(&first, &program_path, &facts, &output);
     assert_eq!(cold.misses, 1);
@@ -900,7 +903,7 @@ fn a_cached_state_carries_its_symbols_across_engines() {
 
     // The second engine's inputs intern the same texts; the cached Out is
     // served and written by name.
-    let second = memory_engine_with(|config| config.cache_dir = Some(store.clone()));
+    let second = cache_engine_with(&temp, |config| config.cache_dir = Some(store.clone()));
     let other = temp.path("second");
     let warm = cached(&second, &program_path, &facts, &other);
     assert_eq!((warm.hits, warm.disk_hits), (1, 1), "{warm:?}");

@@ -2,7 +2,7 @@
 
 use crate::accounting::Limits;
 use crate::daemon::ServiceDefaults;
-use crate::engine::{EngineConfig, EvaluationOptions, EvaluationRequest, Inputs, ProgramSource, Schedule};
+use crate::engine::{EngineConfig, EvaluationOptions, EvaluationRequest, Inputs, ProgramSource};
 use clap::Parser;
 use parsing::diagnostic::{Diagnostic, Result};
 use std::path::{Path, PathBuf};
@@ -36,7 +36,7 @@ pub struct Args {
     no_sharing: bool,
 
     /// number of worker threads per evaluation
-    #[arg(short, long, default_value_t = 1)]
+    #[arg(short, long, default_value_t = 4)]
     workers: usize,
 
     /// optimization Level
@@ -52,23 +52,11 @@ pub struct Args {
     #[arg(long)]
     daemon_socket: Option<PathBuf>,
 
-    /// maximum memory retained by the state cache's memory tier
-    #[arg(long, default_value_t = 4096)]
-    cache_max_mib: usize,
-
-    /// directory of the state cache's disk tier, shared by every process that
-    /// points at it; without it a one-shot run keeps its states in memory only
+    /// the state cache: evaluations read and write their states in this
+    /// directory, shared by every process that points at it; without it
+    /// nothing is cached
     #[arg(long)]
     cache_dir: Option<PathBuf>,
-
-    /// approximate disk budget under --cache-dir, enforced by shared incremental cleanup
-    #[arg(long, default_value_t = 32768)]
-    cache_disk_max_mib: usize,
-
-    /// evaluate stratum by stratum against the state cache even without a
-    /// disk tier (the default is one dataflow for the whole program)
-    #[arg(long, default_value_t = false)]
-    cached: bool,
 
     /// only check the program: parse, validate, stratify and plan it
     #[arg(long, default_value_t = false)]
@@ -141,12 +129,11 @@ impl Args {
             fat_mode: self.fat_mode,
             sharing: !self.no_sharing,
             opt_level: self.opt_level,
-            cache_memory_bytes: self.cache_max_mib.saturating_mul(1024 * 1024),
             cache_dir: self.cache_dir.clone(),
-            cache_disk_bytes: (self.cache_disk_max_mib as u64).saturating_mul(1024 * 1024),
             call_cache: self.call_cache.clone(),
             max_concurrent: self.max_concurrent,
             delimiter: self.delimiter_byte()?,
+            ..EngineConfig::default()
         })
     }
 
@@ -158,11 +145,6 @@ impl Args {
         }
     }
 
-    /// Whether the command line asks to read along the state cache.
-    pub fn cached(&self) -> bool {
-        self.cached || self.cache_dir.is_some()
-    }
-
     pub fn options(&self) -> EvaluationOptions {
         EvaluationOptions {
             profile_path: self.profile_json.clone(),
@@ -172,12 +154,9 @@ impl Args {
                 memory_bytes: self.memory_limit_mib.map(|mib| mib.saturating_mul(1024 * 1024)),
                 tuples: self.tuple_limit,
             },
-            cache: Some(self.cached()),
-            schedule: Some(if self.cached() {
-                Schedule::PerStratum
-            } else {
-                Schedule::WholeProgram
-            }),
+            // The engine caches exactly when it has a cache directory.
+            cache: None,
+            schedule: None,
             explain: Vec::new(),
             explain_all: self.explain,
         }

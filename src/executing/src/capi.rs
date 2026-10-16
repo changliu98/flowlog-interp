@@ -309,7 +309,7 @@ pub unsafe extern "C" fn flowlog_evaluate(
                     types: CString::new(letters).ok()?,
                     arity: state.arity,
                     rows: state.rows.len(),
-                    cells: state.rows.iter().flat_map(|row| row.iter().copied()).collect(),
+                    cells: state.rows.cells().to_vec(),
                 })
             })
             .collect(),

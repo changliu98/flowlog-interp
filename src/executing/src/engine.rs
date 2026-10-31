@@ -1,23 +1,23 @@
 //! The engine: what a host holds to evaluate programs.
 //!
-//! An `Engine` owns the state that outlives one evaluation - the memory tier
-//! of the state cache, the optional disk tier, the symbol table, the
-//! admission limit - and offers three operations: `check` a program without
-//! evaluating it, `evaluate` a program over inputs, and read or make
-//! symbols. The command line, the service and the C API are all clients of
-//! this type; none of them holds anything it does not.
+//! An `Engine` owns the state that outlives one evaluation - the symbol
+//! table and the admission limit - and offers three operations: `check` a
+//! program without evaluating it, `evaluate` a program over inputs, and read
+//! or make symbols. The command line, the service and the C API are all
+//! clients of this type; none of them holds anything it does not.
 //!
 //! A request names its program (text, or already parsed), its inputs (rows in
 //! memory, or a directory of files), and its options: the limits it runs
-//! under, whether to read along the cache, which schedule to run, and which
-//! rows to explain. A result holds every relation's final state, the column
-//! types to read them by, the run's counters, and the witnesses asked for.
+//! under and which rows to explain. A result holds every relation's final
+//! state, the column types to read them by, the run's counters, and the
+//! witnesses asked for. Every evaluation is computed afresh: nothing an
+//! evaluation derives is kept for the next one.
 
 use crate::accounting::{Budget, Limits};
-use crate::cache::{CacheRunStats, CacheStateStats, DiskStore, RelationState, StrataCache};
 use crate::explain::{Explainer, Witness};
 use crate::files;
 use crate::runner;
+use crate::state::{RelationState, RunStats};
 use crate::symbols::SymbolTable;
 use parsing::decl::DataType;
 use parsing::diagnostic::{Diagnostic, Result};
@@ -44,15 +44,6 @@ pub struct EngineConfig {
     /// Optimization level (0-3): sideways information passing and structural
     /// planning; `None` follows each rule's own hints.
     pub opt_level: Option<u8>,
-    /// Bytes of cached states a process keeps in memory in front of its
-    /// cache directory.
-    pub cache_memory_bytes: usize,
-    /// The state cache: a directory evaluations read and write their states
-    /// in, shared by every process that points at it. Without one nothing is
-    /// cached, whatever a request asks.
-    pub cache_dir: Option<PathBuf>,
-    /// Bytes the cache directory may hold.
-    pub cache_disk_bytes: u64,
     /// Opt-in persistent storage for compiled embedded blocks. Without this or
     /// FLOWLOG_CALL_CACHE, builds use temporary directories removed on release.
     pub call_cache: Option<PathBuf>,
@@ -69,9 +60,6 @@ impl Default for EngineConfig {
             fat_mode: false,
             sharing: true,
             opt_level: None,
-            cache_memory_bytes: 4 * 1024 * 1024 * 1024,
-            cache_dir: None,
-            cache_disk_bytes: 32 * 1024 * 1024 * 1024,
             call_cache: None,
             max_concurrent: 0,
             delimiter: b',',
@@ -104,49 +92,16 @@ pub enum Inputs {
     States(HashMap<String, Arc<RelationState>>),
 }
 
-/// How an evaluation is scheduled onto dataflows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Schedule {
-    /// One dataflow per stratum, each keyed against the state cache.
-    PerStratum,
-    /// One dataflow for the whole program, sharing intermediates across
-    /// strata; never cached.
-    WholeProgram,
-}
-
 /// What an evaluation may do and how far it reports.
 #[derive(Debug, Clone, Default)]
 pub struct EvaluationOptions {
     /// Optional live operator profile, atomically refreshed during evaluation.
     pub profile_path: Option<PathBuf>,
     pub limits: Limits,
-    /// Read along and write into the engine's cache directory; `None` does
-    /// whenever the engine has one, `Some(false)` opts out. An engine without
-    /// a cache directory caches nothing.
-    pub cache: Option<bool>,
-    /// `None` is per-stratum when caching, whole-program otherwise.
-    pub schedule: Option<Schedule>,
     /// Rows to explain: relation and row, each answered with a witness.
     pub explain: Vec<(String, Vec<Val>)>,
     /// Explain every derived row of every output relation.
     pub explain_all: bool,
-}
-
-impl EvaluationOptions {
-    /// Whether the evaluation reads along and writes into the cache of an
-    /// engine configured as `config`.
-    pub fn cached(&self, config: &EngineConfig) -> bool {
-        config.cache_dir.is_some() && self.cache.unwrap_or(true)
-    }
-
-    pub fn schedule(&self, config: &EngineConfig) -> Schedule {
-        self.schedule.unwrap_or(if self.cached(config) {
-            Schedule::PerStratum
-        } else {
-            Schedule::WholeProgram
-        })
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -166,7 +121,7 @@ pub struct EvaluationResult {
     pub types: HashMap<String, Vec<DataType>>,
     /// The names of the declared output relations, in declaration order.
     pub declared_outputs: Vec<String>,
-    pub stats: CacheRunStats,
+    pub stats: RunStats,
     pub witnesses: Vec<Witness>,
 }
 
@@ -277,7 +232,6 @@ impl Drop for AdmissionGuard<'_> {
 /// The engine.
 pub struct Engine {
     config: EngineConfig,
-    cache: Mutex<StrataCache>,
     symbols: Arc<SymbolTable>,
     admission: Admission,
     evaluations: AtomicU64,
@@ -286,16 +240,8 @@ pub struct Engine {
 impl Engine {
     pub fn new(config: EngineConfig) -> Arc<Self> {
         crate::accounting::tune_allocator();
-        let cache = StrataCache::new(config.cache_memory_bytes);
-        let cache = match &config.cache_dir {
-            Some(directory) => {
-                cache.with_disk(DiskStore::new(directory.clone(), config.cache_disk_bytes))
-            }
-            None => cache,
-        };
         Arc::new(Self {
             config,
-            cache: Mutex::new(cache),
             symbols: Arc::new(SymbolTable::new()),
             admission: Admission::default(),
             evaluations: AtomicU64::new(0),
@@ -318,17 +264,6 @@ impl Engine {
     /// The text of a symbol id this engine has seen.
     pub fn symbol_text(&self, id: Val) -> Option<String> {
         self.symbols.resolve(id)
-    }
-
-    pub(crate) fn cache(&self) -> &Mutex<StrataCache> {
-        &self.cache
-    }
-
-    pub fn cache_stats(&self) -> CacheStateStats {
-        self.cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .state_stats()
     }
 
     /// Evaluations running now.
@@ -524,12 +459,11 @@ impl Engine {
     }
 }
 
-/// The counters of the last run and the cache's state, for a status reply.
+/// What the engine is doing, for a status reply.
 #[derive(Debug, Clone, Serialize)]
 pub struct EngineStatus {
     pub running: usize,
     pub completed: u64,
-    pub cache: CacheStateStats,
     pub symbols: usize,
 }
 
@@ -538,7 +472,6 @@ impl Engine {
         EngineStatus {
             running: self.running(),
             completed: self.completed(),
-            cache: self.cache_stats(),
             symbols: self.symbols.len(),
         }
     }

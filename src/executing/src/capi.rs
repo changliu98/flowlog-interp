@@ -37,7 +37,7 @@
 use crate::accounting::Limits;
 use crate::engine::{
     Engine, EngineConfig, EvaluationOptions, EvaluationRequest, EvaluationResult, Inputs,
-    ProgramSource, Schedule,
+    ProgramSource,
 };
 use parsing::decl::DataType;
 use parsing::diagnostic::Diagnostic;
@@ -95,10 +95,6 @@ struct OptionsJson {
     memory_limit_bytes: Option<u64>,
     #[serde(default)]
     tuple_limit: Option<u64>,
-    #[serde(default)]
-    cache: Option<bool>,
-    #[serde(default)]
-    schedule: Option<Schedule>,
     #[serde(default)]
     explain: Vec<(String, Vec<Val>)>,
     #[serde(default)]
@@ -282,8 +278,6 @@ pub unsafe extern "C" fn flowlog_evaluate(
                     memory_bytes: options.memory_limit_bytes,
                     tuples: options.tuple_limit,
                 },
-                cache: options.cache,
-                schedule: options.schedule,
                 explain: options.explain,
                 explain_all: options.explain_all,
             },

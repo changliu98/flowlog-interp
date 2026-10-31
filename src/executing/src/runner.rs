@@ -1,51 +1,35 @@
-//! One evaluation: strata onto dataflows, dataflows onto the evaluation's
-//! worker set, states out.
+//! One evaluation: the program onto one dataflow, the dataflow onto the
+//! evaluation's worker set, states out.
 //!
-//! Two schedules exist. *Per stratum* reads along the state cache: every unit
-//! of a stratum is keyed from settled states, served when the cache holds it,
-//! and otherwise assembled - as rule contributions where the unit is an
-//! ordinary non-recursive head, whole otherwise - into one dataflow for the
-//! stratum. *Whole program* builds every stratum into one dataflow, sharing
-//! intermediates across strata, and never touches the cache. Both run on the
-//! same worker set and capture the same states.
+//! Every stratum is assembled into one dataflow, so intermediates are shared
+//! across strata and nothing is materialized between them. The inputs enter
+//! as sessions, every head is captured where the dataflow ends, and the
+//! captures settle into sorted states once its frontier has closed.
 
 use crate::accounting::{Budget, MemoryCounter};
-use crate::cache::{
-    contribution_key, symbol_cells, unit_inputs, unit_key, units_of_stratum, CacheEntry,
-    CacheRunStats, HitSource, RelationState, StrataCache, Unit,
-};
-use crate::canonical::canonical_rule;
-use crate::dataflow::{Assembly, Computation};
-use crate::engine::{budget_of, Engine, EngineConfig, EvaluationOptions, Schedule};
+use crate::dataflow::Assembly;
+use crate::engine::{budget_of, Engine, EngineConfig, EvaluationOptions};
 use crate::native_calls::NativeCallModule;
 use crate::rows::Rows;
+use crate::state::{RelationState, RunStats};
 use crate::worker::WorkerSet;
 use catalog::head::aggregation_catalog_from_program;
-use itertools::Itertools;
 use parsing::diagnostic::Result;
 use parsing::parser::Program;
-use planning::program::{plan_rules, ProgramQueryPlan};
+use planning::program::ProgramQueryPlan;
 use reading::inspect::{MaterializedUpdates, UpdateBatch};
 use reading::{KV_MAX, ROW_MAX};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use strata::stratification::Strata;
 use tracing::{info, warn};
-
-/// The cache behind its lock, poisoned or not: a run that panicked mid-way
-/// wrote nothing partial, so the entries are as good as they were.
-pub fn lock(cache: &Mutex<StrataCache>) -> MutexGuard<'_, StrataCache> {
-    cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 /// What one evaluation leaves behind for the caller and the explainer.
 pub struct RunOutcome {
     pub program: Program,
     pub states: HashMap<String, Arc<RelationState>>,
-    pub stats: CacheRunStats,
+    pub stats: RunStats,
     pub budget: Arc<Budget>,
     pub native: Option<Arc<NativeCallModule>>,
 }
@@ -79,28 +63,11 @@ fn native_module(engine: &Engine, program: &Program) -> Result<Option<Arc<Native
         .transpose()
 }
 
-/// One cache miss to evaluate. A contribution belongs to a pending head union;
-/// a whole-unit result can be published directly at the stratum boundary.
-struct PendingComputation<'a> {
-    unit: Unit<'a>,
-    key: String,
-    inputs: BTreeMap<String, Arc<RelationState>>,
-    contribution_to: Option<usize>,
-}
-
-struct PendingUnion {
-    head: String,
-    arity: usize,
-    key: String,
-    inherited: Option<Arc<RelationState>>,
-    contributions: Vec<Arc<RelationState>>,
-}
-
 /// Run one program over its input states.
 pub fn run(
     engine: &Engine,
     program: Program,
-    states: HashMap<String, Arc<RelationState>>,
+    mut states: HashMap<String, Arc<RelationState>>,
     options: &EvaluationOptions,
 ) -> Result<RunOutcome> {
     let total_started = Instant::now();
@@ -109,7 +76,7 @@ pub fn run(
     let config = engine.config();
     let strata = Strata::try_from_parser(program.clone())?;
     debugging::debugger::display_info("Strata", false, format!("{}\n{}", strata.dependency_graph(), strata));
-    let (whole_plan, fat_mode) = plan_check(&strata, config)?;
+    let (plan, fat_mode) = plan_check(&strata, config)?;
     if let Some(profile) = &profile { profile.phase("compiling_helpers"); }
     let native = native_module(engine, &program)?;
     let idb_map = Arc::new(aggregation_catalog_from_program(&program));
@@ -117,83 +84,15 @@ pub fn run(
     let _tag = crate::accounting::MemoryTag::new(budget.memory());
     let workers = WorkerSet::start(config.workers, Arc::clone(&budget), profile.clone())?;
     if let Some(profile) = &profile { profile.phase("executing"); }
-    let planning_elapsed = total_started.elapsed();
 
-    let mut stats = CacheRunStats::default();
-    stats.planning_micros = duration_micros(planning_elapsed);
-
-    let states = match options.schedule(config) {
-        Schedule::WholeProgram => run_whole(
-            &program,
-            &strata,
-            whole_plan,
-            states,
-            &workers,
-            fat_mode,
-            &idb_map,
-            &native,
-            &budget,
-            &mut stats,
-        )?,
-        Schedule::PerStratum => run_per_stratum(
-            engine,
-            &program,
-            &strata,
-            states,
-            &workers,
-            fat_mode,
-            &idb_map,
-            &native,
-            &budget,
-            options.cached(config),
-            &mut stats,
-        )?,
+    let mut stats = RunStats {
+        strata: strata.strata().len(),
+        rules: program.rules().len(),
+        planning_micros: duration_micros(total_started.elapsed()),
+        ..RunStats::default()
     };
-    drop(workers);
 
-    let cache_state = engine.cache_stats();
-    stats.entries = cache_state.entries;
-    stats.resident_rows = cache_state.resident_rows;
-    stats.resident_bytes = cache_state.resident_bytes;
-    stats.max_bytes = cache_state.max_bytes;
-    stats.peak_memory_bytes = budget.memory().peak();
-    stats.materialized_rows = budget.tuples();
-    stats.total_micros = duration_micros(total_started.elapsed());
-    info!(
-        "state cache: {} strata, {} units, {} hits ({} from disk, {} after a miss), {} misses; contributions: {} hits ({} from disk), {} misses; {} rules evaluated",
-        stats.strata, stats.units, stats.hits, stats.disk_hits, stats.hits_after_miss, stats.misses,
-        stats.contribution_hits, stats.contribution_disk_hits, stats.contribution_misses,
-        stats.rules_evaluated
-    );
-    if let Some(profile) = &profile { profile.complete(); }
-    Ok(RunOutcome {
-        program,
-        states,
-        stats,
-        budget,
-        native,
-    })
-}
-
-/// Every stratum in one dataflow, every head captured at the end.
-fn run_whole(
-    program: &Program,
-    strata: &Strata,
-    plan: ProgramQueryPlan,
-    mut states: HashMap<String, Arc<RelationState>>,
-    workers: &WorkerSet,
-    fat_mode: bool,
-    idb_map: &Arc<HashMap<String, catalog::head::AggregationHeadIDB>>,
-    native: &Option<Arc<NativeCallModule>>,
-    budget: &Arc<Budget>,
-    stats: &mut CacheRunStats,
-) -> Result<HashMap<String, Arc<RelationState>>> {
-    let started = Instant::now();
-    stats.strata = strata.strata().len();
-    stats.units = 1;
-    stats.misses = 1;
-    stats.rules_evaluated = program.rules().len();
-
+    // Every head a rule derives; a sideways slice is internal to its group.
     let mut heads: BTreeMap<String, usize> = BTreeMap::new();
     for rule in program.rules() {
         if !rule.is_sideways() {
@@ -201,7 +100,7 @@ fn run_whole(
         }
     }
     // Every input, and every declared relation a rule reads but none
-    // defines: it is empty, as the per-stratum schedule has it.
+    // defines: it is empty.
     let read: HashSet<&str> = program
         .rules()
         .iter()
@@ -230,24 +129,24 @@ fn run_whole(
         .keys()
         .map(|head| (head.clone(), Arc::new(Mutex::new(Vec::new()))))
         .collect();
-    let assembly = Arc::new(Assembly {
-        computations: vec![Computation {
-            groups: plan.program_plan().clone(),
-            inputs,
-            captures: captures.clone(),
-        }],
+
+    let started = Instant::now();
+    workers.run(Arc::new(Assembly {
+        groups: plan.program_plan().clone(),
+        inputs,
+        captures: captures.clone(),
         fat_mode,
-        idb_map: Arc::clone(idb_map),
+        idb_map: Arc::clone(&idb_map),
         native_calls: native.clone(),
-        budget: Arc::clone(budget),
+        budget: Arc::clone(&budget),
         program_name: program.name().to_string(),
         profile: workers.profile(),
-    });
-    workers.run(assembly)?;
+    }))?;
     stats.execution_micros = duration_micros(started.elapsed());
 
-    // Each head settles on its own: merging and digesting are independent.
-    let settled = parallel_map(captures.into_iter().collect(), workers.peers(), budget,
+    // Each head settles on its own: merging is independent across heads.
+    let started = Instant::now();
+    let settled = parallel_map(captures.into_iter().collect(), workers.peers(), &budget,
         |(name, updates): (String, MaterializedUpdates)| {
             let arity = heads[&name];
             let rows = consolidate(&updates, arity, budget.memory());
@@ -256,372 +155,32 @@ fn run_whole(
             (name, state)
         });
     for (name, state) in settled {
-        stats.rows_cached += state.rows.len();
         states.insert(name, state);
     }
+    stats.settle_micros = duration_micros(started.elapsed());
+    drop(workers);
     budget.poll()?;
-    Ok(states)
-}
 
-/// Stratum by stratum, reading along the cache.
-fn run_per_stratum(
-    engine: &Engine,
-    program: &Program,
-    strata: &Strata,
-    mut states: HashMap<String, Arc<RelationState>>,
-    workers: &WorkerSet,
-    fat_mode: bool,
-    idb_map: &Arc<HashMap<String, catalog::head::AggregationHeadIDB>>,
-    native: &Option<Arc<NativeCallModule>>,
-    budget: &Arc<Budget>,
-    cached: bool,
-    stats: &mut CacheRunStats,
-) -> Result<HashMap<String, Arc<RelationState>>> {
-    let config = engine.config();
-    let cache = engine.cache();
-    let symbols = engine.symbols();
-    let mut execution = Duration::ZERO;
-    let mut cache_time = Duration::ZERO;
-    let strata_rules = strata.strata();
-    let recursive = strata.is_recursive_strata_bitmap();
-    stats.strata = strata_rules.len();
-
-    // Every lookup of a stratum at once: the memory tier under one lock, then
-    // the disk tier's reads and decodes on several threads without it.
-    let lookup_all = |requests: &[(&str, &BTreeMap<String, usize>)]| -> Vec<Option<(Arc<CacheEntry>, HitSource)>> {
-        if !cached {
-            return vec![None; requests.len()];
-        }
-        let (mut found, disk) = {
-            let mut cache = lock(cache);
-            let found: Vec<Option<(Arc<CacheEntry>, HitSource)>> = requests
-                .iter()
-                .map(|(key, heads)| cache.lookup_memory(key, heads).map(|entry| (entry, HitSource::Memory)))
-                .collect();
-            (found, cache.disk())
-        };
-        if let Some(disk) = disk {
-            // One batch: the store reads the hits sorted by where they lie.
-            let wanted: Vec<usize> = (0..requests.len()).filter(|&index| found[index].is_none()).collect();
-            let batch: Vec<(&str, &BTreeMap<String, usize>)> = wanted.iter().map(|&index| requests[index]).collect();
-            let loaded = disk.load_many(&batch, workers.peers());
-            let mut cache = lock(cache);
-            for (index, entry) in wanted.into_iter().zip(loaded) {
-                if let Some(entry) = entry {
-                    let entry = Arc::new(entry);
-                    cache.adopt(requests[index].0.to_string(), Arc::clone(&entry));
-                    found[index] = Some((entry, HitSource::Disk));
-                }
-            }
-        }
-        for (entry, _) in found.iter().flatten() {
-            // A cached state may hold symbols this engine never interned.
-            let _ = symbols.absorb(entry.symbols.iter().cloned());
-        }
-        found
-    };
-    let store = |key: String, entry: Arc<CacheEntry>, contribution: bool| {
-        if cached {
-            if contribution {
-                lock(cache).insert_contribution(key, entry);
-            } else {
-                lock(cache).insert(key, entry);
-            }
-        }
-    };
-    let disk = if cached { lock(cache).disk() } else { None };
-    let counters_before = disk.as_ref().map(|disk| disk.counters()).unwrap_or_default();
-    let entry_of = |relations: BTreeMap<String, Arc<RelationState>>| -> Arc<CacheEntry> {
-        let mut cells = Vec::new();
-        for (name, state) in &relations {
-            if let Some(types) = program.column_types(name) {
-                cells.extend(symbol_cells(&state.rows, types));
-            }
-        }
-        let texts = if cells.is_empty() {
-            Vec::new()
-        } else {
-            symbols.texts_of(cells)
-        };
-        Arc::new(CacheEntry::with_symbols(relations, texts))
-    };
-
-    for (stratum, &is_recursive) in strata_rules.iter().zip(recursive.iter()) {
-        budget.poll()?;
-        let cache_started = Instant::now();
-        let execution_before = execution;
-        let units = units_of_stratum(stratum, is_recursive);
-        stats.units += units.len();
-        let mut settled = Vec::new();
-        let mut missed = Vec::new();
-        let mut unions: Vec<PendingUnion> = Vec::new();
-        let mut contributions_to_store: Vec<(String, Arc<CacheEntry>)> = Vec::new();
-        // Keys read only earlier strata's states, so a stratum's units are
-        // keyed independently of each other.
-        let keyed = parallel_map(units, workers.peers(), budget, |unit: Unit<'_>| {
-            let inputs = unit_inputs(&unit, &states, program);
-            let key = unit_key(&unit, &inputs, program);
-            (unit, inputs, key)
-        });
-        let found = lookup_all(
-            &keyed
-                .iter()
-                .map(|(unit, _, key)| (key.as_str(), &unit.heads))
-                .collect::<Vec<_>>(),
-        );
-        // A contribution to look up: its union and its rule as a unit.
-        let mut contribution_requests: Vec<(usize, Unit<'_>)> = Vec::new();
-        for ((unit, inputs, key), found) in keyed.into_iter().zip(found) {
-            match found {
-                Some((entry, source)) => {
-                    stats.hits += 1;
-                    if source == HitSource::Disk {
-                        stats.disk_hits += 1;
-                    }
-                    if stats.misses > 0 {
-                        stats.hits_after_miss += 1;
-                    }
-                    stats.rows_loaded += entry.row_count();
-                    settled.push(entry);
-                }
-                None => {
-                    stats.misses += 1;
-                    if unit.recursive || unit.heads.keys().any(|head| idb_map.contains_key(head)) {
-                        missed.push(PendingComputation {
-                            unit,
-                            key,
-                            inputs,
-                            contribution_to: None,
-                        });
-                        continue;
-                    }
-
-                    // Every ordinary non-recursive unit has one head. Its
-                    // inherited state supports the final union, but must not
-                    // enter a rule contribution or that contribution's key.
-                    let (head, &arity) = unit.heads.first_key_value().expect("unit has a head");
-                    let pending = PendingUnion {
-                        head: head.clone(),
-                        arity,
-                        key,
-                        inherited: inputs.get(head).cloned(),
-                        contributions: Vec::new(),
-                    };
-                    let mut distinct_rules = HashSet::new();
-                    for rule in unit.rules {
-                        if !distinct_rules.insert(canonical_rule(rule)) {
-                            continue;
-                        }
-                        let contribution = Unit {
-                            heads: unit.heads.clone(),
-                            rules: vec![rule],
-                            recursive: false,
-                        };
-                        contribution_requests.push((unions.len(), contribution));
-                    }
-                    unions.push(pending);
-                }
-            }
-        }
-
-        // Every missed unit's rule contributions, keyed and looked up at once.
-        let keyed_contributions = parallel_map(
-            contribution_requests,
-            workers.peers(),
-            budget,
-            |(union, contribution): (usize, Unit<'_>)| {
-                let head = contribution.heads.keys().next().expect("unit has a head").clone();
-                let mut body_inputs = unit_inputs(&contribution, &states, program);
-                body_inputs.remove(&head);
-                let key = contribution_key(&contribution, &body_inputs, program);
-                (union, head, contribution, body_inputs, key)
-            },
-        );
-        let found = lookup_all(
-            &keyed_contributions
-                .iter()
-                .map(|(_, _, contribution, _, key)| (key.as_str(), &contribution.heads))
-                .collect::<Vec<_>>(),
-        );
-        for ((union, head, contribution, body_inputs, key), found) in keyed_contributions.into_iter().zip(found) {
-            match found {
-                Some((entry, source)) => {
-                    stats.contribution_hits += 1;
-                    if source == HitSource::Disk {
-                        stats.contribution_disk_hits += 1;
-                    }
-                    stats.contribution_rows_loaded += entry.row_count();
-                    unions[union].contributions.push(Arc::clone(&entry.relations[&head]));
-                }
-                None => {
-                    stats.contribution_misses += 1;
-                    missed.push(PendingComputation {
-                        unit: contribution,
-                        key,
-                        inputs: body_inputs,
-                        contribution_to: Some(union),
-                    });
-                }
-            }
-        }
-
-        if !missed.is_empty() {
-            let started = Instant::now();
-            let mut computations = Vec::with_capacity(missed.len());
-            let mut unit_captures: Vec<BTreeMap<String, MaterializedUpdates>> =
-                Vec::with_capacity(missed.len());
-            // Sideways slices are named by rule identifier; units assembled
-            // into one dataflow must not reuse each other's. Intermediates
-            // are shared within one computation and never across two, so the
-            // seen set starts afresh for each.
-            let mut first_identifiers = Vec::with_capacity(missed.len());
-            let mut next_rule_identifier = 0usize;
-            for pending in &missed {
-                first_identifiers.push(next_rule_identifier);
-                next_rule_identifier += pending.unit.rules.len();
-                stats.rules_evaluated += pending.unit.rules.len();
-            }
-            // Planning one computation is independent of planning another.
-            let planned = parallel_map(
-                missed.iter().zip(first_identifiers).collect(),
-                workers.peers(),
-                budget,
-                |(pending, first_identifier): (&PendingComputation<'_>, usize)| {
-                    let unit = &pending.unit;
-                    let mut seen_set = HashSet::new();
-                    plan_rules(
-                        &unit.rules,
-                        unit.recursive,
-                        config.opt_level,
-                        program,
-                        first_identifier,
-                        &mut seen_set,
-                        !config.sharing,
-                    )
-                },
-            );
-            for (pending, groups) in missed.iter().zip(planned) {
-                let captures: BTreeMap<String, MaterializedUpdates> = pending
-                    .unit
-                    .heads
-                    .keys()
-                    .map(|head| (head.clone(), Arc::new(Mutex::new(Vec::new()))))
-                    .collect();
-                unit_captures.push(captures.clone());
-                computations.push(Computation {
-                    groups,
-                    inputs: pending.inputs.clone(),
-                    captures,
-                });
-            }
-            workers.run(Arc::new(Assembly {
-                computations,
-                fat_mode,
-                idb_map: Arc::clone(idb_map),
-                native_calls: native.clone(),
-                budget: Arc::clone(budget),
-                program_name: program.name().to_string(),
-                profile: workers.profile(),
-            }))?;
-            execution += started.elapsed();
-
-            // Merging, sorting and digesting one unit's captures is
-            // independent of every other unit's, and the workers are idle.
-            let settled_units = parallel_map(
-                missed.iter().zip(unit_captures).collect(),
-                workers.peers(),
-                budget,
-                |(pending, captures): (&PendingComputation<'_>, BTreeMap<String, MaterializedUpdates>)| {
-                    let mut relations = BTreeMap::new();
-                    for (name, updates) in captures {
-                        let arity = pending.unit.heads[&name];
-                        let rows = consolidate(&updates, arity, budget.memory());
-                        budget.note_tuples(rows.len() as u64);
-                        relations.insert(
-                            name.clone(),
-                            Arc::new(RelationState::from_sorted(&name, arity, rows)),
-                        );
-                    }
-                    entry_of(relations)
-                },
-            );
-            for (pending, entry) in missed.into_iter().zip(settled_units) {
-                if let Some(index) = pending.contribution_to {
-                    stats.contribution_rows_cached += entry.row_count();
-                    let union = &mut unions[index];
-                    union
-                        .contributions
-                        .push(Arc::clone(&entry.relations[&union.head]));
-                    contributions_to_store.push((pending.key, entry));
-                } else {
-                    stats.rows_cached += entry.row_count();
-                    settled.push(Arc::clone(&entry));
-                    store(pending.key, entry, false);
-                }
-            }
-        }
-
-        // Reconstruct each head from its active contributions, one head per
-        // thread. A deletion omits one support, never subtracts a tuple still
-        // supported by another rule or by the head's state entering this stratum.
-        let union_entries = parallel_map(unions, workers.peers(), budget, |union: PendingUnion| {
-            let contributions: Vec<_> = union
-                .inherited
-                .iter()
-                .chain(union.contributions.iter())
-                .collect();
-            let state = if contributions.len() == 1 {
-                Arc::clone(contributions[0])
-            } else {
-                let total = contributions.iter().map(|state| state.rows.len()).sum();
-                let mut rows = Rows::with_capacity(union.arity, total);
-                for row in contributions.iter().map(|state| state.rows.iter()).kmerge().dedup() {
-                    rows.push(row);
-                }
-                Arc::new(RelationState::from_sorted(&union.head, union.arity, rows))
-            };
-            (union.key, entry_of(BTreeMap::from([(union.head, state)])))
-        });
-        for (key, entry) in union_entries {
-            stats.rows_cached += entry.row_count();
-            store(key, Arc::clone(&entry), false);
-            settled.push(entry);
-        }
-        // Contributions after the units: one that is its head's only support
-        // holds the union's rows, which are then stored with the units already.
-        for (key, entry) in contributions_to_store {
-            store(key, entry, true);
-        }
-
-        for entry in settled {
-            for (name, state) in &entry.relations {
-                states.insert(name.clone(), Arc::clone(state));
-            }
-        }
-        // What this stratum stored, on disk for the processes that follow.
-        if let Some(disk) = &disk {
-            disk.flush();
-        }
-        cache_time += cache_started
-            .elapsed()
-            .saturating_sub(execution.saturating_sub(execution_before));
-        budget.poll()?;
-    }
-
-    if let Some(disk) = &disk {
-        let started = Instant::now();
-        disk.flush();
-        stats.disk += disk.maintain();
-        let counters = disk.counters();
-        stats.disk_reads = counters.read_requests - counters_before.read_requests;
-        stats.disk_read_bytes = counters.read_bytes - counters_before.read_bytes;
-        stats.disk_written_bytes = counters.written_bytes - counters_before.written_bytes;
-        stats.disk_shared_states = counters.reused_blobs - counters_before.reused_blobs;
-        cache_time += started.elapsed();
-    }
-    stats.execution_micros = duration_micros(execution);
-    stats.cache_micros = duration_micros(cache_time);
-    Ok(states)
+    stats.peak_memory_bytes = budget.memory().peak();
+    stats.materialized_rows = budget.tuples();
+    stats.total_micros = duration_micros(total_started.elapsed());
+    info!(
+        "evaluation: {} strata, {} rules, {} rows settled; {:.3}s preparing, {:.3}s in the dataflow, {:.3}s settling",
+        stats.strata,
+        stats.rules,
+        stats.materialized_rows,
+        stats.planning_micros as f64 / 1e6,
+        stats.execution_micros as f64 / 1e6,
+        stats.settle_micros as f64 / 1e6,
+    );
+    if let Some(profile) = &profile { profile.complete(); }
+    Ok(RunOutcome {
+        program,
+        states,
+        stats,
+        budget,
+        native,
+    })
 }
 
 /// `function` over every item on up to `threads` threads, results in item

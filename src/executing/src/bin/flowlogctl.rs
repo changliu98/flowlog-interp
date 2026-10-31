@@ -15,7 +15,7 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Evaluate a program, reading along the cache (protocol version 1 form)
+    /// Evaluate a program over the service's defaults (the protocol version 1 form)
     Reload {
         /// program to evaluate (default: the service's)
         #[arg(long)]
@@ -27,7 +27,7 @@ enum Command {
         #[arg(long)]
         csvs: Option<String>,
     },
-    /// Evaluate a program with the protocol version 2 form
+    /// Evaluate a program
     Evaluate {
         /// request id, for `cancel`
         #[arg(long)]
@@ -61,7 +61,7 @@ enum Command {
         #[arg(long)]
         id: String,
     },
-    /// Report the last run and the cache's occupancy
+    /// Report the last run and the evaluations running
     Stats,
     /// Ask the service to exit cleanly
     Shutdown,

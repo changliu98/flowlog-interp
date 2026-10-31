@@ -85,7 +85,7 @@ def main():
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
     workloads = prepare(root, args.rows, args.chains, args.length)
-    cases = list(itertools.product(binaries, workloads, args.workers, ("whole", "cold", "warm")))
+    cases = list(itertools.product(binaries, workloads, args.workers))
     random.Random(args.seed).shuffle(cases)
     manifest = {
         "host": platform.platform(), "seed": args.seed, "repetitions": args.repetitions,
@@ -93,16 +93,16 @@ def main():
         "binaries": {label: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                      for label, path in binaries.items()},
         "workloads": workloads, "order": cases,
-        "timing": "evaluation wall time includes file input, planning, execution and materialization; excludes result formatting; warm primes the resident cache once; cold uses a fresh engine each repetition; OS page cache is not cleared",
+        "timing": "evaluation wall time includes file input, planning, execution and materialization; excludes result formatting; every repetition uses a fresh engine; OS page cache is not cleared",
     }
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     summary = []
     with (root / "runs.jsonl").open("w") as raw:
-        for label, name, workers, mode in cases:
+        for label, name, workers in cases:
             directory = root / name
-            tag = f"{label}-{name}-w{workers}-{mode}"
+            tag = f"{label}-{name}-w{workers}"
             command = [str(binaries[label]), str(directory / "program.dl"), str(directory),
-                       str(workers), mode, str(args.repetitions)]
+                       str(workers), str(args.repetitions)]
             with (root / f"{tag}.stderr").open("w") as errors:
                 output = subprocess.run(command, text=True, stdout=subprocess.PIPE,
                                         stderr=errors, timeout=300, check=True)
@@ -110,12 +110,10 @@ def main():
             assert len(records) == args.repetitions, tag
             for record in records:
                 assert record["outputs"] == workloads[name]["expected"], (tag, record["outputs"])
-                if mode == "warm":
-                    assert record["stats"]["rules_evaluated"] == 0, tag
                 record.update(engine=label, workload=name)
                 raw.write(json.dumps(record) + "\n")
             raw.flush()
-            row = {"engine": label, "workload": name, "workers": workers, "mode": mode,
+            row = {"engine": label, "workload": name, "workers": workers,
                    "wall_seconds": statistics.median(r["wall_micros"] for r in records) / 1e6,
                    "execution_seconds": statistics.median(r["stats"]["execution_micros"] for r in records) / 1e6,
                    "matching_runs": len(records)}

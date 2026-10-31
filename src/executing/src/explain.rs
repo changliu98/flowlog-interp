@@ -14,7 +14,7 @@
 //! one program costs one index per distinct access pattern.
 
 use crate::accounting::Budget;
-use crate::cache::RelationState;
+use crate::state::RelationState;
 use crate::map::RowProgramRunner;
 use crate::native_calls::NativeCallModule;
 use catalog::rule::Catalog;

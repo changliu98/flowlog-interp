@@ -6,9 +6,9 @@
 //! input. The engine's own interface takes rows in memory; this module is an
 //! adapter over it, and nothing in the engine depends on it.
 
-use crate::cache::{CacheRunStats, RelationState};
-use crate::rows::Rows;
 use crate::explain::Witness;
+use crate::rows::Rows;
+use crate::state::{RelationState, RunStats};
 use crate::symbols::SymbolTable;
 use parsing::decl::DataType;
 use parsing::diagnostic::{Diagnostic, Result};
@@ -250,12 +250,12 @@ fn write_relation(
 }
 
 /// The run's counters, as JSON beside the outputs.
-pub fn write_stats(directory: &Path, stats: &CacheRunStats) -> Result<()> {
+pub fn write_stats(directory: &Path, stats: &RunStats) -> Result<()> {
     let csvs = directory.join("csvs");
     fs::create_dir_all(&csvs).map_err(|error| {
         Diagnostic::input(format!("cannot create output directory {}: {error}", csvs.display()))
     })?;
-    let path = csvs.join("cache-stats.json");
+    let path = csvs.join("stats.json");
     let bytes = serde_json::to_vec(stats)
         .map_err(|error| Diagnostic::internal(format!("cannot serialize the run's counters: {error}")))?;
     fs::write(&path, bytes)

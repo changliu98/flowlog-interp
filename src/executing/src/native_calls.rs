@@ -134,7 +134,6 @@ struct LoadedBlock {
     last_panic: LastPanic,
     first_line: usize,
     path: PathBuf,
-    digest: String,
 }
 
 /// Compilation needs files even when caching is disabled. This directory is
@@ -253,12 +252,6 @@ impl NativeCallModule {
 
     pub fn function(&self, name: &str) -> Option<&LoadedFunction> {
         self.functions.get(name)
-    }
-
-    /// The digests of the loaded blocks, in program order: what a cache key
-    /// should name when a unit calls into a block.
-    pub fn digests(&self) -> Vec<&str> {
-        self.blocks.iter().map(|block| block.digest.as_str()).collect()
     }
 
     pub fn paths(&self) -> Vec<&Path> {
@@ -432,7 +425,6 @@ fn load_block(
             last_panic,
             first_line: block.first_line(),
             path: library_path,
-            digest,
         },
         calls,
     ))

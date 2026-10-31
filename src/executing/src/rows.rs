@@ -2,11 +2,9 @@
 //!
 //! Every row of a relation has the relation's arity, so the rows are kept
 //! row-major in one buffer instead of one allocation per row: row `i` is
-//! `cells[i * arity .. (i + 1) * arity]`. Reading a state back from the disk
-//! tier is then one copy, digesting it one pass over contiguous bytes, and
-//! the memory a state holds is its cells. A relation of arity 0 has no cells
-//! and at most one row, the empty one, so the number of rows is kept apart
-//! from the cells.
+//! `cells[i * arity .. (i + 1) * arity]`, and the memory a state holds is its
+//! cells. A relation of arity 0 has no cells and at most one row, the empty
+//! one, so the number of rows is kept apart from the cells.
 
 use parsing::Val;
 use std::fmt;

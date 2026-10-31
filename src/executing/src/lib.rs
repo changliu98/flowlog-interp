@@ -8,8 +8,6 @@
 pub mod accounting;
 pub mod aggregation;
 pub mod arg;
-pub mod cache;
-pub mod canonical;
 pub mod capi;
 pub mod collector;
 pub mod compare;
@@ -25,7 +23,7 @@ pub mod native_calls;
 pub mod profile;
 pub mod rows;
 pub mod runner;
-pub mod store;
+pub mod state;
 pub mod symbols;
 pub mod transformer;
 pub mod worker;
@@ -33,8 +31,9 @@ pub mod worker;
 pub use accounting::{CancelToken, Limits};
 pub use engine::{
     Engine, EngineConfig, EvaluationOptions, EvaluationRequest, EvaluationResult, Inputs,
-    ProgramReport, ProgramSource, Schedule,
+    ProgramReport, ProgramSource,
 };
+pub use state::{RelationState, RunStats};
 pub use explain::Witness;
 pub use parsing::diagnostic::{Diagnostic, DiagnosticKind, Location};
 

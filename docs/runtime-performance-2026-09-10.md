@@ -1,5 +1,9 @@
 # Runtime performance review, 2026-09-10
 
+> Historical record. The state cache, its per-stratum schedule and the
+> cold/warm modes measured here were removed on 2026-10-31; every
+> evaluation is now one whole-program dataflow.
+
 The interpreter now uses Differential Dataflow 0.25.1 and Timely 0.31.0,
 reads relation files in parallel byte ranges using the configured worker count,
 and captures rows in worker-local buffers before publishing each complete batch.

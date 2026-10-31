@@ -1,5 +1,9 @@
 # FlowLog and Ink performance at 32 workers
 
+> Historical record. The state cache, its per-stratum schedule and the
+> cold/warm modes measured here were removed on 2026-10-31; every
+> evaluation is now one whole-program dataflow.
+
 The four FlowLog Bench cases improve by **3.22x** geometric mean. A separate
 four-function Ink decompiler sample saves **2.85% end to end**; warm resident
 cache performance is effectively unchanged. These are different workloads

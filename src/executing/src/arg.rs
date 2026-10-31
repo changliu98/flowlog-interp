@@ -52,12 +52,6 @@ pub struct Args {
     #[arg(long)]
     daemon_socket: Option<PathBuf>,
 
-    /// the state cache: evaluations read and write their states in this
-    /// directory, shared by every process that points at it; without it
-    /// nothing is cached
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
-
     /// only check the program: parse, validate, stratify and plan it
     #[arg(long, default_value_t = false)]
     check: bool,
@@ -74,7 +68,7 @@ pub struct Args {
     #[arg(long)]
     memory_limit_mib: Option<u64>,
 
-    /// rows the evaluation may materialize at its unit boundaries
+    /// rows the evaluation may materialize in its settled heads
     #[arg(long)]
     tuple_limit: Option<u64>,
 
@@ -129,7 +123,6 @@ impl Args {
             fat_mode: self.fat_mode,
             sharing: !self.no_sharing,
             opt_level: self.opt_level,
-            cache_dir: self.cache_dir.clone(),
             call_cache: self.call_cache.clone(),
             max_concurrent: self.max_concurrent,
             delimiter: self.delimiter_byte()?,
@@ -154,9 +147,6 @@ impl Args {
                 memory_bytes: self.memory_limit_mib.map(|mib| mib.saturating_mul(1024 * 1024)),
                 tuples: self.tuple_limit,
             },
-            // The engine caches exactly when it has a cache directory.
-            cache: None,
-            schedule: None,
             explain: Vec::new(),
             explain_all: self.explain,
         }

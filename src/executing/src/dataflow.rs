@@ -1,12 +1,9 @@
 //! Assembling group plans into a differential dataflow.
 //!
 //! `assemble_group` turns one group's transformations into operators over a
-//! scope. `Assembly` is what one evaluation asks a worker set to run: some
-//! computations, each a list of groups over injected input states with the
-//! relations to capture at its boundary. All the computations of an assembly
-//! share one dataflow and one set of input collections, but each has its own
-//! relation maps, so two computations contributing to one head cannot see
-//! each other's rows.
+//! scope. `Assembly` is what one evaluation asks a worker set to run: the
+//! program's groups over its input states, with the heads to capture where
+//! the dataflow ends.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -21,7 +18,7 @@ use planning::strata::GroupStrataQueryPlan;
 use planning::transformations::Transformation;
 use planning::collections::CollectionSignature;
 use crate::accounting::Budget;
-use crate::cache::RelationState;
+use crate::state::RelationState;
 use crate::collector::non_recursive_collector;
 use crate::collector::recursive_collector;
 use crate::collector::inspector;
@@ -545,17 +542,11 @@ pub(crate) fn assemble_group<'scope>(
     Ok(())
 }
 
-/// A missing whole unit or individual rule contribution. Its input map is the
-/// complete boundary: a contribution does not inherit its head's earlier rows.
-pub struct Computation {
+/// Everything one dataflow of an evaluation is built from.
+pub struct Assembly {
     pub groups: Vec<GroupStrataQueryPlan>,
     pub inputs: BTreeMap<String, Arc<RelationState>>,
     pub captures: BTreeMap<String, MaterializedUpdates>,
-}
-
-/// Everything one dataflow of an evaluation is built from.
-pub struct Assembly {
-    pub computations: Vec<Computation>,
     pub fat_mode: bool,
     pub idb_map: Arc<HashMap<String, AggregationHeadIDB>>,
     pub native_calls: Option<Arc<NativeCallModule>>,
@@ -571,32 +562,13 @@ pub struct BuiltDataflow {
 }
 
 impl Assembly {
-    /// The union of every computation's inputs. Two computations naming one
-    /// relation name one state: the stratum boundary is one boundary.
-    fn shared_inputs(&self) -> BTreeMap<String, Arc<RelationState>> {
-        let mut inputs = BTreeMap::new();
-        for computation in &self.computations {
-            for (name, state) in &computation.inputs {
-                if let Some(previous) = inputs.insert(name.clone(), Arc::clone(state)) {
-                    let previous: Arc<RelationState> = previous;
-                    assert_eq!(
-                        previous.digest, state.digest,
-                        "inconsistent stratum input {name}"
-                    );
-                }
-            }
-        }
-        inputs
-    }
-
-    /// Build every computation into one dataflow on `worker`, feed the
-    /// worker's share of the input rows, and hand back the probe that says
-    /// when the dataflow is complete. Every worker of a set calls this with
-    /// the same assembly, in the same order, which is what timely requires.
+    /// Build the program into one dataflow on `worker`, feed the worker's
+    /// share of the input rows, and hand back the probe that says when the
+    /// dataflow is complete. Every worker of a set calls this with the same
+    /// assembly, which is what timely requires.
     pub fn build(&self, worker: &mut Worker) -> Result<BuiltDataflow> {
         let peers = worker.peers();
         let index = worker.index();
-        let inputs = self.shared_inputs();
         let context_native = self.native_calls.clone();
 
         let mut failure: Option<parsing::diagnostic::Diagnostic> = None;
@@ -604,62 +576,48 @@ impl Assembly {
             let probe = ProbeHandle::new();
             let mut captures = Vec::new();
             let mut sessions = Vec::new();
-            let mut input_map: RowMap<'_, _> = HashMap::new();
+            let mut row_map: RowMap<'_, _> = HashMap::new();
 
-            for (name, state) in inputs.iter() {
+            for (name, state) in self.inputs.iter() {
                 let (session, input_rel) =
                     construct_session_and_table(scope, state.arity, self.fat_mode);
-                input_map.insert(
+                row_map.insert(
                     Arc::new(CollectionSignature::new_atom(name)),
                     Arc::new(input_rel),
                 );
                 sessions.push((session, Arc::clone(&state.rows)));
             }
 
-            for computation in self.computations.iter() {
-                let consumers = count_consumers(&computation.groups);
-                let context = AssemblyContext {
-                    fat_mode: self.fat_mode,
-                    native_calls: &context_native,
-                    idb_map: &self.idb_map,
-                    budget: &self.budget,
-                    program_name: &self.program_name,
-                    profile: &self.profile,
-                    consumers: &consumers,
-                };
-                let mut row_map: RowMap<'_, _> = computation
-                    .inputs
-                    .keys()
-                    .map(|name| {
-                        let signature = Arc::new(CollectionSignature::new_atom(name));
-                        let relation = Arc::clone(&input_map[&signature]);
-                        (signature, relation)
-                    })
-                    .collect();
-                let mut kv_map: KvMap<'_, _> = HashMap::new();
-                let mut k_map: KMap<'_, _> = HashMap::new();
-                for group_plan in &computation.groups {
-                    if failure.is_some() {
-                        break;
-                    }
-                    if let Err(diagnostic) = assemble_group(
-                        scope,
-                        group_plan,
-                        &mut row_map,
-                        &mut kv_map,
-                        &mut k_map,
-                        &context,
-                    ) {
-                        failure = Some(diagnostic);
-                    }
-                }
-                if failure.is_some() {
+            let consumers = count_consumers(&self.groups);
+            let context = AssemblyContext {
+                fat_mode: self.fat_mode,
+                native_calls: &context_native,
+                idb_map: &self.idb_map,
+                budget: &self.budget,
+                program_name: &self.program_name,
+                profile: &self.profile,
+                consumers: &consumers,
+            };
+            let mut kv_map: KvMap<'_, _> = HashMap::new();
+            let mut k_map: KMap<'_, _> = HashMap::new();
+            for group_plan in &self.groups {
+                if let Err(diagnostic) = assemble_group(
+                    scope,
+                    group_plan,
+                    &mut row_map,
+                    &mut kv_map,
+                    &mut k_map,
+                    &context,
+                ) {
+                    failure = Some(diagnostic);
                     break;
                 }
-                for (name, updates) in &computation.captures {
+            }
+            if failure.is_none() {
+                for (name, updates) in &self.captures {
                     let signature = Arc::new(CollectionSignature::new_atom(name));
                     let relation = row_map.get(&signature).unwrap_or_else(|| {
-                        panic!("state boundary relation {name} is absent after its unit")
+                        panic!("head {name} is absent after its rules were assembled")
                     });
                     captures.push(capture_generic(relation, Arc::clone(updates), &probe));
                 }

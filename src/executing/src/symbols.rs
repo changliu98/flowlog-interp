@@ -4,9 +4,8 @@
 //! other: a `Val` that identifies the text. The identity is content-derived -
 //! `symbol_id` is the first eight bytes of the SHA-256 of the UTF-8 bytes,
 //! read big-endian, with the sign bit cleared - so it is the same in every
-//! process that ever interns the text, a cached relation state carries
-//! symbols that any later process can name, and a host embedding the engine
-//! can compute an id without a round trip. The table exists to go the other
+//! process that ever interns the text, and a host embedding the engine can
+//! compute an id without a round trip. The table exists to go the other
 //! way, id to text, and to refuse the one thing content-derived ids can get
 //! wrong: two texts under one id, which is reported at interning rather than
 //! silently merged.
@@ -109,42 +108,6 @@ impl SymbolTable {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    /// The texts of the given ids, for carrying beside rows that leave the
-    /// process. Unknown ids are skipped: a caller that asks for them is
-    /// naming cells that never were symbols here.
-    pub fn texts_of<I>(&self, ids: I) -> Vec<(Val, String)>
-    where
-        I: IntoIterator<Item = Val>,
-    {
-        let inner = self.inner.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut texts = Vec::new();
-        for id in ids {
-            if let Some(text) = inner.texts.get(&id) {
-                texts.push((id, text.to_string()));
-            }
-        }
-        texts
-    }
-
-    /// Learn texts that arrived beside rows from elsewhere: a cached state or
-    /// a peer. Each pair is checked against `symbol_id`, so a damaged pair
-    /// is refused rather than believed.
-    pub fn absorb<I>(&self, pairs: I) -> Result<()>
-    where
-        I: IntoIterator<Item = (Val, String)>,
-    {
-        for (id, text) in pairs {
-            if symbol_id(&text) != id {
-                return Err(Diagnostic::internal(format!(
-                    "symbol {id} does not name the text {text:?}: symbol_id({text:?}) is {}",
-                    symbol_id(&text)
-                )));
-            }
-            self.intern(&text)?;
-        }
-        Ok(())
-    }
 }
 
 fn collision(text: &str, known: &str, id: Val) -> Diagnostic {
@@ -175,13 +138,5 @@ mod tests {
         let (pointer, length) = table.resolve_raw(id).unwrap();
         let bytes = unsafe { std::slice::from_raw_parts(pointer, length) };
         assert_eq!(bytes, b"hello");
-    }
-
-    #[test]
-    fn absorbing_checks_the_id_against_the_text() {
-        let table = SymbolTable::new();
-        assert!(table.absorb(vec![(symbol_id("x"), "x".to_string())]).is_ok());
-        assert!(table.absorb(vec![(symbol_id("x"), "y".to_string())]).is_err());
-        assert_eq!(table.len(), 1);
     }
 }

@@ -1,12 +1,14 @@
 //! The service: one engine on a Unix-domain socket, for hosts that are not
 //! in this process.
 //!
-//! Protocol version 2. One request per line, one JSON object; one response
+//! Protocol version 3. One request per line, one JSON object; one response
 //! per line, one JSON object. Every response carries `version`, `ok`, the
-//! `command` it answers, the request's `id` when one was given, the engine's
-//! `cache` occupancy, and on failure a structured `diagnostic` beside its
-//! rendering in `error`. Evaluations run concurrently, each on its own
-//! thread, under the engine's admission limit; `cancel` stops one by id.
+//! `command` it answers, the request's `id` when one was given, and on
+//! failure a structured `diagnostic` beside its rendering in `error`.
+//! Evaluations run concurrently, each on its own thread, under the engine's
+//! admission limit; `cancel` stops one by id. Every evaluation is computed
+//! afresh: the service keeps the engine's symbols between requests, and
+//! nothing an evaluation derived.
 //!
 //! Commands:
 //!
@@ -14,7 +16,7 @@
 //!   (`{"facts": dir}` or `{"rows": {relation: [[cell, ...], ...]}}`, where a
 //!   symbol cell is its text), `output` (`{"csvs": dir}` and/or
 //!   `{"inline": true}`), `options` (`budget_seconds`, `memory_limit_bytes`,
-//!   `tuple_limit`, `cache`, `schedule`, `explain`, `explain_all`).
+//!   `tuple_limit`, `explain`, `explain_all`).
 //! - `check`: `program` as above; answers with the program report.
 //! - `reload`: the version 1 form, `program`, `facts` and `csvs` paths
 //!   defaulting to the ones the service was started with.
@@ -22,10 +24,10 @@
 //! - `stats`, `shutdown`.
 
 use crate::accounting::{CancelToken, Limits};
-use crate::cache::{CacheRunStats, CacheStateStats};
 use crate::engine::{
-    Engine, EvaluationOptions, EvaluationRequest, Inputs, ProgramReport, ProgramSource, Schedule,
+    Engine, EvaluationOptions, EvaluationRequest, Inputs, ProgramReport, ProgramSource,
 };
+use crate::state::RunStats;
 use crate::explain::Witness;
 use crate::files;
 use parsing::decl::DataType;
@@ -43,7 +45,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tracing::{info, warn};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ProgramSpec {
@@ -86,10 +88,6 @@ pub struct OptionsSpec {
     pub memory_limit_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tuple_limit: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schedule: Option<Schedule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub explain: Vec<ExplainSpec>,
     #[serde(default)]
@@ -148,8 +146,7 @@ pub struct DaemonResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub run: Option<CacheRunStats>,
-    pub cache: CacheStateStats,
+    pub run: Option<RunStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report: Option<ProgramReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,14 +164,13 @@ pub struct DaemonResponse {
 }
 
 impl DaemonResponse {
-    fn new(engine: &Engine, command: &str, id: Option<String>) -> Self {
+    fn new(command: &str, id: Option<String>) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             ok: true,
             command: command.to_string(),
             id,
             run: None,
-            cache: engine.cache_stats(),
             report: None,
             outputs: None,
             types: None,
@@ -209,7 +205,7 @@ pub struct Service {
     engine: Arc<Engine>,
     defaults: ServiceDefaults,
     in_flight: Mutex<HashMap<String, InFlight>>,
-    last_run: Mutex<Option<CacheRunStats>>,
+    last_run: Mutex<Option<RunStats>>,
 }
 
 /// Serve `engine` on `socket_path` until `shutdown`.
@@ -234,15 +230,8 @@ pub fn serve(engine: Arc<Engine>, defaults: ServiceDefaults, socket_path: PathBu
     });
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
     info!(
-        "FlowLog service listening on {} (protocol {PROTOCOL_VERSION}, {})",
-        socket_path.display(),
-        service
-            .engine
-            .config()
-            .cache_dir
-            .as_ref()
-            .map(|directory| format!("state cache {}", directory.display()))
-            .unwrap_or_else(|| "no state cache".to_string())
+        "FlowLog service listening on {} (protocol {PROTOCOL_VERSION})",
+        socket_path.display()
     );
 
     for connection in listener.incoming() {
@@ -258,7 +247,7 @@ pub fn serve(engine: Arc<Engine>, defaults: ServiceDefaults, socket_path: PathBu
         let request = read_request(&stream);
         match request {
             Ok(DaemonRequest::Shutdown) => {
-                let mut response = DaemonResponse::new(&service.engine, "shutdown", None);
+                let mut response = DaemonResponse::new("shutdown", None);
                 response.run = service.last_run.lock().unwrap_or_else(|p| p.into_inner()).clone();
                 if let Err(error) = write_response(&mut stream, &response) {
                     warn!("service could not write a response: {error}");
@@ -266,7 +255,7 @@ pub fn serve(engine: Arc<Engine>, defaults: ServiceDefaults, socket_path: PathBu
                 break;
             }
             Ok(DaemonRequest::Stats) => {
-                let mut response = DaemonResponse::new(&service.engine, "stats", None);
+                let mut response = DaemonResponse::new("stats", None);
                 response.run = service.last_run.lock().unwrap_or_else(|p| p.into_inner()).clone();
                 response.running = Some(service.engine.running());
                 if let Err(error) = write_response(&mut stream, &response) {
@@ -281,7 +270,7 @@ pub fn serve(engine: Arc<Engine>, defaults: ServiceDefaults, socket_path: PathBu
                     .get(&id)
                     .map(|flight| flight.cancel.cancel())
                     .is_some();
-                let response = DaemonResponse::new(&service.engine, "cancel", Some(id.clone()));
+                let response = DaemonResponse::new("cancel", Some(id.clone()));
                 let response = if cancelled {
                     response
                 } else {
@@ -297,16 +286,16 @@ pub fn serve(engine: Arc<Engine>, defaults: ServiceDefaults, socket_path: PathBu
                 let response = match resolve_program(&program, &service.defaults) {
                     Ok((text, name)) => match service.engine.check(&text, &name) {
                         Ok(report) => {
-                            let mut response = DaemonResponse::new(&service.engine, "check", None);
+                            let mut response = DaemonResponse::new("check", None);
                             response.report = Some(report);
                             response
                         }
                         Err(diagnostic) => {
-                            DaemonResponse::new(&service.engine, "check", None).failed(diagnostic)
+                            DaemonResponse::new("check", None).failed(diagnostic)
                         }
                     },
                     Err(diagnostic) => {
-                        DaemonResponse::new(&service.engine, "check", None).failed(diagnostic)
+                        DaemonResponse::new("check", None).failed(diagnostic)
                     }
                 };
                 if let Err(error) = write_response(&mut stream, &response) {
@@ -323,7 +312,7 @@ pub fn serve(engine: Arc<Engine>, defaults: ServiceDefaults, socket_path: PathBu
                 }));
             }
             Err(error) => {
-                let response = DaemonResponse::new(&service.engine, "invalid", None)
+                let response = DaemonResponse::new("invalid", None)
                     .failed(Diagnostic::validation(error.to_string()));
                 if let Err(error) = write_response(&mut stream, &response) {
                     warn!("service could not write a response: {error}");
@@ -382,7 +371,7 @@ impl Service {
             } => ("evaluate", id, program, inputs, output, options),
             _ => unreachable!("only evaluations reach Service::evaluate"),
         };
-        let mut response = DaemonResponse::new(&self.engine, command, id.clone());
+        let mut response = DaemonResponse::new(command, id.clone());
         let cancel = CancelToken::new();
         if let Some(id) = &id {
             self.in_flight
@@ -401,7 +390,6 @@ impl Service {
             Ok((run, outputs, types, witnesses)) => {
                 *self.last_run.lock().unwrap_or_else(|p| p.into_inner()) = Some(run.clone());
                 response.run = Some(run);
-                response.cache = self.engine.cache_stats();
                 if output.inline {
                     response.outputs = Some(outputs);
                     response.types = Some(types);
@@ -411,10 +399,7 @@ impl Service {
                 }
                 response
             }
-            Err(diagnostic) => {
-                response.cache = self.engine.cache_stats();
-                response.failed(diagnostic)
-            }
+            Err(diagnostic) => response.failed(diagnostic),
         }
     }
 
@@ -426,7 +411,7 @@ impl Service {
         options: OptionsSpec,
         cancel: CancelToken,
     ) -> Result<(
-        CacheRunStats,
+        RunStats,
         BTreeMap<String, serde_json::Value>,
         BTreeMap<String, Vec<DataType>>,
         Vec<Witness>,
@@ -463,8 +448,6 @@ impl Service {
                     memory_bytes: options.memory_limit_bytes,
                     tuples: options.tuple_limit,
                 },
-                cache: options.cache,
-                schedule: options.schedule,
                 explain,
                 explain_all: options.explain_all,
             },

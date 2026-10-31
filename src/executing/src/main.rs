@@ -21,7 +21,9 @@ fn main() {
 
     /* CL args parsing */
     let args = Args::parse();
-    debugging::debugger::display_info("Arguments", false, format!("{:#?}", args));
+    if debugging::debugger::display_enabled() {
+        debugging::debugger::display_info("Arguments", false, format!("{:#?}", args));
+    }
 
     if let Err(diagnostic) = run(&args) {
         report(&diagnostic);
@@ -55,11 +57,14 @@ fn run(args: &Args) -> Result<()> {
         return Ok(());
     }
 
-    let request = args.request()?;
+    // Parse and validate once: the evaluation takes the parsed program, and
+    // the outputs are written by it.
+    let mut request = args.request()?;
     let program = match &request.program {
         ProgramSource::Text { name, source } => Program::parse(source, name)?,
         ProgramSource::Parsed(program) => program.clone(),
     };
+    request.program = ProgramSource::Parsed(program.clone());
     let delimiter = engine.config().delimiter;
     let result = engine.evaluate(request)?;
 

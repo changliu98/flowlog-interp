@@ -141,18 +141,30 @@ impl Program {
     /// Parse and validate a program text. `name` is the source name reported
     /// in locations.
     pub fn parse(source: &str, name: &str) -> Result<Self> {
-        let (datalog, embedded_rust) = EmbeddedRust::extract(source, name).map_err(|error| {
-            // A parse diagnostic of the block extraction names the program.
-            let mut error = error;
+        // A parse diagnostic of the block extraction names the program.
+        let named = |mut error: Diagnostic| {
             if let Some(location) = error.location.as_mut() {
                 if location.source.is_empty() {
                     location.source = name.to_string();
                 }
             }
             error
-        })?;
+        };
+        let (datalog, blocks) = EmbeddedRust::split(source, name).map_err(named)?;
 
-        let parsed_rule = FlowLogParser::parse(Rule::main_grammar, &datalog)
+        // The blocks' Rust and the Datalog are parsed at once, on two threads;
+        // a block that does not parse is reported first, as it always was.
+        let (embedded_rust, parsed) = std::thread::scope(|scope| {
+            let embedded = (!blocks.is_empty())
+                .then(|| scope.spawn(move || EmbeddedRust::from_blocks(blocks)));
+            let parsed = FlowLogParser::parse(Rule::main_grammar, &datalog);
+            let embedded = embedded
+                .map(|handle| handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+                .transpose();
+            (embedded, parsed)
+        });
+        let embedded_rust = embedded_rust.map_err(named)?;
+        let parsed_rule = parsed
             .map_err(|error| {
                 let (line, column) = match error.line_col {
                     pest::error::LineColLocation::Pos((line, column)) => (line, column),

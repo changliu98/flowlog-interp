@@ -1,5 +1,5 @@
 use planning::constraints::BaseConstraints;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use arrayvec::ArrayVec;
 use parsing::arithmetic::ArithmeticOperator;
 use parsing::compare::ComparisonOperator;
@@ -121,10 +121,56 @@ pub fn row_kv<const M: usize, const K: usize, const V: usize>(flow: &Transformat
 /* the row program */
 /* ------------------------------------------------------------------------ */
 
+/// The program's embedded functions as they become available.
+///
+/// rustc builds the blocks while the dataflow is assembled and starts to run,
+/// so the module is published here when it is ready - or the diagnostic of a
+/// block that does not compile - and a row program that calls a function
+/// waits for it at its first call. Everything that calls no function runs in
+/// the meantime. The first module is a quick build; an optimized build of the
+/// same blocks may replace it while the evaluation runs, and the calls after
+/// that go to it. Both stay loaded until the evaluation ends.
+pub struct NativeFunctions {
+    module: OnceLock<std::result::Result<Arc<NativeCallModule>, Diagnostic>>,
+    optimized: OnceLock<Arc<NativeCallModule>>,
+}
+
+impl NativeFunctions {
+    /// Functions whose blocks are still being built.
+    pub fn pending() -> Arc<Self> {
+        Arc::new(Self { module: OnceLock::new(), optimized: OnceLock::new() })
+    }
+
+    /// The outcome of building the blocks; only the first is kept.
+    pub fn publish(&self, outcome: Result<Arc<NativeCallModule>>) {
+        let _ = self.module.set(outcome);
+    }
+
+    /// The module, or why there is none, once the blocks are built.
+    pub fn wait(&self) -> &std::result::Result<Arc<NativeCallModule>, Diagnostic> {
+        self.module.wait()
+    }
+
+    /// An optimized build of the same blocks, for the calls from now on.
+    pub fn publish_optimized(&self, module: Arc<NativeCallModule>) {
+        let _ = self.optimized.set(module);
+    }
+
+    /// The optimized build, once it replaced the first.
+    pub fn optimized(&self) -> Option<&Arc<NativeCallModule>> {
+        self.optimized.get()
+    }
+}
+
+/// The entry points of the functions one row program calls, in call-slot
+/// order, with the module that holds them.
+type ResolvedCalls = std::result::Result<(Arc<NativeCallModule>, Vec<LoadedFunction>), Diagnostic>;
+
 enum ResolvedStep {
     Call {
         name: String,
-        function: LoadedFunction,
+        /// Index of the function among the program's resolved calls.
+        slot: usize,
         arguments: Vec<ValueRef>,
         output: Option<usize>,
         lenient: bool,
@@ -141,13 +187,21 @@ enum ResolvedStep {
     },
 }
 
-/// One rule's row program, resolved once per dataflow: every function is a
-/// pointer, every value a column index, so a row costs no lookup.
+/// One rule's row program, resolved once per dataflow: every value is a
+/// column index, and every function a pointer from its first call on, so a
+/// row costs no lookup.
 pub struct RowProgramRunner {
     steps: Vec<ResolvedStep>,
     head: Vec<ValueRef>,
     results: usize,
-    module: Option<Arc<NativeCallModule>>,
+    native: Option<Arc<NativeFunctions>>,
+    /// The names of the called functions, by call slot.
+    called: Vec<String>,
+    /// Their entry points, resolved at the first call: the blocks may still
+    /// be compiling when the dataflow starts.
+    resolved: OnceLock<ResolvedCalls>,
+    /// The same, in the optimized build once there is one.
+    resolved_optimized: OnceLock<ResolvedCalls>,
     budget: Arc<Budget>,
     rule: String,
     location: Option<Location>,
@@ -156,11 +210,12 @@ pub struct RowProgramRunner {
 impl RowProgramRunner {
     pub fn new(
         program: &RowProgram,
-        module: Option<&Arc<NativeCallModule>>,
+        native: Option<&Arc<NativeFunctions>>,
         budget: &Arc<Budget>,
         program_name: &str,
     ) -> Result<Self> {
         let mut steps = Vec::with_capacity(program.steps().len());
+        let mut called: Vec<String> = Vec::new();
         for step in program.steps() {
             steps.push(match step {
                 Step::Call {
@@ -169,20 +224,18 @@ impl RowProgramRunner {
                     output,
                     lenient,
                 } => {
-                    let loaded = module
-                        .and_then(|module| module.function(function))
-                        .copied()
-                        .ok_or_else(|| {
-                            Diagnostic::internal(format!(
-                                "rule {} calls embedded function {function:?}, which was \
-                                 validated but not loaded",
-                                program.rule()
-                            ))
-                            .with_function(function.clone())
-                        })?;
+                    if native.is_none() {
+                        return Err(Diagnostic::internal(format!(
+                            "rule {} calls embedded function {function:?}, which was \
+                             validated but not loaded",
+                            program.rule()
+                        ))
+                        .with_function(function.clone()));
+                    }
+                    called.push(function.clone());
                     ResolvedStep::Call {
                         name: function.clone(),
-                        function: loaded,
+                        slot: called.len() - 1,
                         arguments: arguments.clone(),
                         output: *output,
                         lenient: *lenient,
@@ -208,7 +261,10 @@ impl RowProgramRunner {
             steps,
             head: program.head().to_vec(),
             results: program.results(),
-            module: module.cloned(),
+            native: native.cloned(),
+            called,
+            resolved: OnceLock::new(),
+            resolved_optimized: OnceLock::new(),
             budget: Arc::clone(budget),
             rule: program.rule().to_string(),
             location: (program.line() > 0)
@@ -223,6 +279,37 @@ impl RowProgramRunner {
             ValueRef::Result(index) => results[index],
             ValueRef::Constant(value) => value,
         }
+    }
+
+    /// The called functions' entry points in the newest build, waiting for
+    /// the blocks to be built on the first call.
+    fn calls(&self) -> &ResolvedCalls {
+        let native = self.native.as_ref().expect("a program with calls holds the functions");
+        if let Some(optimized) = native.optimized() {
+            return self.resolved_optimized.get_or_init(|| self.resolve(optimized));
+        }
+        self.resolved.get_or_init(|| match native.wait() {
+            Ok(module) => self.resolve(module),
+            Err(diagnostic) => Err(diagnostic.clone()),
+        })
+    }
+
+    fn resolve(&self, module: &Arc<NativeCallModule>) -> ResolvedCalls {
+        let functions = self
+            .called
+            .iter()
+            .map(|name| {
+                module.function(name).copied().ok_or_else(|| {
+                    Diagnostic::internal(format!(
+                        "rule {} calls embedded function {name:?}, which was validated \
+                         but not loaded",
+                        self.rule
+                    ))
+                    .with_function(name.clone())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((Arc::clone(module), functions))
     }
 
     fn fault(&self, diagnostic: Diagnostic) {
@@ -262,17 +349,25 @@ impl RowProgramRunner {
             match step {
                 ResolvedStep::Call {
                     name,
-                    function,
+                    slot,
                     arguments,
                     output,
                     lenient,
                 } => {
+                    let (module, functions) = match self.calls() {
+                        Ok((module, functions)) => (module, functions),
+                        Err(diagnostic) => {
+                            // The blocks did not build: the evaluation ends
+                            // with that diagnostic, which the runner reports.
+                            self.budget.fault(diagnostic.clone());
+                            return None;
+                        }
+                    };
                     let cells = arguments
                         .iter()
                         .map(|argument| self.value(input, results_slice, *argument))
                         .collect::<ArrayVec<Val, 16>>();
-                    let module = self.module.as_ref().expect("a call resolved a module");
-                    let value = match module.call(name, function, &cells) {
+                    let value = match module.call(name, &functions[*slot], &cells) {
                         Ok(value) => value,
                         // The row may never have reached this filter where
                         // the rule wrote it; it runs again there.

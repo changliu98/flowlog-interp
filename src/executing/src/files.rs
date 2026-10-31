@@ -222,8 +222,12 @@ fn write_relation(
     let write_error = |error: std::io::Error| {
         Diagnostic::input(format!("cannot write {}: {error}", path.display()))
     };
+    // A buffer the size of what the relation is likely to need, up to 1 MiB:
+    // most relations of a large program are empty or small, and a megabyte
+    // for each of thousands of files is memory the writer never touches.
+    let expected = state.rows.len().saturating_mul(state.arity.max(1) * 12 + 1);
     let mut out = BufWriter::with_capacity(
-        1 << 20,
+        expected.clamp(1 << 10, 1 << 20),
         File::create(path).map_err(|error| {
             Diagnostic::input(format!("cannot create {}: {error}", path.display()))
         })?,

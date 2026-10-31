@@ -53,10 +53,13 @@ impl RelationState {
 ///
 /// - `strata`, `rules`: strata of the program; source rules evaluated (before
 ///   any sideways expansion).
-/// - `planning_micros`: parsing through planning, compiling embedded blocks,
-///   starting the workers; `execution_micros`: the dataflow, to its last
-///   update; `settle_micros`: merging the captured heads into states;
-///   `total_micros`: the whole run.
+/// - `planning_micros`: stratifying, planning, reading the inputs and
+///   starting the workers; `compile_micros`: building the embedded blocks,
+///   which overlaps everything after planning; `execution_micros`: the
+///   dataflow, to its last update (including any wait for the blocks), of
+///   which `build_micros` assembling and feeding it on the slowest worker;
+///   `settle_micros`: merging the captured heads into states; `total_micros`:
+///   the whole run.
 /// - `peak_memory_bytes`: bytes the evaluation's threads held at most, as the
 ///   allocator saw them; `materialized_rows`: rows of the settled heads.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -64,7 +67,9 @@ pub struct RunStats {
     pub strata: usize,
     pub rules: usize,
     pub planning_micros: u64,
+    pub compile_micros: u64,
     pub execution_micros: u64,
+    pub build_micros: u64,
     pub settle_micros: u64,
     pub total_micros: u64,
     pub peak_memory_bytes: i64,

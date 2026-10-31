@@ -2,6 +2,12 @@ use std::fmt;
 use tracing::debug;
 
 
+/// Whether `display_info` prints anything: a caller asks before building
+/// content that is costly to render, such as a whole program's plans.
+pub fn display_enabled() -> bool {
+    tracing::enabled!(tracing::Level::DEBUG)
+}
+
 pub fn display_info<T: fmt::Display>(info_title: &str, sub_title: bool, content: T) {
     let info_title_len = info_title.len();
 

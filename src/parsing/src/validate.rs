@@ -40,8 +40,13 @@ pub fn validate_program(program: &Program) -> Result<HashMap<String, Vec<DataTyp
     check_head_agreement(program)?;
     let arities = relation_arities(program, &declared)?;
     let types = infer_types(program, &declared, &arities, &shapes)?;
+    // The complete typing, in the form `var_types` reads, once for every rule.
+    let complete: HashMap<String, Vec<Option<DataType>>> = types
+        .iter()
+        .map(|(name, columns)| (name.clone(), columns.iter().copied().map(Some).collect()))
+        .collect();
     for (rule, shape) in program.rules().iter().zip(shapes.iter()) {
-        check_types(program, rule, shape, &types)?;
+        check_types(program, rule, shape, &types, &complete)?;
     }
     Ok(types)
 }
@@ -449,7 +454,8 @@ fn var_types(
     shape: &Shape,
     types: &HashMap<String, Vec<Option<DataType>>>,
 ) -> Result<HashMap<String, DataType>> {
-    let mut vars: HashMap<String, (DataType, String)> = HashMap::new();
+    // The atom that typed each variable first, rendered only for a refusal.
+    let mut vars: HashMap<&String, (DataType, &Atom)> = HashMap::new();
     for atom in rule.positive_atoms().chain(rule.negated_atoms()) {
         let Some(columns) = types.get(atom.name()) else {
             continue;
@@ -463,7 +469,7 @@ fn var_types(
             };
             match vars.get(variable) {
                 None => {
-                    vars.insert(variable.clone(), (column_type, atom.to_string()));
+                    vars.insert(variable, (column_type, atom));
                 }
                 Some((known, first)) if *known != column_type => {
                     return Err(refuse(
@@ -482,7 +488,7 @@ fn var_types(
     }
     let mut result: HashMap<String, DataType> = vars
         .into_iter()
-        .map(|(variable, (column_type, _))| (variable, column_type))
+        .map(|(variable, (column_type, _))| (variable.clone(), column_type))
         .collect();
     for (output, value_type) in &shape.call_outputs {
         result.insert(output.clone(), *value_type);
@@ -622,12 +628,9 @@ fn check_types(
     rule: &FLRule,
     shape: &Shape,
     types: &HashMap<String, Vec<DataType>>,
+    complete: &HashMap<String, Vec<Option<DataType>>>,
 ) -> Result<()> {
-    let complete: HashMap<String, Vec<Option<DataType>>> = types
-        .iter()
-        .map(|(name, columns)| (name.clone(), columns.iter().copied().map(Some).collect()))
-        .collect();
-    let vars = var_types(program, rule, shape, &complete)?;
+    let vars = var_types(program, rule, shape, complete)?;
 
     for atom in rule.positive_atoms().chain(rule.negated_atoms()) {
         let columns = &types[atom.name()];

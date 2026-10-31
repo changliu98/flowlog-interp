@@ -15,7 +15,7 @@
 //! every block; see the executing crate's native call module for what it can
 //! do.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt;
 
 use syn::{FnArg, Item, ReturnType, Type, Visibility};
@@ -127,6 +127,9 @@ impl EmbeddedBlock {
 #[derive(Debug, Clone, Default)]
 pub struct EmbeddedRust {
     blocks: Vec<EmbeddedBlock>,
+    /// Each function's block and position in it, by name: validation and
+    /// planning look a function up at every call of every rule.
+    index: HashMap<String, (usize, usize)>,
 }
 
 impl EmbeddedRust {
@@ -139,11 +142,11 @@ impl EmbeddedRust {
     /// Blocks with the program lines they start on.
     pub fn from_blocks(sources: Vec<(String, usize)>) -> Result<Self> {
         let mut blocks = Vec::with_capacity(sources.len());
-        let mut names: HashSet<String> = HashSet::new();
+        let mut names: HashMap<String, (usize, usize)> = HashMap::new();
         for (index, (source, first_line)) in sources.into_iter().enumerate() {
             let functions = parse_block(&source, index, first_line)?;
-            for function in &functions {
-                if !names.insert(function.name.clone()) {
+            for (position, function) in functions.iter().enumerate() {
+                if names.insert(function.name.clone(), (index, position)).is_some() {
                     return Err(Diagnostic::validation(format!(
                         "embedded Rust exports {:?} twice; every public function needs a name \
                          of its own",
@@ -158,7 +161,7 @@ impl EmbeddedRust {
                 functions,
             });
         }
-        Ok(Self { blocks })
+        Ok(Self { blocks, index: names })
     }
 
     pub fn blocks(&self) -> &[EmbeddedBlock] {
@@ -178,10 +181,9 @@ impl EmbeddedRust {
     }
 
     pub fn function(&self, name: &str) -> Option<&RustFunction> {
-        self.blocks
-            .iter()
-            .flat_map(|block| block.functions.iter())
-            .find(|function| function.name == name)
+        self.index
+            .get(name)
+            .map(|&(block, position)| &self.blocks[block].functions[position])
     }
 
     /// The whole embedded source: every block's text, in program order.
@@ -214,6 +216,18 @@ impl EmbeddedRust {
     /// Newlines are retained so later parser errors keep their original
     /// source line numbers.
     pub fn extract(program: &str, source_name: &str) -> Result<(String, Option<Self>)> {
+        let (datalog, blocks) = Self::split(program, source_name)?;
+        let embedded = if blocks.is_empty() {
+            None
+        } else {
+            Some(Self::from_blocks(blocks)?)
+        };
+        Ok((datalog, embedded))
+    }
+
+    /// `extract` without parsing the blocks: the Datalog, and every block's
+    /// text with the program line it starts on, for `from_blocks`.
+    pub fn split(program: &str, source_name: &str) -> Result<(String, Vec<(String, usize)>)> {
         let mut datalog = String::with_capacity(program.len());
         let mut blocks: Vec<(String, usize)> = Vec::new();
         let mut current: Option<(String, usize)> = None;
@@ -259,13 +273,7 @@ impl EmbeddedRust {
             return Err(Diagnostic::parse(".code rust section is missing .endcode")
                 .with_location(Location::new(source_name, first_line - 1, 0)));
         }
-
-        let embedded = if blocks.is_empty() {
-            None
-        } else {
-            Some(Self::from_blocks(blocks)?)
-        };
-        Ok((datalog, embedded))
+        Ok((datalog, blocks))
     }
 }
 

@@ -8,8 +8,9 @@
 
 use crate::accounting::{Budget, MemoryCounter};
 use crate::dataflow::Assembly;
-use crate::engine::{budget_of, Engine, EngineConfig, EvaluationOptions};
-use crate::native_calls::NativeCallModule;
+use crate::engine::{budget_of, Engine, EngineConfig, EvaluationOptions, Inputs};
+use crate::map::NativeFunctions;
+use crate::native_calls::{self, BuildTier, NativeCallModule};
 use crate::rows::Rows;
 use crate::state::{RelationState, RunStats};
 use crate::worker::WorkerSet;
@@ -20,7 +21,8 @@ use planning::program::ProgramQueryPlan;
 use reading::inspect::{MaterializedUpdates, UpdateBatch};
 use reading::{KV_MAX, ROW_MAX};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use strata::stratification::Strata;
 use tracing::{info, warn};
@@ -31,13 +33,15 @@ pub struct RunOutcome {
     pub states: HashMap<String, Arc<RelationState>>,
     pub stats: RunStats,
     pub budget: Arc<Budget>,
-    pub native: Option<Arc<NativeCallModule>>,
+    pub native: Option<Arc<NativeFunctions>>,
 }
 
 /// Plan the whole program, for the fat-mode decision and for `check`.
 pub(crate) fn plan_check(strata: &Strata, config: &EngineConfig) -> Result<(ProgramQueryPlan, bool)> {
     let plan = ProgramQueryPlan::from_strata(strata, !config.sharing, config.opt_level);
-    debugging::debugger::display_info("Program Query Plans", true, format!("{}", plan));
+    if debugging::debugger::display_enabled() {
+        debugging::debugger::display_info("Program Query Plans", true, format!("{}", plan));
+    }
     let fat_mode = plan.should_use_fat_mode(config.fat_mode, KV_MAX, ROW_MAX);
     if fat_mode && !config.fat_mode {
         warn!("WARNING: Fat mode automatically enabled due to high arity");
@@ -49,25 +53,22 @@ pub(crate) fn plan_check(strata: &Strata, config: &EngineConfig) -> Result<(Prog
     Ok((plan, fat_mode))
 }
 
-fn native_module(engine: &Engine, program: &Program) -> Result<Option<Arc<NativeCallModule>>> {
-    program
-        .embedded_rust()
-        .map(|embedded| {
-            NativeCallModule::compile_and_load(
-                embedded,
-                engine.config().call_cache.as_deref(),
-                Arc::clone(engine.symbols()),
-                program.name(),
-            )
-        })
-        .transpose()
-}
-
-/// Run one program over its input states.
+/// Run one program over its inputs.
+///
+/// Building the program's embedded blocks is the slow part of preparing it -
+/// rustc takes from a fraction of a second to several - and needs nothing
+/// but the program. So it runs on its own thread while the inputs are read
+/// and the dataflow is assembled and starts to run; a row program that calls
+/// a function waits for the blocks at its first call (`NativeFunctions`).
+///
+/// A refusal is the one the stages would have met in turn: stratifying comes
+/// first and refuses before anything is built (planning cannot refuse), then
+/// the inputs, then a block that does not compile, then whatever the
+/// evaluation met.
 pub fn run(
     engine: &Engine,
     program: Program,
-    mut states: HashMap<String, Arc<RelationState>>,
+    inputs: Inputs,
     options: &EvaluationOptions,
 ) -> Result<RunOutcome> {
     let total_started = Instant::now();
@@ -75,15 +76,214 @@ pub fn run(
     let profile = profile_run.as_ref().map(|run| Arc::clone(&run.profile));
     let config = engine.config();
     let strata = Strata::try_from_parser(program.clone())?;
-    debugging::debugger::display_info("Strata", false, format!("{}\n{}", strata.dependency_graph(), strata));
-    let (plan, fat_mode) = plan_check(&strata, config)?;
-    if let Some(profile) = &profile { profile.phase("compiling_helpers"); }
-    let native = native_module(engine, &program)?;
-    let idb_map = Arc::new(aggregation_catalog_from_program(&program));
+    if debugging::debugger::display_enabled() {
+        debugging::debugger::display_info("Strata", false, format!("{}\n{}", strata.dependency_graph(), strata));
+    }
+    let native = program.embedded_rust().map(|_| NativeFunctions::pending());
+
+    let compile_micros = AtomicU64::new(0);
+    // The evaluation has ended: no optimized build is wanted any more.
+    let finished = Finished::default();
+    // The evaluation was refused before it ran: no build is wanted at all.
+    let abandoned = AtomicBool::new(false);
+    let evaluated = std::thread::scope(|scope| {
+        let (finished, abandoned) = (&finished, &abandoned);
+        let compiling = match (&native, program.embedded_rust()) {
+            (Some(functions), Some(embedded)) => {
+                let (program, profile, compile_micros) = (&program, &profile, &compile_micros);
+                Some(scope.spawn(move || {
+                    let build = |tier, cancel| {
+                        NativeCallModule::compile_and_load(
+                            embedded,
+                            config.call_cache.as_deref(),
+                            Arc::clone(engine.symbols()),
+                            program.name(),
+                            tier,
+                            cancel,
+                        )
+                    };
+                    if let Some(profile) = profile { profile.helpers("compiling"); }
+                    let started = Instant::now();
+                    let publish = PublishOnUnwind(functions);
+                    // A persistent cache that holds the optimized build serves
+                    // it at once; otherwise the evaluation starts on a quick one.
+                    let tier = if native_calls::cached_at(embedded, config.call_cache.as_deref(), BuildTier::Optimized) {
+                        BuildTier::Optimized
+                    } else {
+                        BuildTier::Quick
+                    };
+                    let outcome = build(tier, Some(abandoned));
+                    compile_micros.store(duration_micros(started.elapsed()), Ordering::Relaxed);
+                    let built = outcome.is_ok();
+                    if let Some(profile) = profile {
+                        profile.helpers(if built { "ready" } else { "failed" });
+                    }
+                    functions.publish(outcome);
+                    std::mem::forget(publish);
+                    if !built
+                        || tier == BuildTier::Optimized
+                        || finished.wait(optimize_after(started.elapsed()))
+                    {
+                        return;
+                    }
+                    // Still running: the calls from now on are worth a build
+                    // that makes them fast.
+                    if let Some(profile) = profile { profile.helpers("optimizing"); }
+                    match build(BuildTier::Optimized, Some(finished.cancel())) {
+                        Ok(module) => {
+                            functions.publish_optimized(module);
+                            info!(
+                                "embedded functions moved to their optimized build {:.3}s into the evaluation",
+                                total_started.elapsed().as_secs_f64()
+                            );
+                            if let Some(profile) = profile { profile.helpers("optimized"); }
+                        }
+                        // Cancelled when the evaluation ended, or failed where
+                        // the quick build did not: the quick build serves.
+                        Err(_) => {
+                            if let Some(profile) = profile { profile.helpers("ready"); }
+                        }
+                    }
+                }))
+            }
+            _ => None,
+        };
+        let join = move |refused: bool| {
+            if refused {
+                abandoned.store(true, Ordering::Relaxed);
+            }
+            finished.finish();
+            if let Some(handle) = compiling {
+                let _ = handle.join();
+            }
+        };
+        let prepared = plan_check(&strata, config)
+            .and_then(|planned| Ok((planned, engine.states_of(&program, inputs)?)));
+        let ((plan, fat_mode), states) = match prepared {
+            Ok(prepared) => prepared,
+            Err(diagnostic) => {
+                join(true);
+                return Err(diagnostic);
+            }
+        };
+        let evaluated = evaluate(
+            &program,
+            &strata,
+            plan,
+            fat_mode,
+            states,
+            options,
+            config,
+            native.as_ref(),
+            &profile,
+            total_started,
+        );
+        join(false);
+        // The blocks were the program's to compile before it could run: a
+        // block that does not is the refusal, whatever the dataflow met
+        // while it waited.
+        if let Some(functions) = &native {
+            if let Err(diagnostic) = functions.wait() {
+                return Err(diagnostic.clone());
+            }
+        }
+        evaluated
+    });
+    let (states, mut stats, budget) = evaluated?;
+    stats.compile_micros = compile_micros.load(Ordering::Relaxed);
+    stats.total_micros = duration_micros(total_started.elapsed());
+    info!(
+        "evaluation: {} strata, {} rules, {} rows settled; {:.3}s preparing, {:.3}s compiling blocks (overlapped), {:.3}s in the dataflow, {:.3}s settling",
+        stats.strata,
+        stats.rules,
+        stats.materialized_rows,
+        stats.planning_micros as f64 / 1e6,
+        stats.compile_micros as f64 / 1e6,
+        stats.execution_micros as f64 / 1e6,
+        stats.settle_micros as f64 / 1e6,
+    );
+    if let Some(profile) = &profile { profile.complete(); }
+    Ok(RunOutcome {
+        program,
+        states,
+        stats,
+        budget,
+        native,
+    })
+}
+
+/// How long an evaluation runs on the quick build of its blocks before an
+/// optimized build is started: twice what the quick build took, and a second
+/// at least. The optimized build takes about three times as long, so an
+/// evaluation that ends sooner would gain nothing from it, and building it
+/// would only take cores from the next evaluation.
+fn optimize_after(quick_build: Duration) -> Duration {
+    (quick_build * 2).max(Duration::from_secs(1))
+}
+
+/// The end of an evaluation, as the thread building its blocks sees it.
+#[derive(Default)]
+struct Finished {
+    done: Mutex<bool>,
+    changed: Condvar,
+    cancel: AtomicBool,
+}
+
+impl Finished {
+    fn finish(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        *self.done.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.changed.notify_all();
+    }
+
+    /// Wait up to `timeout` for the evaluation to end; whether it did.
+    fn wait(&self, timeout: Duration) -> bool {
+        let done = self.done.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (done, _) = self
+            .changed
+            .wait_timeout_while(done, timeout, |done| !*done)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *done
+    }
+
+    /// Set once the evaluation has ended: cancels an optimized build.
+    fn cancel(&self) -> &AtomicBool {
+        &self.cancel
+    }
+}
+
+/// Publishes an internal diagnostic if the thread building the blocks
+/// unwinds, so that no row program waits for them forever.
+struct PublishOnUnwind<'a>(&'a NativeFunctions);
+
+impl Drop for PublishOnUnwind<'_> {
+    fn drop(&mut self) {
+        self.0.publish(Err(parsing::diagnostic::Diagnostic::internal(
+            "the thread building the program's embedded blocks panicked",
+        )));
+    }
+}
+
+/// The dataflow of a planned program over its input states, and the settled
+/// state of every head.
+#[allow(clippy::too_many_arguments)]
+fn evaluate(
+    program: &Program,
+    strata: &Strata,
+    plan: ProgramQueryPlan,
+    fat_mode: bool,
+    mut states: HashMap<String, Arc<RelationState>>,
+    options: &EvaluationOptions,
+    config: &EngineConfig,
+    native: Option<&Arc<NativeFunctions>>,
+    profile: &Option<Arc<crate::profile::Profile>>,
+    total_started: Instant,
+) -> Result<(HashMap<String, Arc<RelationState>>, RunStats, Arc<Budget>)> {
+    let idb_map = Arc::new(aggregation_catalog_from_program(program));
     let budget = budget_of(options);
     let _tag = crate::accounting::MemoryTag::new(budget.memory());
     let workers = WorkerSet::start(config.workers, Arc::clone(&budget), profile.clone())?;
-    if let Some(profile) = &profile { profile.phase("executing"); }
+    if let Some(profile) = profile { profile.phase("executing"); }
 
     let mut stats = RunStats {
         strata: strata.strata().len(),
@@ -131,18 +331,21 @@ pub fn run(
         .collect();
 
     let started = Instant::now();
-    workers.run(Arc::new(Assembly {
+    let assembly = Arc::new(Assembly {
         groups: plan.program_plan().clone(),
         inputs,
         captures: captures.clone(),
         fat_mode,
         idb_map: Arc::clone(&idb_map),
-        native_calls: native.clone(),
+        native_calls: native.cloned(),
         budget: Arc::clone(&budget),
         program_name: program.name().to_string(),
         profile: workers.profile(),
-    }))?;
+        build_micros: AtomicU64::new(0),
+    });
+    workers.run(Arc::clone(&assembly))?;
     stats.execution_micros = duration_micros(started.elapsed());
+    stats.build_micros = assembly.build_micros.load(Ordering::Relaxed);
 
     // Each head settles on its own: merging is independent across heads.
     let started = Instant::now();
@@ -163,24 +366,7 @@ pub fn run(
 
     stats.peak_memory_bytes = budget.memory().peak();
     stats.materialized_rows = budget.tuples();
-    stats.total_micros = duration_micros(total_started.elapsed());
-    info!(
-        "evaluation: {} strata, {} rules, {} rows settled; {:.3}s preparing, {:.3}s in the dataflow, {:.3}s settling",
-        stats.strata,
-        stats.rules,
-        stats.materialized_rows,
-        stats.planning_micros as f64 / 1e6,
-        stats.execution_micros as f64 / 1e6,
-        stats.settle_micros as f64 / 1e6,
-    );
-    if let Some(profile) = &profile { profile.complete(); }
-    Ok(RunOutcome {
-        program,
-        states,
-        stats,
-        budget,
-        native,
-    })
+    Ok((states, stats, budget))
 }
 
 /// `function` over every item on up to `threads` threads, results in item

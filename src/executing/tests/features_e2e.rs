@@ -695,3 +695,83 @@ fn a_filter_run_early_refuses_exactly_the_rows_it_would_have_refused() {
     assert_eq!(error.function.as_deref(), Some("small"), "{error}");
     assert!(error.message.contains("too large: 500"), "{error}");
 }
+
+#[test]
+fn a_block_that_does_not_compile_is_refused_even_when_no_row_reaches_a_call() {
+    // The dataflow is built and runs while rustc works; with no row for the
+    // call it can finish first, and the block is still the refusal.
+    let error = evaluate(
+        &engine(),
+        ".in\n.decl E(k: number)\n.decl F(k: number)\n.printsize\n.decl R(k: number)\n.decl S(k: number)\n\
+         .code rust\n\
+         pub fn broken(x: i64) -> i64 {\n\
+             let narrow: u8 = x;\n\
+             narrow as i64\n\
+         }\n\
+         .endcode\n\
+         .rule\nR(y) :- E(x), y = @call(broken, x).\nS(k) :- F(k).\n",
+        vec![rows("F", &[&[1], &[2]])],
+        EvaluationOptions::default(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, DiagnosticKind::Function, "{error}");
+    assert!(error.detail.as_deref().unwrap_or("").contains("mismatched types"), "{error}");
+}
+
+#[test]
+fn an_input_refusal_comes_before_the_blocks_are_built() {
+    let temp = TempTree::new("input-before-blocks");
+    let facts = temp.path("facts");
+    fs::create_dir_all(&facts).unwrap();
+    fs::write(facts.join("E.facts"), "1\nnot-a-number\n").unwrap();
+    let started = std::time::Instant::now();
+    let error = engine()
+        .evaluate(EvaluationRequest {
+            program: ProgramSource::Text {
+                name: "input.dl".to_string(),
+                source: ".code rust\npub fn twice(x: i64) -> i64 { x * 2 }\n.endcode\n\
+                         .in\n.decl E(k: number)\n.input E.facts\n.printsize\n.decl R(k: number)\n.rule\n\
+                         R(y) :- E(x), y = @call(twice, x).\n"
+                    .to_string(),
+            },
+            inputs: Inputs::Directory(facts),
+            options: EvaluationOptions::default(),
+        })
+        .unwrap_err();
+    assert_eq!(error.kind, DiagnosticKind::Input, "{error}");
+    assert!(error.message.contains("not a number"), "{error}");
+    // The build that was under way is stopped, not waited for.
+    assert!(started.elapsed() < Duration::from_secs(30), "{:?}", started.elapsed());
+}
+
+#[test]
+fn both_build_tiers_compute_the_same_values() {
+    use flowlog::native_calls::{BuildTier, NativeCallModule};
+    let program = parsing::parser::Program::parse(
+        ".code rust\n\
+         pub fn mix(x: i64, y: i64) -> i64 { let mut h = x; for i in 0..64 { h = h.wrapping_mul(31) + y * i; } h }\n\
+         pub fn grow(x: i64) -> i64 { x + 1 }\n\
+         pub fn small(x: i64) -> bool { (x as u8) < 7 }\n\
+         .endcode\n\
+         .in\n.decl E(k: number)\n.printsize\n.decl R(k: number)\n.rule\nR(y) :- E(x), y = @call(grow, x).\n",
+        "tiers.dl",
+    )
+    .unwrap();
+    let embedded = program.embedded_rust().unwrap();
+    let symbols = Arc::new(flowlog::symbols::SymbolTable::new());
+    let build = |tier| {
+        NativeCallModule::compile_and_load(embedded, None, Arc::clone(&symbols), "tiers.dl", tier, None)
+            .unwrap_or_else(|diagnostic| panic!("{tier:?}: {diagnostic}"))
+    };
+    let (quick, optimized) = (build(BuildTier::Quick), build(BuildTier::Optimized));
+    let call = |module: &NativeCallModule, name: &str, arguments: &[i64]| {
+        module.call(name, module.function(name).unwrap(), arguments).unwrap()
+    };
+    for arguments in [[0, 0], [1, -1], [i64::MAX, 3], [i64::MIN, i64::MAX], [-7, 1 << 40]] {
+        assert_eq!(call(&quick, "mix", &arguments), call(&optimized, "mix", &arguments), "{arguments:?}");
+        assert_eq!(call(&quick, "grow", &arguments[..1]), call(&optimized, "grow", &arguments[..1]));
+        assert_eq!(call(&quick, "small", &arguments[..1]), call(&optimized, "small", &arguments[..1]));
+    }
+    // Overflow wraps in the quick build too, as it does optimized.
+    assert_eq!(call(&quick, "grow", &[i64::MAX]), i64::MIN);
+}

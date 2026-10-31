@@ -363,10 +363,8 @@ impl Engine {
             options,
         } = request;
         let program = self.prepare(program)?;
-        let states = self.states_of(&program, inputs)?;
-
         let _admitted = self.admission.acquire(self.config.max_concurrent);
-        let outcome = runner::run(self, program, states, &options)?;
+        let outcome = runner::run(self, program, inputs, &options)?;
 
         let witnesses = if options.explain.is_empty() && !options.explain_all {
             Vec::new()
@@ -410,7 +408,9 @@ impl Engine {
         })
     }
 
-    fn states_of(
+    /// The input states of `program`: read, or built from rows, with every
+    /// input the request did not supply empty.
+    pub(crate) fn states_of(
         &self,
         program: &Program,
         inputs: Inputs,

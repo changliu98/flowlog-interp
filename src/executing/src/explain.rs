@@ -16,7 +16,7 @@
 use crate::accounting::Budget;
 use crate::state::RelationState;
 use crate::map::RowProgramRunner;
-use crate::native_calls::NativeCallModule;
+use crate::map::NativeFunctions;
 use catalog::rule::Catalog;
 use parsing::aggregation::AggregationOperator;
 use parsing::arithmetic::{Arithmetic, Factor};
@@ -73,7 +73,7 @@ type Index = HashMap<Vec<Val>, Vec<usize>>;
 pub struct Explainer<'a> {
     program: &'a Program,
     states: &'a HashMap<String, Arc<RelationState>>,
-    module: Option<&'a Arc<NativeCallModule>>,
+    module: Option<&'a Arc<NativeFunctions>>,
     budget: &'a Arc<Budget>,
     indexes: RefCell<HashMap<(String, Vec<usize>), Arc<Index>>>,
     inputs: std::collections::HashSet<String>,
@@ -83,7 +83,7 @@ impl<'a> Explainer<'a> {
     pub fn new(
         program: &'a Program,
         states: &'a HashMap<String, Arc<RelationState>>,
-        module: Option<&'a Arc<NativeCallModule>>,
+        module: Option<&'a Arc<NativeFunctions>>,
         budget: &'a Arc<Budget>,
     ) -> Self {
         Self {

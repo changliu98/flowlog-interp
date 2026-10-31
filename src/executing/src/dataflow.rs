@@ -27,7 +27,7 @@ use crate::transformer::*;
 use crate::Time;
 use crate::Iter;
 use crate::map::*;
-use crate::native_calls::NativeCallModule;
+use crate::map::NativeFunctions;
 
 use parsing::diagnostic::Result;
 use macros::*;
@@ -48,7 +48,7 @@ type KMap<'scope, T> = HashMap<Arc<CollectionSignature>, (Arc<Rel<'scope, T>>, A
 /// What `assemble_group` needs beside the plan.
 pub(crate) struct AssemblyContext<'a> {
     pub fat_mode: bool,
-    pub native_calls: &'a Option<Arc<NativeCallModule>>,
+    pub native_calls: &'a Option<Arc<NativeFunctions>>,
     pub idb_map: &'a HashMap<String, AggregationHeadIDB>,
     pub budget: &'a Arc<Budget>,
     pub program_name: &'a str,
@@ -549,10 +549,12 @@ pub struct Assembly {
     pub captures: BTreeMap<String, MaterializedUpdates>,
     pub fat_mode: bool,
     pub idb_map: Arc<HashMap<String, AggregationHeadIDB>>,
-    pub native_calls: Option<Arc<NativeCallModule>>,
+    pub native_calls: Option<Arc<NativeFunctions>>,
     pub budget: Arc<Budget>,
     pub program_name: String,
     pub profile: Option<Arc<crate::profile::Profile>>,
+    /// How long the slowest worker took to build and feed the dataflow.
+    pub build_micros: std::sync::atomic::AtomicU64,
 }
 
 /// Completion and the buffers that must be published before reporting it.
@@ -567,6 +569,14 @@ impl Assembly {
     /// dataflow is complete. Every worker of a set calls this with the same
     /// assembly, which is what timely requires.
     pub fn build(&self, worker: &mut Worker) -> Result<BuiltDataflow> {
+        let started = std::time::Instant::now();
+        let built = self.build_and_feed(worker);
+        let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.build_micros.fetch_max(micros, std::sync::atomic::Ordering::Relaxed);
+        built
+    }
+
+    fn build_and_feed(&self, worker: &mut Worker) -> Result<BuiltDataflow> {
         let peers = worker.peers();
         let index = worker.index();
         let context_native = self.native_calls.clone();

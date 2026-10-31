@@ -318,6 +318,23 @@ Renamed(R, K) :- Named(N, K), R = @call(suffixed, N).
   replaced atomically. If repair fails, a `function` diagnostic names the
   cache file to remove and reports both failures. A block that does not
   compile carries rustc's report with lines counted inside the block.
+- Blocks build while the evaluation proceeds: rustc starts once the program
+  is stratified, and the program is planned, its inputs read and its
+  dataflow assembled and run meanwhile. A rule that calls a function waits
+  for the blocks at its first call; everything else does not wait. The
+  blocks of one program build in parallel, up to eight at once. A block that
+  does not compile is still the refusal, whatever the dataflow met while it
+  waited.
+- Builds are tiered. An evaluation starts on a quick build (`opt-level=0`,
+  with debug assertions and overflow checks off as when optimized, so a
+  function computes the same values): on the generated blocks the engine is
+  given in practice that is a third of the optimized build's time, and the
+  functions are rarely where an evaluation spends its time. An evaluation
+  still running after twice the quick build's time (a second at least) gets
+  an optimized build (`opt-level=3`) in the background, and its calls move to it once it
+  is loaded; an evaluation that ends first cancels it. The two tiers are
+  named apart in `--call-cache`, and a cache that holds the optimized build
+  serves it at once.
 - The call interface is documented in `src/executing/src/native_calls.rs`:
   one `i64` cell per argument and result, and a context of two callbacks over
   the engine's symbol table. Embedded Rust is trusted native code and runs
@@ -402,8 +419,10 @@ it to `<csvs>/csvs/stats.json`:
 | counter | meaning |
 |---|---|
 | `strata`, `rules` | strata of the program; source rules evaluated |
-| `planning_micros` | parsing through planning, compiling embedded blocks, starting the workers |
-| `execution_micros` | the dataflow, until its last update |
+| `planning_micros` | stratifying, planning, reading the inputs, starting the workers |
+| `compile_micros` | the first build of the embedded blocks, which overlaps everything after stratifying |
+| `execution_micros` | the dataflow, until its last update, including any wait for the blocks |
+| `build_micros` | assembling the dataflow and feeding it the inputs, on the slowest worker (part of `execution_micros`) |
 | `settle_micros` | merging the captured heads into sorted states |
 | `total_micros` | the whole run |
 | `peak_memory_bytes`, `materialized_rows` | the evaluation's own footprint: bytes its threads held at most, rows of its settled heads |
@@ -461,6 +480,7 @@ target/release/executing -p <program.dl> -f <facts_directory> [-c <output>] [opt
 | `--call-cache <DIR>` | compiled blocks |
 | `--budget-seconds`, `--memory-limit-mib`, `--tuple-limit` | the evaluation's limits |
 | `--explain` | write a witness per output row to `explain.jsonl` |
+| `--profile-json <FILE>` | keep a live operator profile in this file, rewritten every half second: per-rule time and record counts, the busiest operators, the phase, and where the blocks' builds stand (`helpers`: compiling, ready, failed, optimizing, optimized) |
 | `--daemon-socket <PATH>`, `--max-concurrent <N>` | run the service |
 
 An input file holds one row per line, cells separated by the delimiter: a

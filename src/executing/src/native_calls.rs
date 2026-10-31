@@ -1,13 +1,14 @@
 //! Embedded functions: compiled per block, loaded once, called over cells.
 //!
-//! A program's `.code rust` blocks are independent compilation units. Each
-//! block is compiled by `rustc` into a shared library named by the digest of
-//! the complete generated source, the compiler's version and the call
-//! interface version. Changes to the engine's scaffolding invalidate the
-//! library along with changes to the block. Unchanged, valid libraries are
-//! reused only when a persistent cache was explicitly requested. Otherwise
-//! compilation uses a temporary directory removed when the module is released.
-//! The library exports one entry
+//! A program's `.code rust` blocks are independent compilation units, built
+//! in parallel. Each block is compiled by `rustc` into a shared library named
+//! by the digest of the complete generated source, the compiler's version,
+//! the call interface version and the build tier (`BuildTier`: a quick build
+//! first, an optimized one for an evaluation that runs long). Changes to the
+//! engine's scaffolding invalidate the library along with changes to the
+//! block. Unchanged, valid libraries are reused only when a persistent cache
+//! was explicitly requested. Otherwise compilation uses a temporary directory
+//! removed when the module is released. The library exports one entry
 //! point per public function, `__flowlog_call_<name>`, and one
 //! `__flowlog_last_panic` that hands back the location and message of the
 //! most recent panic on the calling thread.
@@ -43,10 +44,107 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tracing::{info, warn};
+
+/// The most blocks of one program rustc builds at once.
+const PARALLEL_BLOCK_BUILDS: usize = 8;
+
+/// How a block's library is built.
+///
+/// An evaluation starts on a quick build: most of rustc's time on a block is
+/// optimization, and a block's functions are rarely where an evaluation
+/// spends its time. When the evaluation is still running a moment after the
+/// quick build is ready, the block is built again optimized and the calls
+/// move to it (see `runner`), so a call-heavy evaluation pays for the slower
+/// code only briefly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildTier {
+    /// opt-level 0: about a third of the optimized build's time, with
+    /// functions several times slower.
+    Quick,
+    /// opt-level 3.
+    Optimized,
+}
+
+impl BuildTier {
+    /// rustc's options for the tier. Debug assertions and overflow checks are
+    /// off at every tier, as they are optimized, so a function computes the
+    /// same values whichever build runs it. Both tiers split a block into
+    /// several codegen units, which rustc builds in parallel.
+    fn options(self) -> &'static [&'static str] {
+        match self {
+            BuildTier::Quick => &[
+                "-C", "opt-level=0", "-C", "debug-assertions=off", "-C", "overflow-checks=off",
+                "-C", "codegen-units=16",
+            ],
+            BuildTier::Optimized => &["-C", "opt-level=3", "-C", "codegen-units=16"],
+        }
+    }
+
+    /// The library of each tier is named apart; the optimized library keeps
+    /// the name it always had, so a persistent cache keeps serving it.
+    fn digest(self, generated: &str, rustc_version: &str) -> String {
+        match self {
+            BuildTier::Optimized => block_digest(generated, rustc_version),
+            BuildTier::Quick => {
+                let mut hasher = Sha256::new();
+                hasher.update(b"quick");
+                hasher.update([0]);
+                hasher.update(block_digest(generated, rustc_version).as_bytes());
+                format!("{:x}", hasher.finalize())
+            }
+        }
+    }
+}
+
+/// Whether the persistent cache, when one was requested, already holds every
+/// block's library built at `tier`: then loading it needs no build.
+pub fn cached_at(embedded: &EmbeddedRust, requested_cache: Option<&Path>, tier: BuildTier) -> bool {
+    let Some(cache_root) = cache_directory(requested_cache) else {
+        return false;
+    };
+    let Some(rustc_version) = rustc_version().ok() else {
+        return false;
+    };
+    embedded.blocks().iter().all(|block| {
+        let digest = tier.digest(&render_block(block), &rustc_version);
+        library_path(&cache_root.join(&digest), &digest).is_file()
+    })
+}
+
+fn rustc_command() -> OsString {
+    env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"))
+}
+
+/// `rustc --version`, which names the compiler in every library's digest.
+fn rustc_version() -> Result<String> {
+    let rustc = rustc_command();
+    let version_output = Command::new(&rustc).arg("--version").output().map_err(|error| {
+        Diagnostic::function(format!(
+            "cannot run {rustc:?} --version, and an embedded function needs the Rust \
+             compiler at run time: {error}"
+        ))
+    })?;
+    if !version_output.status.success() {
+        return Err(Diagnostic::function(format!(
+            "{rustc:?} --version failed: {}",
+            String::from_utf8_lossy(&version_output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&version_output.stdout).to_string())
+}
+
+fn library_path(cache_dir: &Path, digest: &str) -> PathBuf {
+    cache_dir.join(format!(
+        "{}flowlog_block_{}{}",
+        env::consts::DLL_PREFIX,
+        &digest[..16],
+        env::consts::DLL_SUFFIX
+    ))
+}
 
 /// The version of the call interface; part of every library's digest.
 pub const CALL_ABI_VERSION: &str = "flowlog-call-abi-v3-cells-context";
@@ -187,27 +285,18 @@ pub struct NativeCallModule {
 }
 
 impl NativeCallModule {
-    /// Compile and load every block, using persistent storage only on opt-in.
+    /// Compile and load every block at `tier`, using persistent storage only
+    /// on opt-in. A build `cancel` asks for stops rustc and fails.
     pub fn compile_and_load(
         embedded: &EmbeddedRust,
         requested_cache: Option<&Path>,
         symbols: Arc<SymbolTable>,
         program_name: &str,
+        tier: BuildTier,
+        cancel: Option<&AtomicBool>,
     ) -> Result<Arc<Self>> {
-        let rustc = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
-        let version_output = Command::new(&rustc).arg("--version").output().map_err(|error| {
-            Diagnostic::function(format!(
-                "cannot run {rustc:?} --version, and an embedded function needs the Rust \
-                 compiler at run time: {error}"
-            ))
-        })?;
-        if !version_output.status.success() {
-            return Err(Diagnostic::function(format!(
-                "{rustc:?} --version failed: {}",
-                String::from_utf8_lossy(&version_output.stderr).trim()
-            )));
-        }
-        let rustc_version = String::from_utf8_lossy(&version_output.stdout).to_string();
+        let rustc = rustc_command();
+        let rustc_version = rustc_version()?;
         let (cache_root, temporary_build) = match cache_directory(requested_cache) {
             Some(path) => (path, None),
             None => {
@@ -216,11 +305,44 @@ impl NativeCallModule {
             }
         };
 
+        // Blocks are independent compilation units: rustc builds several at
+        // once, each on its own core. The first block in program order that
+        // fails is the one reported, as if they had been built in turn.
+        let load = |block: &EmbeddedBlock| {
+            load_block(&rustc, &rustc_version, &cache_root, block, program_name, tier, cancel)
+        };
+        let mut loaded = Vec::with_capacity(embedded.blocks().len());
+        if embedded.blocks().len() <= 1 {
+            loaded.extend(embedded.blocks().iter().map(load));
+        } else {
+            let next = AtomicU64::new(0);
+            let results: Vec<Mutex<Option<Result<(LoadedBlock, Vec<NativeCall>)>>>> =
+                embedded.blocks().iter().map(|_| Mutex::new(None)).collect();
+            let builders = std::thread::available_parallelism()
+                .map_or(1, |count| count.get())
+                .clamp(1, PARALLEL_BLOCK_BUILDS)
+                .min(embedded.blocks().len());
+            std::thread::scope(|scope| {
+                for _ in 0..builders {
+                    scope.spawn(|| loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed) as usize;
+                        let Some(block) = embedded.blocks().get(index) else { break };
+                        let outcome = load(block);
+                        *results[index].lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
+                    });
+                }
+            });
+            for slot in results {
+                loaded.push(slot.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner()).unwrap_or_else(|| {
+                    Err(Diagnostic::internal("a thread building an embedded Rust block panicked"))
+                }));
+            }
+        }
+
         let mut blocks = Vec::with_capacity(embedded.blocks().len());
         let mut functions = HashMap::new();
-        for (index, block) in embedded.blocks().iter().enumerate() {
-            let (loaded, calls) =
-                load_block(&rustc, &rustc_version, &cache_root, block, program_name)?;
+        for (index, (block, outcome)) in embedded.blocks().iter().zip(loaded).enumerate() {
+            let (loaded, calls) = outcome?;
             for (function, call) in block.functions().iter().zip(calls) {
                 functions.insert(
                     function.name().to_string(),
@@ -362,9 +484,11 @@ fn load_block(
     cache_root: &Path,
     block: &EmbeddedBlock,
     program_name: &str,
+    tier: BuildTier,
+    cancel: Option<&AtomicBool>,
 ) -> Result<(LoadedBlock, Vec<NativeCall>)> {
     let generated = render_block(block);
-    let digest = block_digest(&generated, rustc_version);
+    let digest = tier.digest(&generated, rustc_version);
     let block_lock = block_compile_lock(&digest);
     // Serialize the cache check, compilation and publication for this digest.
     // Keep the guard through loading and repair, which can compile again.
@@ -376,12 +500,7 @@ fn load_block(
             cache_dir.display()
         ))
     })?;
-    let library_path = cache_dir.join(format!(
-        "{}flowlog_block_{}{}",
-        env::consts::DLL_PREFIX,
-        &digest[..16],
-        env::consts::DLL_SUFFIX
-    ));
+    let library_path = library_path(&cache_dir, &digest);
     if !library_path.is_file() {
         compile_block(
             rustc,
@@ -391,6 +510,8 @@ fn load_block(
             &cache_dir,
             &library_path,
             program_name,
+            tier,
+            cancel,
         )?;
     }
 
@@ -409,6 +530,8 @@ fn load_block(
                 &cache_dir,
                 &library_path,
                 program_name,
+                tier,
+                cancel,
             )
             .map_err(|repair_error| {
                 cache_repair_diagnostic(&library_path, &first_error, repair_error)
@@ -485,6 +608,7 @@ fn cache_repair_diagnostic(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_block(
     rustc: &OsString,
     block: &EmbeddedBlock,
@@ -493,6 +617,8 @@ fn compile_block(
     cache_dir: &Path,
     library_path: &Path,
     program_name: &str,
+    tier: BuildTier,
+    cancel: Option<&AtomicBool>,
 ) -> Result<()> {
     static NEXT_COMPILATION: AtomicU64 = AtomicU64::new(0);
     let unique = format!(
@@ -510,15 +636,21 @@ fn compile_block(
         ))
     })?;
 
-    let output = Command::new(rustc)
+    // rustc reports into a file rather than a pipe, so a long report never
+    // blocks it while this thread waits for it, or for a cancellation.
+    let report_path = cache_dir.join(format!("rustc.{unique}.stderr"));
+    let report = fs::File::create(&report_path).map_err(|error| {
+        Diagnostic::function(format!("cannot create {}: {error}", report_path.display()))
+    })?;
+    let cleanup = || {
+        let _ = fs::remove_file(&temporary_library);
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&report_path);
+    };
+    let mut child = Command::new(rustc)
         .arg("--edition=2021")
         .arg("--crate-type=cdylib")
-        .arg("-C")
-        .arg("opt-level=3")
-        // One unit: a block is many tiny functions, where splitting costs
-        // more than the parallel code generation it buys.
-        .arg("-C")
-        .arg("codegen-units=1")
+        .args(tier.options())
         .arg("-C")
         .arg("panic=unwind")
         .arg("--crate-name")
@@ -526,20 +658,41 @@ fn compile_block(
         .arg(&source_path)
         .arg("-o")
         .arg(&temporary_library)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(report))
+        .spawn()
         .map_err(|error| {
+            cleanup();
             Diagnostic::function(format!("cannot run {rustc:?} for an embedded Rust block: {error}"))
         })?;
-
-    if !output.status.success() {
-        let _ = fs::remove_file(&temporary_library);
-        let _ = fs::remove_file(&source_path);
-        return Err(compile_diagnostic(
-            block,
-            &String::from_utf8_lossy(&output.stderr),
-            program_name,
-        ));
+    let status = match cancel {
+        None => child.wait(),
+        Some(cancel) => loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) if cancel.load(Ordering::Relaxed) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    cleanup();
+                    return Err(Diagnostic::internal("the build of an embedded Rust block was cancelled"));
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                Err(error) => break Err(error),
+            }
+        },
     }
+    .map_err(|error| {
+        cleanup();
+        Diagnostic::function(format!("cannot wait for {rustc:?} building an embedded Rust block: {error}"))
+    })?;
+
+    if !status.success() {
+        let stderr = fs::read(&report_path).unwrap_or_default();
+        cleanup();
+        return Err(compile_diagnostic(block, &String::from_utf8_lossy(&stderr), program_name));
+    }
+    let _ = fs::remove_file(&report_path);
 
     fs::rename(&temporary_library, library_path).map_err(|error| {
         Diagnostic::function(format!(

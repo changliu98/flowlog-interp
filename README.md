@@ -397,7 +397,11 @@ the output directory also retains raw measurements and median timings. See
 
 For the official FlowLog Bench cohort at 32 workers, see
 [the performance audit and measurements](docs/performance-w32-2026-09-10.md)
-and `scripts/benchmark_flowlog_bench.sh`.
+and `scripts/benchmark_flowlog_bench.sh`. For programs as rlcrafter writes
+them - thousands of rules, one large generated block, small inputs - see
+[the 2026-10-31 review](docs/performance-2026-10-31.md);
+`scripts/benchmark_workloads.py` times binaries on captured workload
+directories and checks their outputs byte for byte.
 
 ### Limits
 
